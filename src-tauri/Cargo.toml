@@ -1,0 +1,46 @@
+[package]
+name = "app"
+version = "0.1.0"
+description = "A Tauri App"
+authors = ["you"]
+license = ""
+repository = ""
+edition = "2021"
+rust-version = "1.77.2"
+
+# See more keys and their definitions at https://doc.rust-lang.org/cargo/reference/manifest.html
+
+[lib]
+name = "app_lib"
+crate-type = ["staticlib", "cdylib", "rlib"]
+
+[build-dependencies]
+tauri-build = { version = "2.6.3", features = [] }
+
+[dependencies]
+serde_json = "1.0"
+serde = { version = "1.0", features = ["derive"] }
+log = "0.4"
+tauri = { version = "2.11.3", features = [] }
+tauri-plugin-log = "2"
+async-imap = { version = "0.11.2", default-features = false, features = ["runtime-tokio", "tokio"] }
+tokio = { version = "1.52.3", features = ["rt-multi-thread", "macros", "net"] }
+tokio-native-tls = "0.3.1"
+futures = "0.3.32"
+imap-proto = "0.16.7"
+chrono = "0.4.45"
+zeroize = "1.8.2"
+rfc2047-decoder = "1.1.2"
+mail-parser = { version = "0.11.3", features = ["full_encoding", "serde"] }
+lettre = { version = "0.11.19", default-features = false, features = ["tokio1-native-tls", "smtp-transport", "builder", "hostname"] }
+hickory-resolver = "0.25.2"
+rusqlite = { version = "0.40.1", features = ["bundled-sqlcipher"] }
+
+[target.'cfg(target_os = "linux")'.dependencies]
+keyring = { version = "3", features = ["sync-secret-service"] }
+
+[target.'cfg(target_os = "macos")'.dependencies]
+keyring = { version = "3", features = ["apple-native"] }
+
+[target.'cfg(target_os = "windows")'.dependencies]
+keyring = { version = "3", features = ["windows-native"] }

@@ -1,0 +1,21 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="UTF-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+    <title>Helix</title>
+    <style>
+      /* react-native-web's flex/height:100% layout needs an explicit height
+         chain to anchor to -- without this the shell collapses to its
+         content height instead of filling the window. */
+      html, body, #root {
+        height: 100%;
+        margin: 0;
+      }
+    </style>
+  </head>
+  <body>
+    <div id="root"></div>
+    <script type="module" src="/src/main.tsx"></script>
+  </body>
+</html>
