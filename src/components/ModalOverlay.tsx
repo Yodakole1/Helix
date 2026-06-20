@@ -1,5 +1,6 @@
 import type { ReactNode } from "react";
 import { Pressable, StyleSheet, Text, View } from "react-native";
+import { useEscapeKey } from "../hooks/useEscapeKey";
 import { glassPanel } from "../lib/webStyle";
 import type { Accent } from "../theme";
 import { colors, fontFamily, fontSize, radii, spacing } from "../theme";
@@ -9,6 +10,9 @@ interface ModalOverlayProps {
   accent: Accent;
   title: string;
   width?: number;
+  // Lower alpha = more see-through glass. Per-modal since some dialogs
+  // (Compose) want a more transparent card than others.
+  cardAlpha?: number;
   onClose: () => void;
   children: ReactNode;
 }
@@ -16,17 +20,28 @@ interface ModalOverlayProps {
 // Shared chrome for every dialog in the app: a blurred full-screen scrim
 // behind a glass card with a title bar. AddAccountModal and ComposeModal
 // both build on this rather than each rolling their own overlay.
-export function ModalOverlay({ visible, accent, title, width = 440, onClose, children }: ModalOverlayProps) {
+export function ModalOverlay({
+  visible,
+  accent,
+  title,
+  width = 440,
+  cardAlpha = 0.92,
+  onClose,
+  children,
+}: ModalOverlayProps) {
+  useEscapeKey(visible, onClose);
+
   if (!visible) {
     return null;
   }
 
   const accentColor = colors.accent[accent];
+  const cardGlass = glassPanel(colors.background.panel, cardAlpha, 30);
 
   return (
     <View style={styles.overlay}>
       <Pressable style={styles.scrim} onPress={onClose} />
-      <View style={[styles.card, { borderColor: accentColor, width }]}>
+      <View style={[styles.card, cardGlass, { borderColor: accentColor, width }]}>
         <View style={styles.header}>
           <Text style={styles.title}>{title}</Text>
           <Pressable onPress={onClose}>
@@ -59,10 +74,10 @@ const styles = StyleSheet.create({
   },
   card: {
     maxHeight: "90%",
+    maxWidth: "92%",
     padding: spacing.xl,
     borderRadius: radii.lg,
     borderWidth: 1,
-    ...glassPanel(colors.background.panel, 0.92, 30),
   },
   header: {
     flexDirection: "row",

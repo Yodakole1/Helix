@@ -7,11 +7,23 @@ use crate::credentials;
 /// `account_id` doubles as both the SMTP login username and the message's
 /// From address, same convention as the IMAP layer — accounts are
 /// identified by their email address.
+///
+/// `use_starttls` picks which of lettre's two TLS strategies to use:
+/// `false` for implicit TLS (`relay()`, the SMTPS/port-465 style, TLS from
+/// the first byte) or `true` for STARTTLS (`starttls_relay()`, connects
+/// in plaintext and then upgrades, the port-587 style). This is an
+/// explicit caller-supplied flag rather than something inferred from
+/// `port` — some providers run implicit TLS on nonstandard ports, and
+/// guessing wrong would silently attempt the wrong handshake instead of
+/// failing clearly. Either way the upgrade/connection is required, not
+/// opportunistic: `starttls_relay()` refuses to send anything, including
+/// credentials, if the server won't upgrade.
 #[tauri::command]
 pub async fn send_message(
     account_id: String,
     host: String,
     port: u16,
+    use_starttls: bool,
     to: String,
     subject: String,
     body: String,
@@ -30,12 +42,17 @@ pub async fn send_message(
         .body(body)
         .map_err(|e| format!("could not build message: {e}"))?;
 
-    let mailer: AsyncSmtpTransport<Tokio1Executor> =
+    let builder = if use_starttls {
+        AsyncSmtpTransport::<Tokio1Executor>::starttls_relay(&host)
+    } else {
         AsyncSmtpTransport::<Tokio1Executor>::relay(&host)
-            .map_err(|e| format!("could not configure SMTP relay for {host}: {e}"))?
-            .port(port)
-            .credentials(Credentials::new(account_id, password))
-            .build();
+    }
+    .map_err(|e| format!("could not configure SMTP relay for {host}: {e}"))?;
+
+    let mailer: AsyncSmtpTransport<Tokio1Executor> = builder
+        .port(port)
+        .credentials(Credentials::new(account_id, password))
+        .build();
 
     mailer
         .send(email)
@@ -68,6 +85,44 @@ mod tests {
             account_id.to_string(),
             "smtp.gmail.com".to_string(),
             465,
+            false,
+            "nobody@example.com".to_string(),
+            "test".to_string(),
+            "test body".to_string(),
+        )
+        .await;
+
+        credentials::delete_credential(account_id.to_string()).ok();
+
+        let err = result.expect_err("send should fail without real credentials");
+        assert!(
+            err.starts_with("send failed"),
+            "expected an SMTP send/auth failure, got: {err}"
+        );
+    }
+
+    // Same as above but exercises the STARTTLS path (`use_starttls: true`)
+    // against smtp.gmail.com:587 instead of the implicit-TLS path. GreenMail
+    // can't stand in for this one -- its bundled SMTP server doesn't
+    // implement the STARTTLS extension at all (confirmed by inspecting its
+    // class files; only the JavaMail *client* libraries it bundles mention
+    // STARTTLS), so a real STARTTLS-capable server is the only way to
+    // exercise this branch end to end.
+    #[tokio::test]
+    #[ignore = "requires network access to a real SMTP server"]
+    async fn rejects_bad_credentials_against_a_real_smtp_server_via_starttls() {
+        let account_id = "helix-test-no-such-account-starttls@gmail.com";
+        credentials::store_credential(
+            account_id.to_string(),
+            "definitely-not-a-real-password".to_string(),
+        )
+        .expect("storing the test credential should succeed");
+
+        let result = send_message(
+            account_id.to_string(),
+            "smtp.gmail.com".to_string(),
+            587,
+            true,
             "nobody@example.com".to_string(),
             "test".to_string(),
             "test body".to_string(),

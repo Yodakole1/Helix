@@ -51,7 +51,9 @@ Helix/
     main.tsx             entry point; imports self-hosted fonts
     theme/               design tokens (colors, typography, spacing)
     components/          Sidebar, MessageList, ReaderPane, modals, etc.
-    data/                 shared sample/static data (e.g. accounts.ts)
+    data/                 shared sample/static data (accounts, folders,
+                           per-folder sample messages)
+    hooks/                 useBreakpoint, usePersistedState
     lib/                  small framework-agnostic helpers (credentials
                            bridge, hover-state typing, web-only style
                            escape hatch)
@@ -131,19 +133,23 @@ connecting an account today stores a credential and nothing else.
 
 ## A note on react-native-svg
 
-The logo (`src/components/Logo.tsx`) renders raw DOM `<svg>`/`<path>`
-elements instead of using `react-native-svg`. We tried `react-native-svg`
-first, since it's the standard cross-platform way to draw vector graphics
-in a React Native codebase, but its web build pulls in Fabric/TurboModule
-files (`*NativeComponent.js`, `Native*Module.js`) that only exist for
-React Native's New Architecture and have no react-native-web equivalent --
+Small icons (e.g. `src/components/FolderIcon.tsx`, the sidebar's folder
+glyphs) render raw DOM `<svg>`/`<path>` elements instead of using
+`react-native-svg`. We tried `react-native-svg` first, since it's the
+standard cross-platform way to draw vector graphics in a React Native
+codebase, but its web build pulls in Fabric/TurboModule files
+(`*NativeComponent.js`, `Native*Module.js`) that only exist for React
+Native's New Architecture and have no react-native-web equivalent --
 Vite's dev-server dependency scan (esbuild) crashes trying to resolve
 them, even after preferring `.web.js` files via `resolve.extensions`.
 
 Plain DOM SVG works fine today because the app only targets web/Tauri. It
 will need to be swapped for `react-native-svg` (or revisited under a
 Metro-based setup) when Helix actually ports to native iOS/Android, since
-raw `<svg>` tags don't exist outside a DOM.
+raw `<svg>` tags don't exist outside a DOM. The same reasoning applies to
+`src/components/Splitter.tsx`'s plain `<div>` drag handle, which also
+needs raw pointer events tracked on `window` -- there's no RN
+gesture-responder equivalent wired up here yet.
 
 ## Build / dev workflow
 

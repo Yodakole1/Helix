@@ -1,53 +1,49 @@
 import { useState } from "react";
 import { Pressable, ScrollView, StyleSheet, Text, View } from "react-native";
 import { ACCOUNTS } from "../data/accounts";
+import { FOLDERS } from "../data/folders";
+import { FolderIcon } from "./FolderIcon";
 import type { HoverState } from "../lib/pressable";
-import { glassPanel } from "../lib/webStyle";
+import { glassPanel, type WebViewStyle } from "../lib/webStyle";
 import type { Accent } from "../theme";
 import { colorForIndex, colors, fontFamily, fontSize, radii, spacing, withAlpha } from "../theme";
-import { Logo } from "./Logo";
-
-interface FolderItem {
-  id: string;
-  label: string;
-  glyph: string;
-}
-
-const FOLDERS: FolderItem[] = [
-  { id: "inbox", label: "Inbox", glyph: "IN" },
-  { id: "drafts", label: "Drafts", glyph: "DR" },
-  { id: "sent", label: "Sent", glyph: "SE" },
-  { id: "spam", label: "Spam", glyph: "SP" },
-  { id: "archive", label: "Archive", glyph: "AR" },
-  { id: "trash", label: "Trash", glyph: "TR" },
-];
-
 
 interface SidebarProps {
   accent: Accent;
   onAccentChange: (accent: Accent) => void;
+  selectedFolder: Record<Accent, string>;
+  onFolderChange: (account: Accent, folder: string) => void;
   onAddAccount: () => void;
   onCompose: () => void;
   onOpenSettings: () => void;
+  width: number;
+  // Tablet breakpoint renders the same tree as a dismissable drawer instead
+  // of a fixed column -- see App.tsx's breakpoint branching.
+  overlay?: boolean;
+  onDismissOverlay?: () => void;
 }
 
 // Switching the active account shifts the accent color used across the
 // whole shell, not just here -- see the `accent` prop threaded through
 // App.tsx.
-export function Sidebar({ accent, onAccentChange, onAddAccount, onCompose, onOpenSettings }: SidebarProps) {
+export function Sidebar({
+  accent,
+  onAccentChange,
+  selectedFolder,
+  onFolderChange,
+  onAddAccount,
+  onCompose,
+  onOpenSettings,
+  width,
+  overlay = false,
+  onDismissOverlay,
+}: SidebarProps) {
   const accentColor = colors.accent[accent];
   const [expanded, setExpanded] = useState<Record<Accent, boolean>>({ cyan: true, purple: true });
-  const [selectedFolder, setSelectedFolder] = useState<Record<Accent, string>>({
-    cyan: "inbox",
-    purple: "inbox",
-  });
 
-  return (
-    <View style={styles.sidebar}>
+  const content = (
+    <View style={[styles.sidebar, { width }, overlay && styles.sidebarOverlay]}>
       <View style={styles.brand}>
-        <View style={[styles.mark, { borderColor: accentColor, shadowColor: accentColor }]}>
-          <Logo size={18} color={accentColor} />
-        </View>
         <Text style={styles.wordmark}>Helix</Text>
       </View>
 
@@ -99,35 +95,33 @@ export function Sidebar({ accent, onAccentChange, onAddAccount, onCompose, onOpe
                 </Text>
               </Pressable>
 
-              {isExpanded && (
-                <View style={styles.folderList}>
-                  {FOLDERS.map((folder, index) => {
-                    const folderActive = active && selectedFolder[account.id] === folder.id;
-                    const folderColor = colorForIndex(index);
-                    return (
-                      <Pressable
-                        key={folder.id}
-                        onPress={() => {
-                          onAccentChange(account.id);
-                          setSelectedFolder((prev) => ({ ...prev, [account.id]: folder.id }));
-                        }}
-                        style={({ hovered }: HoverState) => [
-                          styles.folder,
-                          folderActive && { backgroundColor: colors.background.surface, borderColor: folderColor },
-                          !folderActive && hovered && { backgroundColor: colors.background.surface },
-                        ]}
-                      >
-                        <View style={[styles.folderIcon, { backgroundColor: withAlpha(folderColor, 0.18) }]}>
-                          <Text style={[styles.folderGlyph, { color: folderColor }]}>{folder.glyph}</Text>
-                        </View>
-                        <Text style={[styles.folderLabel, folderActive && { color: colors.text.primary }]}>
-                          {folder.label}
-                        </Text>
-                      </Pressable>
-                    );
-                  })}
-                </View>
-              )}
+              <View style={[styles.folderList, !isExpanded && styles.folderListCollapsed]}>
+                {FOLDERS.map((folder, index) => {
+                  const folderActive = active && selectedFolder[account.id] === folder.id;
+                  const folderColor = colorForIndex(index);
+                  return (
+                    <Pressable
+                      key={folder.id}
+                      onPress={() => {
+                        onFolderChange(account.id, folder.id);
+                        onDismissOverlay?.();
+                      }}
+                      style={({ hovered }: HoverState) => [
+                        styles.folder,
+                        folderActive && { backgroundColor: colors.background.surface, borderColor: folderColor },
+                        !folderActive && hovered && { backgroundColor: colors.background.surface },
+                      ]}
+                    >
+                      <View style={[styles.folderIcon, { backgroundColor: withAlpha(folderColor, 0.18) }]}>
+                        <FolderIcon id={folder.id} color={folderColor} />
+                      </View>
+                      <Text style={[styles.folderLabel, folderActive && { color: colors.text.primary }]}>
+                        {folder.label}
+                      </Text>
+                    </Pressable>
+                  );
+                })}
+              </View>
             </View>
           );
         })}
@@ -138,7 +132,11 @@ export function Sidebar({ accent, onAccentChange, onAddAccount, onCompose, onOpe
         style={({ hovered }: HoverState) => [styles.settings, hovered && { backgroundColor: colors.background.surface }]}
       >
         <View style={[styles.folderIcon, { backgroundColor: colors.background.surface }]}>
-          <Text style={[styles.folderGlyph, { color: colors.text.muted }]}>+</Text>
+          <svg width={14} height={14} viewBox="0 0 24 24" fill="none" stroke={colors.text.muted} strokeWidth={1.6} strokeLinecap="round">
+            <circle cx={12} cy={12} r={9} />
+            <line x1={12} y1={8} x2={12} y2={16} />
+            <line x1={8} y1={12} x2={16} y2={12} />
+          </svg>
         </View>
         <Text style={styles.folderLabel}>Add account</Text>
       </Pressable>
@@ -148,19 +146,53 @@ export function Sidebar({ accent, onAccentChange, onAddAccount, onCompose, onOpe
         style={({ hovered }: HoverState) => [styles.settings, hovered && { backgroundColor: colors.background.surface }]}
       >
         <View style={[styles.folderIcon, { backgroundColor: colors.background.surface }]}>
-          <Text style={[styles.folderGlyph, { color: colors.text.muted }]}>ST</Text>
+          <svg width={14} height={14} viewBox="0 0 24 24" fill="none" stroke={colors.text.muted} strokeWidth={1.6} strokeLinecap="round">
+            <circle cx={12} cy={12} r={3} />
+            <path d="M12 3v3M12 18v3M3 12h3M18 12h3M5.6 5.6l2.1 2.1M16.3 16.3l2.1 2.1M5.6 18.4l2.1-2.1M16.3 7.7l2.1-2.1" />
+          </svg>
         </View>
         <Text style={styles.folderLabel}>Settings</Text>
       </Pressable>
     </View>
   );
+
+  if (!overlay) {
+    return content;
+  }
+
+  return (
+    <View style={styles.overlayContainer}>
+      <Pressable style={styles.overlayBackdrop} onPress={onDismissOverlay} />
+      {content}
+    </View>
+  );
 }
 
 const sidebarGlass = glassPanel(colors.background.panel, 0.42, 24);
+const chevronTransition: WebViewStyle = { transition: "transform 200ms ease" };
+const folderListTransition: WebViewStyle = {
+  transition: "max-height 200ms ease, opacity 150ms ease, margin-bottom 200ms ease",
+};
 
 const styles = StyleSheet.create({
+  overlayContainer: {
+    position: "absolute",
+    top: 0,
+    left: 0,
+    right: 0,
+    bottom: 0,
+    flexDirection: "row",
+    zIndex: 10,
+  },
+  overlayBackdrop: {
+    position: "absolute",
+    top: 0,
+    left: 0,
+    right: 0,
+    bottom: 0,
+    backgroundColor: "rgba(0, 0, 0, 0.5)",
+  },
   sidebar: {
-    width: 240,
     height: "100%",
     paddingVertical: spacing.lg,
     paddingHorizontal: spacing.md,
@@ -168,24 +200,17 @@ const styles = StyleSheet.create({
     borderRightWidth: 1,
     borderRightColor: colors.border.strong,
   },
+  sidebarOverlay: {
+    shadowColor: "#000000",
+    shadowOpacity: 0.6,
+    shadowRadius: 24,
+    shadowOffset: { width: 4, height: 0 },
+  },
   brand: {
     flexDirection: "row",
     alignItems: "center",
     paddingHorizontal: spacing.xs,
     marginBottom: spacing.lg,
-  },
-  mark: {
-    width: 32,
-    height: 32,
-    alignItems: "center",
-    justifyContent: "center",
-    borderRadius: radii.md,
-    borderWidth: 1,
-    backgroundColor: colors.background.surface,
-    marginRight: spacing.sm,
-    shadowOpacity: 0.5,
-    shadowRadius: 8,
-    shadowOffset: { width: 0, height: 0 },
   },
   wordmark: {
     fontFamily: fontFamily.display,
@@ -241,13 +266,14 @@ const styles = StyleSheet.create({
   },
   accountEmail: {
     fontFamily: fontFamily.mono,
-    fontSize: 10,
-    color: colors.text.muted,
+    fontSize: fontSize.xs,
+    color: colors.text.secondary,
   },
   chevron: {
     fontSize: fontSize.md,
     color: colors.text.muted,
     transform: [{ rotate: "0deg" }],
+    ...chevronTransition,
   },
   chevronOpen: {
     transform: [{ rotate: "90deg" }],
@@ -256,6 +282,15 @@ const styles = StyleSheet.create({
     marginTop: 2,
     marginBottom: spacing.sm,
     paddingLeft: spacing.lg,
+    maxHeight: 260,
+    opacity: 1,
+    overflow: "hidden",
+    ...folderListTransition,
+  },
+  folderListCollapsed: {
+    maxHeight: 0,
+    opacity: 0,
+    marginBottom: 0,
   },
   folder: {
     flexDirection: "row",
@@ -274,11 +309,6 @@ const styles = StyleSheet.create({
     justifyContent: "center",
     borderRadius: radii.sm,
     marginRight: spacing.sm,
-  },
-  folderGlyph: {
-    fontFamily: fontFamily.mono,
-    fontSize: 9,
-    fontWeight: "600",
   },
   folderLabel: {
     fontFamily: fontFamily.ui,

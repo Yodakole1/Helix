@@ -88,9 +88,31 @@ three panels (`App.tsx` threads `accent` state down to `Sidebar`,
 
 Three-pane shell in `App.tsx`: `Sidebar` (accounts + folders) |
 `MessageList` (message rows for the active folder) | `ReaderPane` (selected
-message body). `MessageList` currently owns `SAMPLE_MESSAGES`, illustrative
-data only -- there is no account sync wired into the UI yet. `ReaderPane`
-imports that same sample data by id rather than owning its own copy.
+message body). `App.tsx` owns the cross-pane state -- `accent`,
+`selectedFolder` (per account), pane widths, and breakpoint/view-stack state
+-- and threads it down, rather than panes tracking their own slice of it.
+
+The shell is responsive via `useBreakpoint()` (`src/hooks/useBreakpoint.ts`,
+wrapping `useWindowDimensions`): desktop (>=1080px) shows all three panes
+with draggable `Splitter` components between them; tablet (720-1079px) drops
+the sidebar to a dismissable overlay (toggled by a corner button) and keeps
+list+reader side by side; mobile (<720px) shows one pane at a time with
+list/reader view-stack navigation (`ReaderPane`'s `onBack`). Pane widths
+persist across reloads via `usePersistedState` (`src/hooks/
+usePersistedState.ts`, a thin localStorage-backed hook scoped to numeric
+layout values). `MessageList` renders rows through `FlatList` rather than a
+plain `.map()`, so only visible rows mount.
+
+Sample message data lives in `src/data/messages.ts`, keyed by
+`"<account>:<folder>"` (`getMessagesFor`/`findMessage`) -- illustrative only,
+there is no account sync wired into the UI yet, but folder/account switching
+in the sidebar now actually changes what the list and reader pane show
+rather than always rendering the same fixed rows. Folder metadata
+(id/label/glyph) lives in `src/data/folders.ts`, shared between `Sidebar`
+and `MessageList`'s header label. See `docs/technical/frontend-layout.md`
+for the breakpoint/splitter/persistence details.
+
+### Backend: Tauri 2 (Rust), one module per concern
 
 ### Backend: Tauri 2 (Rust), one module per concern
 

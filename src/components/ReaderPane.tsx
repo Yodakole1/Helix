@@ -1,64 +1,149 @@
-import { StyleSheet, Text, View } from "react-native";
+import { useEffect, useState } from "react";
+import { Pressable, StyleSheet, Text, View } from "react-native";
+import type { SampleMessage } from "../data/messages";
+import { formatMessageTime, getAttachment, getBody } from "../data/messages";
+import type { HoverState } from "../lib/pressable";
 import { glassPanel } from "../lib/webStyle";
 import type { Accent } from "../theme";
 import { colorForIndex, colors, fontFamily, fontSize, radii, spacing } from "../theme";
-import { SAMPLE_MESSAGES } from "./MessageList";
-
-// Body copy and the attachment shown below are part of the same layout
-// preview as the rows in MessageList -- not real synced mail.
-const BODY_BY_ID: Record<number, string> = {
-  1: "Thanks for trying the early build. The desktop shell and account silos are wired up. Account setup and real IMAP sync are next.",
-  2: "Looks good, one comment on the timeline for the encryption work -- can we slot key generation before the OAuth flow instead of after?",
-  3: "Issue #42: add OAuth support for Gmail and Outlook accounts. Filed by a contributor, needs triage.",
-  4: "Sending over the IMAP server config we discussed on the call. Let me know if port 993 with implicit TLS works on your end.",
-  5: "Your PGP keypair has been generated and stored in your OS keychain. The attachment below holds the exported public key.",
-};
-
-const ATTACHMENT_BY_ID: Record<number, { name: string; size: string }> = {
-  5: { name: "helix-public-key.asc", size: "4 KB" },
-};
+import { FolderIcon } from "./FolderIcon";
+import { ListIcon } from "./ListIcon";
 
 interface ReaderPaneProps {
   accent: Accent;
-  selectedId: number;
+  message: SampleMessage | undefined;
+  avatarIndex: number;
+  // Present only when rendered in the mobile single-pane view-stack.
+  onBack?: () => void;
+  onReply: (message: SampleMessage) => void;
+  onToggleStar: (id: number) => void;
+  onArchive: (id: number) => void;
+  onMoveToSpam: (id: number) => void;
+  onDelete: (id: number) => void;
+  onMarkUnread: (id: number) => void;
 }
 
-export function ReaderPane({ accent, selectedId }: ReaderPaneProps) {
-  const index = SAMPLE_MESSAGES.findIndex((candidate) => candidate.id === selectedId);
-  const message = SAMPLE_MESSAGES[index];
+export function ReaderPane({
+  accent,
+  message,
+  avatarIndex,
+  onBack,
+  onReply,
+  onToggleStar,
+  onArchive,
+  onMoveToSpam,
+  onDelete,
+  onMarkUnread,
+}: ReaderPaneProps) {
   const accentColor = colors.accent[accent];
 
+  // A message with poor color/font choices in its own content can be
+  // unreadable in the app's dark theme -- this flips just the content
+  // area, not the app's own chrome. Resets per message rather than
+  // staying sticky, since the problem is per-email, not a reader setting.
+  const [lightMode, setLightMode] = useState(false);
+  useEffect(() => {
+    setLightMode(false);
+  }, [message?.id]);
+
   if (!message) {
-    return <View style={styles.pane} />;
+    return (
+      <View style={[styles.pane, styles.emptyPane]}>
+        <Text style={styles.emptyText}>No email open</Text>
+      </View>
+    );
   }
 
-  const avatarColor = colorForIndex(index);
-  const attachment = ATTACHMENT_BY_ID[message.id];
+  const avatarColor = colorForIndex(avatarIndex);
+  const attachment = getAttachment(message.id);
 
   return (
     <View style={styles.pane}>
       <View style={[styles.header, { borderBottomColor: accentColor }]}>
+        {onBack && (
+          <Pressable onPress={onBack} style={styles.backButton}>
+            <Text style={[styles.backText, { color: accentColor }]}>&#8249; Back</Text>
+          </Pressable>
+        )}
         <Text style={styles.subject}>{message.subject}</Text>
+
+        <View style={styles.actionsRow}>
+          <Pressable
+            onPress={() => onReply(message)}
+            style={[styles.replyButton, { backgroundColor: accentColor, shadowColor: accentColor }]}
+          >
+            <Text style={styles.replyButtonText}>Reply</Text>
+          </Pressable>
+          <Pressable onPress={() => onToggleStar(message.id)} style={styles.actionButton}>
+            <ListIcon
+              name="star"
+              filled={message.starred}
+              color={message.starred ? colors.accent.amber : colors.text.muted}
+              size={15}
+            />
+          </Pressable>
+          <Pressable onPress={() => onArchive(message.id)} style={styles.actionButton}>
+            <FolderIcon id="archive" color={colors.text.muted} size={15} />
+          </Pressable>
+          <Pressable onPress={() => onMoveToSpam(message.id)} style={styles.actionButton}>
+            <FolderIcon id="spam" color={colors.text.muted} size={15} />
+          </Pressable>
+          <Pressable onPress={() => onDelete(message.id)} style={styles.actionButton}>
+            <FolderIcon id="trash" color={colors.text.muted} size={15} />
+          </Pressable>
+          <Pressable
+            onPress={() => onMarkUnread(message.id)}
+            style={[styles.markUnreadPill, { borderColor: accentColor }]}
+          >
+            <Text style={[styles.markUnreadPillText, { color: accentColor }]}>Mark as unread</Text>
+          </Pressable>
+        </View>
+
+        {/* Last in the header on purpose -- the hover tooltip below drops
+            down from here, so nothing else in the header can sit beneath
+            it and get visually collided with. */}
         <View style={styles.metaRow}>
-          <View style={styles.senderRow}>
-            <View style={[styles.avatar, { backgroundColor: avatarColor }]}>
-              <Text style={styles.avatarText}>{message.sender.charAt(0).toUpperCase()}</Text>
-            </View>
-            <Text style={styles.sender}>{message.sender}</Text>
-          </View>
-          <Text style={styles.time}>{message.time}</Text>
+          <Pressable style={styles.senderRow}>
+            {({ hovered }: HoverState) => (
+              <>
+                <View style={[styles.avatar, { backgroundColor: avatarColor }]}>
+                  <Text style={styles.avatarText}>{message.sender.charAt(0).toUpperCase()}</Text>
+                </View>
+                <Text style={styles.sender}>{message.sender}</Text>
+                {hovered && (
+                  <View style={[styles.senderTooltip, { borderColor: accentColor }]}>
+                    <Text style={styles.senderTooltipName}>{message.sender}</Text>
+                    <Text style={styles.senderTooltipDetail}>{message.senderEmail}</Text>
+                    <Text style={styles.senderTooltipDetail}>To: {message.to}</Text>
+                  </View>
+                )}
+              </>
+            )}
+          </Pressable>
+          <Text style={styles.time}>{formatMessageTime(message.date)}</Text>
         </View>
       </View>
 
-      <View style={styles.body}>
-        <Text style={styles.bodyText}>{BODY_BY_ID[message.id]}</Text>
+      <View style={[styles.body, lightMode && styles.bodyLight]}>
+        <Pressable
+          onPress={() => setLightMode((value) => !value)}
+          style={[styles.lightModeToggle, { borderColor: accentColor }, lightMode && { backgroundColor: accentColor }]}
+        >
+          <Text style={[styles.lightModeToggleText, lightMode ? { color: colors.background.base } : { color: accentColor }]}>
+            {lightMode ? "Dark mode" : "Light mode"}
+          </Text>
+        </Pressable>
+
+        <Text style={[styles.bodyText, lightMode && styles.bodyTextLight]}>{getBody(message.id)}</Text>
 
         {attachment && (
-          <View style={[styles.vaultCard, { borderColor: accentColor }]}>
+          <View style={[styles.vaultCard, { borderColor: accentColor }, lightMode && styles.vaultCardLight]}>
             <View style={[styles.vaultLock, { backgroundColor: accentColor }]} />
             <View>
-              <Text style={styles.vaultName}>{attachment.name}</Text>
-              <Text style={styles.vaultMeta}>{attachment.size} -- encrypted attachment</Text>
+              <Text style={[styles.vaultName, lightMode && styles.bodyTextLight]}>{attachment.name}</Text>
+              <Text style={[styles.vaultMeta, lightMode && styles.vaultMetaLight]}>
+                {attachment.size} -- encrypted attachment
+              </Text>
             </View>
           </View>
         )}
@@ -73,10 +158,28 @@ const styles = StyleSheet.create({
     height: "100%",
     ...glassPanel(colors.background.base, 0.55, 30),
   },
+  emptyPane: {
+    alignItems: "center",
+    justifyContent: "center",
+  },
+  emptyText: {
+    fontFamily: fontFamily.ui,
+    fontSize: fontSize.sm,
+    color: colors.text.muted,
+  },
   header: {
     paddingHorizontal: spacing.xxl,
     paddingVertical: spacing.xl,
     borderBottomWidth: 1,
+  },
+  backButton: {
+    alignSelf: "flex-start",
+    marginBottom: spacing.md,
+  },
+  backText: {
+    fontFamily: fontFamily.ui,
+    fontSize: fontSize.sm,
+    fontWeight: "600",
   },
   subject: {
     fontFamily: fontFamily.display,
@@ -93,6 +196,32 @@ const styles = StyleSheet.create({
   senderRow: {
     flexDirection: "row",
     alignItems: "center",
+    position: "relative",
+  },
+  senderTooltip: {
+    position: "absolute",
+    top: "100%",
+    left: 0,
+    marginTop: spacing.sm,
+    minWidth: 220,
+    padding: spacing.md,
+    borderRadius: radii.md,
+    borderWidth: 1,
+    backgroundColor: colors.background.panel,
+    zIndex: 30,
+  },
+  senderTooltipName: {
+    fontFamily: fontFamily.ui,
+    fontSize: fontSize.sm,
+    fontWeight: "600",
+    color: colors.text.primary,
+    marginBottom: 4,
+  },
+  senderTooltipDetail: {
+    fontFamily: fontFamily.mono,
+    fontSize: fontSize.xs,
+    color: colors.text.secondary,
+    marginBottom: 2,
   },
   avatar: {
     width: 24,
@@ -118,9 +247,61 @@ const styles = StyleSheet.create({
     fontSize: fontSize.xs,
     color: colors.text.muted,
   },
+  actionsRow: {
+    flexDirection: "row",
+    alignItems: "center",
+    marginBottom: spacing.md,
+  },
+  actionButton: {
+    padding: spacing.xs,
+    marginRight: spacing.sm,
+  },
+  replyButton: {
+    paddingVertical: 6,
+    paddingHorizontal: spacing.md,
+    borderRadius: radii.pill,
+    marginRight: spacing.md,
+    shadowOpacity: 0.5,
+    shadowRadius: 8,
+    shadowOffset: { width: 0, height: 0 },
+  },
+  replyButtonText: {
+    fontFamily: fontFamily.ui,
+    fontSize: fontSize.xs,
+    fontWeight: "700",
+    color: colors.background.base,
+  },
+  markUnreadPill: {
+    paddingVertical: 4,
+    paddingHorizontal: spacing.sm,
+    borderWidth: 1,
+    borderRadius: radii.pill,
+  },
+  markUnreadPillText: {
+    fontFamily: fontFamily.ui,
+    fontSize: 11,
+    fontWeight: "600",
+  },
   body: {
+    flex: 1,
     paddingHorizontal: spacing.xxl,
     paddingVertical: spacing.xl,
+  },
+  bodyLight: {
+    backgroundColor: "#FFFFFF",
+  },
+  lightModeToggle: {
+    alignSelf: "flex-end",
+    paddingVertical: spacing.xs,
+    paddingHorizontal: spacing.md,
+    borderWidth: 1,
+    borderRadius: radii.pill,
+    marginBottom: spacing.lg,
+  },
+  lightModeToggleText: {
+    fontFamily: fontFamily.ui,
+    fontSize: fontSize.xs,
+    fontWeight: "600",
   },
   bodyText: {
     fontFamily: fontFamily.ui,
@@ -128,6 +309,9 @@ const styles = StyleSheet.create({
     lineHeight: 24,
     color: colors.text.primary,
     marginBottom: spacing.xl,
+  },
+  bodyTextLight: {
+    color: "#000000",
   },
   vaultCard: {
     flexDirection: "row",
@@ -138,6 +322,9 @@ const styles = StyleSheet.create({
     borderWidth: 1,
     borderRadius: radii.lg,
     backgroundColor: colors.background.surface,
+  },
+  vaultCardLight: {
+    backgroundColor: "#F0F0F0",
   },
   vaultLock: {
     width: 28,
@@ -155,5 +342,8 @@ const styles = StyleSheet.create({
     fontFamily: fontFamily.mono,
     fontSize: fontSize.xs,
     color: colors.text.muted,
+  },
+  vaultMetaLight: {
+    color: "#555555",
   },
 });

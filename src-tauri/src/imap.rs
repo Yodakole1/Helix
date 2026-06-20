@@ -87,6 +87,7 @@ pub struct MessageSummary {
     pub from: Option<String>,
     pub date: Option<String>,
     pub seen: bool,
+    pub flagged: bool,
 }
 
 /// Plain UTF-8 decoding for header parts that are never RFC 2047 encoded —
@@ -159,6 +160,7 @@ async fn fetch_recent_messages(
                     .map(format_address),
                 date: fetch.internal_date().map(|d| d.to_rfc3339()),
                 seen: fetch.flags().any(|flag| flag == async_imap::types::Flag::Seen),
+                flagged: fetch.flags().any(|flag| flag == async_imap::types::Flag::Flagged),
             }
         })
         .try_collect()
@@ -264,6 +266,236 @@ pub async fn fetch_message_body(
     result
 }
 
+/// Adds or removes one flag on one message via `UID STORE`. Opens the
+/// folder with `SELECT`, not `EXAMINE` -- unlike `fetch_messages`, this is
+/// specifically here to mutate mailbox state.
+async fn set_flag(
+    session: &mut ImapSession,
+    folder: &str,
+    uid: u32,
+    flag: &str,
+    set: bool,
+) -> Result<(), String> {
+    session
+        .select(folder)
+        .await
+        .map_err(|e| format!("could not open folder {folder}: {e}"))?;
+
+    let sign = if set { "+" } else { "-" };
+    session
+        .uid_store(uid.to_string(), format!("{sign}FLAGS.SILENT ({flag})"))
+        .await
+        .map_err(|e| format!("STORE failed: {e}"))?
+        .try_collect::<Vec<_>>()
+        .await
+        .map_err(|e| format!("STORE failed: {e}"))?;
+
+    Ok(())
+}
+
+#[tauri::command]
+pub async fn set_message_seen(
+    account_id: String,
+    host: String,
+    port: u16,
+    folder: String,
+    uid: u32,
+    seen: bool,
+) -> Result<(), String> {
+    let mut session = login_with_stored_credential(&host, port, &account_id).await?;
+    let result = set_flag(&mut session, &folder, uid, "\\Seen", seen).await;
+    session.logout().await.ok();
+    result
+}
+
+#[tauri::command]
+pub async fn set_message_flagged(
+    account_id: String,
+    host: String,
+    port: u16,
+    folder: String,
+    uid: u32,
+    flagged: bool,
+) -> Result<(), String> {
+    let mut session = login_with_stored_credential(&host, port, &account_id).await?;
+    let result = set_flag(&mut session, &folder, uid, "\\Flagged", flagged).await;
+    session.logout().await.ok();
+    result
+}
+
+/// Fallback for servers that support neither MOVE (RFC 6851) nor UIDPLUS
+/// (RFC 4315): COPY to the destination, mark the original `\Deleted`, then
+/// `UID EXPUNGE` just that one UID without touching anything else flagged
+/// `\Deleted` in the folder.
+async fn move_via_copy_store_uid_expunge(
+    session: &mut ImapSession,
+    uid_str: &str,
+    destination_folder: &str,
+) -> Result<(), String> {
+    session
+        .uid_copy(uid_str, destination_folder)
+        .await
+        .map_err(|e| format!("COPY failed: {e}"))?;
+
+    session
+        .uid_store(uid_str, "+FLAGS.SILENT (\\Deleted)")
+        .await
+        .map_err(|e| format!("STORE failed: {e}"))?
+        .try_collect::<Vec<_>>()
+        .await
+        .map_err(|e| format!("STORE failed: {e}"))?;
+
+    session
+        .uid_expunge(uid_str)
+        .await
+        .map_err(|e| format!("EXPUNGE failed: {e}"))?
+        .try_collect::<Vec<_>>()
+        .await
+        .map_err(|e| format!("EXPUNGE failed: {e}"))?;
+
+    Ok(())
+}
+
+/// Last-resort fallback for servers with neither MOVE nor UIDPLUS (the
+/// real professional mail host used elsewhere in these docs for manual
+/// verification is one -- see `mailbox-actions.md`). A bare `EXPUNGE`
+/// would remove every `\Deleted` message in the folder, not just this
+/// one, so any message some other client had already marked `\Deleted`
+/// and not yet cleaned up would be silently destroyed too. Instead: find
+/// those other already-deleted messages, temporarily un-delete them,
+/// delete only the target UID, expunge, then restore their `\Deleted`
+/// flag. This is the exact dance RFC 3501's own `STORE`/`EXPUNGE`
+/// documentation describes for this situation -- not a novel workaround.
+///
+/// Not race-free: a message marked `\Deleted` by another client between
+/// the `SEARCH` and the `EXPUNGE` here would still be removed. That
+/// window is inherent to not having UIDPLUS, not a bug in this function.
+async fn move_via_search_store_expunge(
+    session: &mut ImapSession,
+    uid: u32,
+    destination_folder: &str,
+) -> Result<(), String> {
+    let uid_str = uid.to_string();
+
+    session
+        .uid_copy(&uid_str, destination_folder)
+        .await
+        .map_err(|e| format!("COPY failed: {e}"))?;
+
+    let other_deleted: Vec<u32> = session
+        .uid_search("DELETED")
+        .await
+        .map_err(|e| format!("SEARCH failed: {e}"))?
+        .into_iter()
+        .filter(|&other_uid| other_uid != uid)
+        .collect();
+    let other_deleted_set = other_deleted
+        .iter()
+        .map(|u| u.to_string())
+        .collect::<Vec<_>>()
+        .join(",");
+
+    if !other_deleted.is_empty() {
+        session
+            .uid_store(&other_deleted_set, "-FLAGS.SILENT (\\Deleted)")
+            .await
+            .map_err(|e| format!("STORE failed: {e}"))?
+            .try_collect::<Vec<_>>()
+            .await
+            .map_err(|e| format!("STORE failed: {e}"))?;
+    }
+
+    let delete_and_expunge_result: Result<(), String> = async {
+        session
+            .uid_store(&uid_str, "+FLAGS.SILENT (\\Deleted)")
+            .await
+            .map_err(|e| format!("STORE failed: {e}"))?
+            .try_collect::<Vec<_>>()
+            .await
+            .map_err(|e| format!("STORE failed: {e}"))?;
+
+        session
+            .expunge()
+            .await
+            .map_err(|e| format!("EXPUNGE failed: {e}"))?
+            .try_collect::<Vec<_>>()
+            .await
+            .map_err(|e| format!("EXPUNGE failed: {e}"))?;
+
+        Ok(())
+    }
+    .await;
+
+    let restore_result = if other_deleted.is_empty() {
+        Ok(())
+    } else {
+        session
+            .uid_store(&other_deleted_set, "+FLAGS.SILENT (\\Deleted)")
+            .await
+            .map_err(|e| format!("restoring other \\Deleted flags failed: {e}"))?
+            .try_collect::<Vec<_>>()
+            .await
+            .map_err(|e| format!("restoring other \\Deleted flags failed: {e}"))
+            .map(|_: Vec<_>| ())
+    };
+
+    delete_and_expunge_result?;
+    restore_result?;
+    Ok(())
+}
+
+/// Moves one message by UID into `destination_folder`, preferring the
+/// most reliable mechanism the server actually supports: MOVE (RFC 6851)
+/// first, then a UIDPLUS-based COPY+STORE+EXPUNGE, then the careful
+/// SEARCH-based dance as a last resort. See `mailbox-actions.md` for why
+/// all three exist -- real providers in the wild are split across all
+/// three capability levels.
+async fn move_message(
+    session: &mut ImapSession,
+    folder: &str,
+    uid: u32,
+    destination_folder: &str,
+) -> Result<(), String> {
+    session
+        .select(folder)
+        .await
+        .map_err(|e| format!("could not open folder {folder}: {e}"))?;
+
+    let capabilities = session
+        .capabilities()
+        .await
+        .map_err(|e| format!("CAPABILITY failed: {e}"))?;
+    let uid_str = uid.to_string();
+
+    if capabilities.has_str("MOVE") {
+        return session
+            .uid_mv(&uid_str, destination_folder)
+            .await
+            .map_err(|e| format!("MOVE failed: {e}"));
+    }
+
+    if capabilities.has_str("UIDPLUS") {
+        return move_via_copy_store_uid_expunge(session, &uid_str, destination_folder).await;
+    }
+
+    move_via_search_store_expunge(session, uid, destination_folder).await
+}
+
+#[tauri::command]
+pub async fn move_message_to_folder(
+    account_id: String,
+    host: String,
+    port: u16,
+    folder: String,
+    uid: u32,
+    destination_folder: String,
+) -> Result<(), String> {
+    let mut session = login_with_stored_credential(&host, port, &account_id).await?;
+    let result = move_message(&mut session, &folder, uid, &destination_folder).await;
+    session.logout().await.ok();
+    result
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -361,18 +593,11 @@ mod tests {
         );
     }
 
-    // Exercises the actual EXAMINE/FETCH/envelope-decoding logic against a
-    // real IMAP server, which the two tests above never reach (they fail at
-    // login). Needs a local GreenMail test server — see
-    // docs/technical/imap-core.md for the docker command to start one and
-    // inject a test message before running this.
-    //
-    // GreenMail's TLS cert is self-signed, so this test builds its own
-    // permissive connector instead of going through `connect_and_login` —
-    // production code must keep validating certificates normally.
-    #[tokio::test]
-    #[ignore = "requires a local GreenMail test server, see docs/technical/imap-core.md"]
-    async fn parses_a_real_message_from_a_local_test_server() {
+    /// Shared GreenMail connection setup for the local-test-server suite
+    /// below. GreenMail's TLS cert is self-signed, so this builds its own
+    /// permissive connector instead of going through `connect_and_login` —
+    /// production code must keep validating certificates normally.
+    async fn connect_to_greenmail_and_login() -> ImapSession {
         let tcp_stream = TcpStream::connect(("127.0.0.1", 3993))
             .await
             .expect("GreenMail should be reachable on 127.0.0.1:3993");
@@ -388,11 +613,22 @@ mod tests {
             .await
             .expect("TLS handshake with GreenMail should succeed");
 
-        let mut session = async_imap::Client::new(tls_stream)
+        async_imap::Client::new(tls_stream)
             .login("helix", "helixpass")
             .await
             .map_err(|(e, _)| e)
-            .expect("login to the GreenMail test account should succeed");
+            .expect("login to the GreenMail test account should succeed")
+    }
+
+    // Exercises the actual EXAMINE/FETCH/envelope-decoding logic against a
+    // real IMAP server, which the two tests above never reach (they fail at
+    // login). Needs a local GreenMail test server — see
+    // docs/technical/imap-core.md for the docker command to start one and
+    // inject a test message before running this.
+    #[tokio::test]
+    #[ignore = "requires a local GreenMail test server, see docs/technical/imap-core.md"]
+    async fn parses_a_real_message_from_a_local_test_server() {
+        let mut session = connect_to_greenmail_and_login().await;
 
         let messages = fetch_recent_messages(&mut session, "INBOX", 10)
             .await
@@ -417,26 +653,7 @@ mod tests {
     #[tokio::test]
     #[ignore = "requires a local GreenMail test server, see docs/technical/imap-core.md"]
     async fn parses_a_multipart_message_with_attachment_from_a_local_test_server() {
-        let tcp_stream = TcpStream::connect(("127.0.0.1", 3993))
-            .await
-            .expect("GreenMail should be reachable on 127.0.0.1:3993");
-
-        let insecure_connector = TlsConnector::from(
-            tokio_native_tls::native_tls::TlsConnector::builder()
-                .danger_accept_invalid_certs(true)
-                .build()
-                .expect("building a permissive test TLS connector should not fail"),
-        );
-        let tls_stream = insecure_connector
-            .connect("127.0.0.1", tcp_stream)
-            .await
-            .expect("TLS handshake with GreenMail should succeed");
-
-        let mut session = async_imap::Client::new(tls_stream)
-            .login("helix", "helixpass")
-            .await
-            .map_err(|(e, _)| e)
-            .expect("login to the GreenMail test account should succeed");
+        let mut session = connect_to_greenmail_and_login().await;
 
         let body = fetch_body_by_uid(&mut session, "INBOX", 1)
             .await
@@ -450,5 +667,174 @@ mod tests {
         assert_eq!(body.attachments[0].filename.as_deref(), Some("document.pdf"));
         assert_eq!(body.attachments[0].content_type.as_deref(), Some("application/pdf"));
         assert!(body.attachments[0].size > 0);
+    }
+
+    // Exercises set_flag's UID STORE path for \Seen against a real message.
+    // Needs the same single-message GreenMail seed as
+    // parses_a_real_message_from_a_local_test_server — see
+    // docs/technical/mailbox-actions.md.
+    #[tokio::test]
+    #[ignore = "requires a local GreenMail test server, see docs/technical/mailbox-actions.md"]
+    async fn sets_and_clears_the_seen_flag_against_a_local_test_server() {
+        let mut session = connect_to_greenmail_and_login().await;
+
+        set_flag(&mut session, "INBOX", 1, "\\Seen", true)
+            .await
+            .expect("setting \\Seen should succeed");
+        let messages = fetch_recent_messages(&mut session, "INBOX", 1)
+            .await
+            .expect("fetch should succeed");
+        assert!(messages[0].seen, "message should be seen after setting the flag");
+
+        set_flag(&mut session, "INBOX", 1, "\\Seen", false)
+            .await
+            .expect("clearing \\Seen should succeed");
+        let messages = fetch_recent_messages(&mut session, "INBOX", 1)
+            .await
+            .expect("fetch should succeed");
+        assert!(!messages[0].seen, "message should not be seen after clearing the flag");
+
+        session.logout().await.ok();
+    }
+
+    // Same shape as the \Seen test above, for \Flagged -- the "star" action.
+    #[tokio::test]
+    #[ignore = "requires a local GreenMail test server, see docs/technical/mailbox-actions.md"]
+    async fn sets_and_clears_the_flagged_flag_against_a_local_test_server() {
+        let mut session = connect_to_greenmail_and_login().await;
+
+        set_flag(&mut session, "INBOX", 1, "\\Flagged", true)
+            .await
+            .expect("setting \\Flagged should succeed");
+        let messages = fetch_recent_messages(&mut session, "INBOX", 1)
+            .await
+            .expect("fetch should succeed");
+        assert!(messages[0].flagged, "message should be flagged after setting the flag");
+
+        set_flag(&mut session, "INBOX", 1, "\\Flagged", false)
+            .await
+            .expect("clearing \\Flagged should succeed");
+        let messages = fetch_recent_messages(&mut session, "INBOX", 1)
+            .await
+            .expect("fetch should succeed");
+        assert!(!messages[0].flagged, "message should not be flagged after clearing the flag");
+
+        session.logout().await.ok();
+    }
+
+    // Exercises move_message's dispatcher end to end: GreenMail advertises
+    // the MOVE capability, so this is also proof that the capability check
+    // correctly prefers MOVE when it's available, not just that uid_mv
+    // works in isolation.
+    #[tokio::test]
+    #[ignore = "requires a local GreenMail test server, see docs/technical/mailbox-actions.md"]
+    async fn moves_a_message_via_the_move_extension_on_a_local_test_server() {
+        let mut session = connect_to_greenmail_and_login().await;
+        session
+            .create("Archive")
+            .await
+            .expect("creating the destination folder should succeed");
+
+        move_message(&mut session, "INBOX", 1, "Archive")
+            .await
+            .expect("move should succeed");
+
+        let inbox_messages = fetch_recent_messages(&mut session, "INBOX", 10)
+            .await
+            .expect("fetch should succeed");
+        assert!(inbox_messages.is_empty(), "the message should no longer be in INBOX");
+
+        let archive_messages = fetch_recent_messages(&mut session, "Archive", 10)
+            .await
+            .expect("fetch should succeed");
+        assert_eq!(archive_messages.len(), 1, "the message should have landed in Archive");
+
+        session.logout().await.ok();
+    }
+
+    // GreenMail itself always advertises MOVE, so the only way to exercise
+    // the UIDPLUS-based fallback's actual mechanics is to call it directly
+    // rather than through move_message's capability check.
+    #[tokio::test]
+    #[ignore = "requires a local GreenMail test server, see docs/technical/mailbox-actions.md"]
+    async fn moves_a_message_via_the_uidplus_fallback_on_a_local_test_server() {
+        let mut session = connect_to_greenmail_and_login().await;
+        session
+            .create("Archive")
+            .await
+            .expect("creating the destination folder should succeed");
+        session.select("INBOX").await.expect("select should succeed");
+
+        move_via_copy_store_uid_expunge(&mut session, "1", "Archive")
+            .await
+            .expect("move should succeed");
+
+        let inbox_messages = fetch_recent_messages(&mut session, "INBOX", 10)
+            .await
+            .expect("fetch should succeed");
+        assert!(inbox_messages.is_empty(), "the message should no longer be in INBOX");
+
+        let archive_messages = fetch_recent_messages(&mut session, "Archive", 10)
+            .await
+            .expect("fetch should succeed");
+        assert_eq!(archive_messages.len(), 1, "the message should have landed in Archive");
+
+        session.logout().await.ok();
+    }
+
+    // The important case for the last-resort fallback: a second message
+    // (UID 2) stands in for one some *other* IMAP client already marked
+    // \Deleted and hasn't expunged yet -- exactly what this fallback exists
+    // to not destroy while moving UID 1. Needs a GreenMail container seeded
+    // with two plain-text messages (UIDs 1 and 2) -- see
+    // docs/technical/mailbox-actions.md.
+    #[tokio::test]
+    #[ignore = "requires a local GreenMail test server, see docs/technical/mailbox-actions.md"]
+    async fn moves_a_message_via_the_search_fallback_without_losing_other_deleted_messages_on_a_local_test_server()
+     {
+        let mut session = connect_to_greenmail_and_login().await;
+        session
+            .create("Archive")
+            .await
+            .expect("creating the destination folder should succeed");
+        session.select("INBOX").await.expect("select should succeed");
+
+        session
+            .uid_store("2", "+FLAGS.SILENT (\\Deleted)")
+            .await
+            .expect("marking UID 2 deleted should succeed")
+            .try_collect::<Vec<_>>()
+            .await
+            .expect("marking UID 2 deleted should succeed");
+
+        move_via_search_store_expunge(&mut session, 1, "Archive")
+            .await
+            .expect("move should succeed");
+
+        let inbox_messages = fetch_recent_messages(&mut session, "INBOX", 10)
+            .await
+            .expect("fetch should succeed");
+        assert_eq!(
+            inbox_messages.len(),
+            1,
+            "UID 2 must survive the expunge -- only UID 1 should have been removed"
+        );
+        assert_eq!(inbox_messages[0].uid, Some(2));
+
+        let still_deleted = session
+            .uid_search("DELETED")
+            .await
+            .expect("search should succeed");
+        assert!(
+            still_deleted.contains(&2),
+            "UID 2's \\Deleted flag should have been restored after the expunge"
+        );
+
+        let archive_messages = fetch_recent_messages(&mut session, "Archive", 10)
+            .await
+            .expect("fetch should succeed");
+        assert_eq!(archive_messages.len(), 1, "UID 1 should have landed in Archive");
+
+        session.logout().await.ok();
     }
 }

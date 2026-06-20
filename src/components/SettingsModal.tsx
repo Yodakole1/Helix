@@ -1,5 +1,5 @@
 import { useState } from "react";
-import { Pressable, ScrollView, StyleSheet, Text, View } from "react-native";
+import { Pressable, ScrollView, StyleSheet, Text, TextInput, View } from "react-native";
 import { ACCOUNTS } from "../data/accounts";
 import type { HoverState } from "../lib/pressable";
 import type { Accent } from "../theme";
@@ -21,10 +21,20 @@ interface SettingsModalProps {
   accent: Accent;
   compactList: boolean;
   onToggleCompactList: () => void;
+  signature: string;
+  onSignatureChange: (signature: string) => void;
   onClose: () => void;
 }
 
-export function SettingsModal({ visible, accent, compactList, onToggleCompactList, onClose }: SettingsModalProps) {
+export function SettingsModal({
+  visible,
+  accent,
+  compactList,
+  onToggleCompactList,
+  signature,
+  onSignatureChange,
+  onClose,
+}: SettingsModalProps) {
   const [category, setCategory] = useState<Category>("accounts");
   const [blockImages, setBlockImages] = useState(true);
   const [readReceipts, setReadReceipts] = useState(false);
@@ -33,7 +43,7 @@ export function SettingsModal({ visible, accent, compactList, onToggleCompactLis
   const accentColor = colors.accent[accent];
 
   return (
-    <ModalOverlay visible={visible} accent={accent} title="Settings" width={720} onClose={onClose}>
+    <ModalOverlay visible={visible} accent={accent} title="Settings" width={900} onClose={onClose}>
       <View style={styles.body}>
         <View style={styles.nav}>
           {CATEGORIES.map((item) => {
@@ -128,9 +138,30 @@ export function SettingsModal({ visible, accent, compactList, onToggleCompactLis
                 onChange={() => setUnifiedInbox((value) => !value)}
                 color={accentColor}
               />
+
+              <Text style={styles.sectionTitle}>Signature</Text>
+              <TextInput
+                style={styles.signatureInput}
+                value={signature}
+                onChangeText={onSignatureChange}
+                placeholder="Sent from Helix"
+                placeholderTextColor={colors.text.muted}
+                multiline
+                textAlignVertical="top"
+              />
+              <Text style={styles.hint}>
+                Appended to the body when you start a new message, the same way any signature does -- it only
+                pre-fills an empty draft, so it never overwrites one already in progress.
+              </Text>
             </View>
           )}
         </ScrollView>
+      </View>
+
+      <View style={styles.footer}>
+        <Pressable onPress={onClose} style={[styles.saveButton, { backgroundColor: accentColor, shadowColor: accentColor }]}>
+          <Text style={styles.saveButtonText}>Save</Text>
+        </Pressable>
       </View>
     </ModalOverlay>
   );
@@ -159,7 +190,29 @@ function SettingRow({ label, description, value, onChange, color }: SettingRowPr
 const styles = StyleSheet.create({
   body: {
     flexDirection: "row",
-    minHeight: 360,
+    minHeight: 480,
+  },
+  footer: {
+    flexDirection: "row",
+    justifyContent: "flex-end",
+    marginTop: spacing.lg,
+    paddingTop: spacing.lg,
+    borderTopWidth: 1,
+    borderTopColor: colors.border.subtle,
+  },
+  saveButton: {
+    paddingVertical: spacing.sm,
+    paddingHorizontal: spacing.xl,
+    borderRadius: radii.sm,
+    shadowOpacity: 0.55,
+    shadowRadius: 10,
+    shadowOffset: { width: 0, height: 0 },
+  },
+  saveButtonText: {
+    fontFamily: fontFamily.ui,
+    fontSize: fontSize.sm,
+    fontWeight: "700",
+    color: colors.background.base,
   },
   nav: {
     width: 160,
@@ -222,6 +275,18 @@ const styles = StyleSheet.create({
     color: colors.text.muted,
     marginTop: spacing.lg,
     lineHeight: 18,
+  },
+  signatureInput: {
+    minHeight: 90,
+    backgroundColor: colors.background.surface,
+    borderWidth: 1,
+    borderColor: colors.border.subtle,
+    borderRadius: radii.sm,
+    padding: spacing.md,
+    color: colors.text.primary,
+    fontFamily: fontFamily.ui,
+    fontSize: fontSize.sm,
+    lineHeight: 20,
   },
   sample: {
     fontSize: fontSize.md,

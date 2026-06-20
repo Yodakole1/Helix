@@ -8,6 +8,7 @@ import { withAlpha } from "../theme";
 export interface WebViewStyle extends ViewStyle {
   backdropFilter?: string;
   filter?: string;
+  transition?: string;
 }
 
 export function glassPanel(backgroundHex: string, alpha = 0.7, blurPx = 24): WebViewStyle {

@@ -1,4 +1,4 @@
-import { useState } from "react";
+import { useRef, useState } from "react";
 import { Pressable, StyleSheet, Text, TextInput, View } from "react-native";
 import { storeCredential } from "../lib/credentials";
 import type { Accent } from "../theme";
@@ -11,6 +11,10 @@ interface AddAccountModalProps {
   visible: boolean;
   accent: Accent;
   onClose: () => void;
+  // Fired a moment after a successful storeCredential call, once the
+  // success message has had time to register -- lets App.tsx move past
+  // the welcome screen without this component knowing anything about it.
+  onAdded?: () => void;
 }
 
 // Connects an account the same way Thunderbird's account wizard does:
@@ -19,7 +23,7 @@ interface AddAccountModalProps {
 // The password is the only thing that actually goes anywhere right now --
 // it's handed to the Rust-side OS keychain via storeCredential. There's no
 // account list or IMAP sync to add it to yet.
-export function AddAccountModal({ visible, accent, onClose }: AddAccountModalProps) {
+export function AddAccountModal({ visible, accent, onClose, onAdded }: AddAccountModalProps) {
   const [name, setName] = useState("");
   const [email, setEmail] = useState("");
   const [password, setPassword] = useState("");
@@ -30,6 +34,7 @@ export function AddAccountModal({ visible, accent, onClose }: AddAccountModalPro
   const [smtpPort, setSmtpPort] = useState("465");
   const [status, setStatus] = useState<Status>("idle");
   const [errorMessage, setErrorMessage] = useState("");
+  const successTimeout = useRef<number | null>(null);
 
   const accentColor = colors.accent[accent];
   const canSubmit = email.trim().length > 0 && password.length > 0 && status !== "submitting";
@@ -44,6 +49,10 @@ export function AddAccountModal({ visible, accent, onClose }: AddAccountModalPro
   }
 
   function handleClose() {
+    if (successTimeout.current !== null) {
+      window.clearTimeout(successTimeout.current);
+      successTimeout.current = null;
+    }
     reset();
     onClose();
   }
@@ -53,6 +62,10 @@ export function AddAccountModal({ visible, accent, onClose }: AddAccountModalPro
     try {
       await storeCredential(email.trim(), password);
       setStatus("success");
+      successTimeout.current = window.setTimeout(() => {
+        onAdded?.();
+        handleClose();
+      }, 900);
     } catch (err) {
       setStatus("error");
       setErrorMessage(
