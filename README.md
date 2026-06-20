@@ -1,5 +1,5 @@
 <p align="center">
-  <img src="src-tauri/icons/icon.png" alt="Helix" width="600">
+  <img src="src-tauri/icons/app-icon.png" alt="Helix" width="600">
 </p>
 
 # Helix
