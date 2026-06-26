@@ -1,22 +1,16 @@
 import { Pressable, StyleSheet, Text, View } from "react-native";
 import type { HoverState } from "../lib/pressable";
 import { glassPanel } from "../lib/webStyle";
-import type { Accent } from "../theme";
 import { colors, fontFamily, fontSize, radii, spacing } from "../theme";
 
 interface WelcomeScreenProps {
-  accent: Accent;
+  accentColor: string;
   onAddAccount: () => void;
-  onSkip: () => void;
 }
 
-// Shown in place of the 3-pane shell until an account is added (or skipped)
-// for this session -- there's no persistence yet, so this is session-only
-// state, not a real first-run flag. The skip path exists so the existing
-// sample-data preview stays reachable without forcing setup every time.
-export function WelcomeScreen({ accent, onAddAccount, onSkip }: WelcomeScreenProps) {
-  const accentColor = colors.accent[accent];
-
+// Shown in place of the 3-pane shell until at least one account is added.
+// No skip path -- the app requires a real account to do anything useful.
+export function WelcomeScreen({ accentColor, onAddAccount }: WelcomeScreenProps) {
   return (
     <View style={styles.container}>
       <View style={styles.card}>
@@ -36,9 +30,14 @@ export function WelcomeScreen({ accent, onAddAccount, onSkip }: WelcomeScreenPro
           <Text style={styles.primaryButtonText}>Add your first account</Text>
         </Pressable>
 
-        <Pressable onPress={onSkip} style={({ hovered }: HoverState) => [styles.skip, hovered && styles.skipHovered]}>
-          <Text style={[styles.skipText, { color: accentColor }]}>Skip -- explore with sample data</Text>
-        </Pressable>
+        <a
+          href="https://github.com/Yodakole1/Helix"
+          target="_blank"
+          rel="noopener noreferrer"
+          style={{ textDecoration: "none" }}
+        >
+          <Text style={styles.githubLink}>Open source -- view on GitHub</Text>
+        </a>
       </View>
     </View>
   );
@@ -96,17 +95,10 @@ const styles = StyleSheet.create({
     fontWeight: "700",
     color: colors.background.base,
   },
-  skip: {
-    paddingVertical: spacing.xs,
-    paddingHorizontal: spacing.sm,
-    borderRadius: radii.sm,
-  },
-  skipHovered: {
-    backgroundColor: colors.background.surface,
-  },
-  skipText: {
+  githubLink: {
     fontFamily: fontFamily.ui,
     fontSize: fontSize.xs,
-    fontWeight: "600",
+    color: colors.text.muted,
+    marginTop: spacing.lg,
   },
 });

@@ -1,7 +1,9 @@
 import { useState } from "react";
 import { Pressable, StyleSheet, Text, View } from "react-native";
+import { useAnchorRect } from "../hooks/useAnchorRect";
 import type { HoverState } from "../lib/pressable";
 import { colors, fontFamily, fontSize, radii, spacing } from "../theme";
+import { FloatingPortal } from "./FloatingPortal";
 import { ListIcon } from "./ListIcon";
 
 interface DropdownOption {
@@ -17,30 +19,30 @@ interface DropdownProps {
   width?: number;
 }
 
-// Small floating picker (month/year, etc.) -- self-contained, including its
-// own oversized invisible backdrop to close on outside-click, since it has
-// no shared parent state to coordinate that with. The backdrop is
-// deliberately much bigger than the viewport could ever be: anchoring to
-// this component's own tiny wrapper (the only "position: relative" box it
-// has) means top:0/left:0/right:0/bottom:0 would only cover the wrapper
-// itself, not the rest of the screen.
+// Small floating picker (month/year, etc.). The menu is portaled (see
+// FloatingPortal) so it escapes whatever this dropdown happens to be
+// nested inside -- this is routinely a few levels deep (e.g. the custom
+// date range inside the message list's filter panel), and a plain
+// absolute/zIndex position would lose to unrelated later siblings of an
+// ancestor several levels up.
 export function Dropdown({ value, options, onChange, accentColor, width = 84 }: DropdownProps) {
   const [open, setOpen] = useState(false);
+  const [anchorRef, rect] = useAnchorRect(open);
   const selectedLabel = options.find((option) => option.value === value)?.label ?? value;
 
   return (
     <View style={[styles.wrapper, { width }]}>
       <Pressable
+        ref={anchorRef}
         onPress={() => setOpen((current) => !current)}
         style={[styles.button, open && { borderColor: accentColor }]}
       >
         <Text style={styles.buttonText}>{selectedLabel}</Text>
         <ListIcon name="chevron-down" color={colors.text.muted} size={9} />
       </Pressable>
-      {open && (
-        <>
-          <Pressable style={styles.backdrop} onPress={() => setOpen(false)} />
-          <View style={styles.menu}>
+      {open && rect && (
+        <FloatingPortal top={rect.bottom + 4} left={rect.left} onDismiss={() => setOpen(false)}>
+          <View style={[styles.menu, { minWidth: rect.width }]}>
             {options.map((option) => {
               const active = option.value === value;
               return (
@@ -61,7 +63,7 @@ export function Dropdown({ value, options, onChange, accentColor, width = 84 }: 
               );
             })}
           </View>
-        </>
+        </FloatingPortal>
       )}
     </View>
   );
@@ -70,7 +72,6 @@ export function Dropdown({ value, options, onChange, accentColor, width = 84 }: 
 const styles = StyleSheet.create({
   wrapper: {
     position: "relative",
-    zIndex: 5,
   },
   button: {
     flexDirection: "row",
@@ -88,20 +89,9 @@ const styles = StyleSheet.create({
     fontSize: fontSize.xs,
     color: colors.text.secondary,
   },
-  backdrop: {
-    position: "absolute",
-    top: -2000,
-    left: -2000,
-    width: 5000,
-    height: 5000,
-  },
   menu: {
-    position: "absolute",
-    top: "100%",
-    left: 0,
     marginTop: 4,
     maxHeight: 180,
-    minWidth: "100%",
     borderRadius: radii.sm,
     borderWidth: 1,
     borderColor: colors.border.subtle,

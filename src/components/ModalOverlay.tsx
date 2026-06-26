@@ -2,14 +2,17 @@ import type { ReactNode } from "react";
 import { Pressable, StyleSheet, Text, View } from "react-native";
 import { useEscapeKey } from "../hooks/useEscapeKey";
 import { glassPanel } from "../lib/webStyle";
-import type { Accent } from "../theme";
 import { colors, fontFamily, fontSize, radii, spacing } from "../theme";
 
 interface ModalOverlayProps {
   visible: boolean;
-  accent: Accent;
+  accentColor: string;
   title: string;
   width?: number;
+  // Takes over the whole viewport (minus a thin margin) instead of sizing
+  // to `width` -- for screens that are really their own view (Settings),
+  // not a dialog floating over the content behind it.
+  fullScreen?: boolean;
   // Lower alpha = more see-through glass. Per-modal since some dialogs
   // (Compose) want a more transparent card than others.
   cardAlpha?: number;
@@ -22,9 +25,10 @@ interface ModalOverlayProps {
 // both build on this rather than each rolling their own overlay.
 export function ModalOverlay({
   visible,
-  accent,
+  accentColor,
   title,
   width = 440,
+  fullScreen = false,
   cardAlpha = 0.92,
   onClose,
   children,
@@ -35,13 +39,14 @@ export function ModalOverlay({
     return null;
   }
 
-  const accentColor = colors.accent[accent];
   const cardGlass = glassPanel(colors.background.panel, cardAlpha, 30);
 
   return (
     <View style={styles.overlay}>
       <Pressable style={styles.scrim} onPress={onClose} />
-      <View style={[styles.card, cardGlass, { borderColor: accentColor, width }]}>
+      <View
+        style={[styles.card, cardGlass, { borderColor: accentColor }, fullScreen ? styles.cardFullScreen : { width }]}
+      >
         <View style={styles.header}>
           <Text style={styles.title}>{title}</Text>
           <Pressable onPress={onClose}>
@@ -78,6 +83,12 @@ const styles = StyleSheet.create({
     padding: spacing.xl,
     borderRadius: radii.lg,
     borderWidth: 1,
+  },
+  cardFullScreen: {
+    width: "97%",
+    height: "95%",
+    maxWidth: "97%",
+    maxHeight: "95%",
   },
   header: {
     flexDirection: "row",

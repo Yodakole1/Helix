@@ -1,6 +1,6 @@
 # IMAP connection core
 
-`src-tauri/src/imap.rs` exposes three Tauri commands:
+`src-tauri/src/imap.rs` exposes four Tauri commands:
 
 - `list_folders(account_id, host, port)` — connects, authenticates, lists
   the account's folders
@@ -10,10 +10,88 @@
 - `fetch_message_body(account_id, host, port, folder, uid)` — connects,
   authenticates, and returns the parsed content (plain text, HTML,
   attachment metadata) of one specific message by UID
+- `fetch_attachment(account_id, host, port, folder, uid, attachment_index)`
+  — connects, authenticates, and returns one specific attachment's actual
+  content (base64-encoded), by its `index` in `fetch_message_body`'s
+  `attachments` list. See "Attachment content" below.
 
 These are the first slices of real protocol work — proof that we can
 actually talk to a mail server, before building anything more elaborate
 on top.
+
+## Attachment content
+
+`fetch_message_body` only ever returns attachment *metadata*
+(filename/content type/size) — fetching every attachment's bytes just to
+show a message preview would waste bandwidth on attachments nobody asked
+to download. `fetch_attachment` is the separate command for actually
+downloading one: it re-fetches the message's raw bytes (`fetch_raw_message_by_uid`,
+the same SELECT + `UID FETCH BODY[]` `fetch_body_by_uid` already does) and
+hands them to `extract_attachment`, which re-parses and pulls out the part
+at `attachment_index` via `mail_parser::MessagePart::contents()` (already
+decoded — base64/quoted-printable is undone by the parser, not by us).
+
+This re-fetches and re-parses the *entire* message rather than asking IMAP
+for just the one MIME part via `BODY[<section>]`. That would save bandwidth
+on large messages with large attachments, but requires mapping
+`mail_parser`'s attachment ordering to IMAP's own section-number scheme,
+which isn't implemented — not worth the complexity until a concrete case
+(very large attachments) makes the cost of the current approach real.
+
+The `index` field on `AttachmentInfo` (returned by `fetch_message_body`) is
+what a caller passes back as `attachment_index` — it's just the position
+in `mail_parser::Message::attachments()`'s iteration order, which is
+deterministic for the same raw bytes, so it stays valid across the two
+separate fetches as long as the message itself hasn't changed in between.
+
+Content comes back as `content_base64`, a base64-encoded `String`, not a
+raw `Vec<u8>` — Tauri's IPC goes through JSON, where serde would otherwise
+turn a `Vec<u8>` into a JSON array of numbers, far larger over the wire
+than a base64 string of the same bytes.
+
+`pop3::pop3_fetch_attachment` is the POP3 equivalent, reusing
+`extract_attachment` directly (it's protocol-agnostic — once you have an
+email's raw bytes, there's no IMAP/POP3-specific step left) — see
+`pop3.md`. Attachment bytes still aren't written to the local cache
+(`cache.rs`'s schema has no content column for them) — that's a separate,
+still-open backlog item, not solved by this.
+
+## Recipient and threading headers (reply/forward composition)
+
+`fetch_message_body`/POP3's `fetch_message` used to expose none of a
+message's own From/To/Cc or threading headers — `MessageBody` was purely
+about *content* (text/html/attachments). Resolving who a Reply/Reply-All
+should go to, and threading a reply correctly, both need the original
+message's headers too, so `MessageBody` gained:
+
+- `from: Option<String>`, `to: Vec<String>`, `cc: Vec<String>`,
+  `reply_to: Option<String>` — formatted `"Name <email>"` strings (same
+  convention as `MessageSummary.from`), straight off the parsed
+  `mail_parser::Message`. A real Reply should prefer `reply_to` over
+  `from` when present (that's the entire point of the header existing),
+  and Reply-All's Cc list is `to + cc` minus whichever address is the
+  user's own account — both of those decisions belong to whatever
+  composes the reply, not to this struct, which just reports what the
+  message actually said.
+- `message_id: Option<String>`, `in_reply_to: Option<String>`,
+  `references: Vec<String>` — this message's own threading headers
+  (angle brackets stripped, matching `mail_parser`'s own parsing). A
+  reply to *this* message should send `in_reply_to: message_id` and
+  `references: references + [message_id]` (RFC 5322 section 3.6.4) to
+  `smtp::send_message` — see `smtp.md`. `in_reply_to`/`references` here
+  describe whether *this* message is itself a reply; they're not
+  consulted by anything in this codebase yet but are exactly the
+  groundwork message threading (grouping by these same three headers)
+  will need next, which is why they're parsed once, here, rather than
+  bolted on twice.
+
+`References`/`In-Reply-To`/`Message-ID` parse to `mail_parser`'s
+`HeaderValue::Text` when there's exactly one ID or `HeaderValue::TextList`
+for more than one (`header_value_to_id_list` collapses both into one
+`Vec`) — a single-reference fixture wouldn't have caught a caller that
+only handled the `Text` case, which is why
+`parse_message_body_extracts_recipients_and_threading_headers`'s test
+fixture deliberately uses a two-ID `References` chain.
 
 ## How it's wired
 
@@ -102,6 +180,16 @@ word decodes correctly, plain ASCII passes through unchanged, malformed
 encoded-word syntax falls back instead of failing, and a decoded display
 name flows through into the formatted `"Name <user@host>"` string.
 
+**Recipient/threading header extraction.**
+`parse_message_body_extracts_recipients_and_threading_headers` (no network)
+hand-builds a reply-shaped raw message -- multiple To/Cc recipients, a
+`Reply-To` distinct from `From`, and a two-ID `References` chain -- and
+confirms `parse_message_body` extracts every new `MessageBody` field
+correctly, including the multi-ID `TextList` case a single-reference
+fixture wouldn't exercise. `parses_a_multipart_message_with_attachment_from_a_local_test_server`
+(`#[ignore]`, real GreenMail) also asserts `from`/`to` against the real
+seeded message, alongside its existing attachment assertions.
+
 There's no committed test mailbox account, so the rest of the
 verification leans on three kinds of check:
 
@@ -151,10 +239,12 @@ docker rm -f helix-test-greenmail
 ```
 
 **Local disposable test server, full message-body path.**
-`parses_a_multipart_message_with_attachment_from_a_local_test_server`
-exercises `fetch_body_by_uid` against a real multipart message (plain
-text + HTML + a PDF attachment) on a fresh GreenMail container, seeded
-with this instead of the plain-text message above:
+`parses_a_multipart_message_with_attachment_from_a_local_test_server` and
+`fetches_an_attachment_from_a_local_test_server` exercise `fetch_body_by_uid`
+and `extract_attachment` respectively against a real multipart message
+(plain text + HTML + a PDF attachment) on a fresh GreenMail container,
+seeded with this instead of the plain-text message above. Both are
+read-only and can run against the same seeded container in either order:
 
 ```
 docker run -d --name helix-test-greenmail -p 3993:3993 -p 3025:3025 \

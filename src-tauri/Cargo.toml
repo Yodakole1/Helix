@@ -23,8 +23,9 @@ serde = { version = "1.0", features = ["derive"] }
 log = "0.4"
 tauri = { version = "2.11.3", features = [] }
 tauri-plugin-log = "2"
+tauri-plugin-notification = "2"
 async-imap = { version = "0.11.2", default-features = false, features = ["runtime-tokio", "tokio"] }
-tokio = { version = "1.52.3", features = ["rt-multi-thread", "macros", "net"] }
+tokio = { version = "1.52.3", features = ["rt-multi-thread", "macros", "net", "time"] }
 tokio-native-tls = "0.3.1"
 futures = "0.3.32"
 imap-proto = "0.16.7"
@@ -35,6 +36,10 @@ mail-parser = { version = "0.11.3", features = ["full_encoding", "serde"] }
 lettre = { version = "0.11.19", default-features = false, features = ["tokio1-native-tls", "smtp-transport", "builder", "hostname"] }
 hickory-resolver = "0.25.2"
 rusqlite = { version = "0.40.1", features = ["bundled-sqlcipher"] }
+rand = "0.8"
+dirs = "5"
+pgp = "0.19"
+base64 = "0.22"
 
 [target.'cfg(target_os = "linux")'.dependencies]
 keyring = { version = "3", features = ["sync-secret-service"] }

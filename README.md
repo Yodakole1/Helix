@@ -14,16 +14,30 @@ same React Native component tree.
 
 Early development -- not usable as a daily-driver email client yet. The
 desktop shell has a fully designed three-pane interface (account/folder
-sidebar, message list, reader pane), but the frontend is still wired to
-sample data rather than the real backend commands.
+sidebar, message list, reader pane), and the inbox itself is still wired
+to sample data rather than a real account's mail. That said, a real and
+growing slice of the app now talks to the real backend: account
+onboarding (auto-discovery + a verified IMAP login + OS-keychain storage),
+PGP key generation/import, local-cache stats and clearing, desktop
+notification permissions, and a working rules/auto-sorting engine and
+message-template manager (both real, just running against the sample
+inbox for now).
 
-The Rust backend is further along: working IMAP connection/login, folder
-listing, message fetching (headers and body), SMTP sending, provider
-auto-discovery, and OS-keychain credential storage. See
+The Rust backend is still ahead of the frontend overall: IMAP
+connection/login, folder listing, message fetching (headers, body,
+attachments), the core mailbox actions (read/flag/move, with archive and
+trash built on the same primitive), SMTP sending with STARTTLS, provider
+auto-discovery, OS-keychain credential storage, a SQLCipher-encrypted
+local cache, a persisted multi-account model with a unified-inbox view
+across accounts, a local contact/address cache for autocomplete, and PGP
+encrypt/sign/decrypt/verify. See
 [`docs/technical/backend-backlog.md`](docs/technical/backend-backlog.md)
-for the detailed checklist of what's implemented vs. still planned, and
-[`docs/user/overview.md`](docs/user/overview.md) for a user-facing
-description of the current build.
+for the backend checklist,
+[`docs/technical/frontend-roadmap.md`](docs/technical/frontend-roadmap.md)
+for the frontend-side equivalent, and
+[`docs/user/overview.md`](docs/user/overview.md) /
+[`docs/user/guide.md`](docs/user/guide.md) for a user-facing description
+and walkthrough of the current build.
 
 ## Tech stack
 
@@ -31,7 +45,8 @@ description of the current build.
   rendered via `react-native-web`; no actual React Native runtime in the
   desktop build), Vite, TypeScript
 - **Backend/shell:** Tauri 2 (Rust) -- `async-imap`, `lettre` (SMTP),
-  `keyring` (OS-native credential storage), `tokio`
+  `keyring` (OS-native credential storage), `rusqlite`/SQLCipher (local
+  encrypted cache), `tokio`
 
 ## Getting started
 
@@ -62,7 +77,8 @@ There is no frontend test runner or linter/formatter config set up yet.
 
 ## Documentation
 
-- [`docs/user/`](docs/user) -- what Helix is, current status, how to run it
+- [`docs/user/`](docs/user) -- what Helix is, current status, how to run
+  it, and a walkthrough of how to actually use it (`guide.md`)
 - [`docs/technical/`](docs/technical) -- architecture, stack-choice
   rationale, setup, and per-feature implementation notes (credential
   storage, IMAP core, SMTP, provider discovery, account onboarding)

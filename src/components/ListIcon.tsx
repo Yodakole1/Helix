@@ -1,5 +1,16 @@
 interface ListIconProps {
-  name: "search" | "filter" | "sort" | "chevron-down" | "close" | "star" | "attachment";
+  name:
+    | "search"
+    | "filter"
+    | "sort"
+    | "chevron-down"
+    | "chevron-up"
+    | "close"
+    | "star"
+    | "attachment"
+    | "refresh"
+    | "image"
+    | "template";
   color: string;
   size?: number;
   // Only meaningful for "star" -- filled (solid) vs. outline.
@@ -46,6 +57,12 @@ export function ListIcon({ name, color, size = 14, filled = false }: ListIconPro
           <polyline points="6 9 12 15 18 9" />
         </svg>
       );
+    case "chevron-up":
+      return (
+        <svg {...props}>
+          <polyline points="6 15 12 9 18 15" />
+        </svg>
+      );
     case "close":
       return (
         <svg {...props}>
@@ -63,6 +80,28 @@ export function ListIcon({ name, color, size = 14, filled = false }: ListIconPro
       return (
         <svg {...props}>
           <path d="M16.5 6.5L8.7 14.3a3.5 3.5 0 0 0 4.95 4.95l7.07-7.07a5.5 5.5 0 0 0-7.78-7.78L5.5 11.8a4 4 0 0 0 5.66 5.66" />
+        </svg>
+      );
+    case "refresh":
+      return (
+        <svg {...props}>
+          <path d="M21 12a9 9 0 1 1-2.64-6.36" />
+          <polyline points="21 3 21 9 15 9" />
+        </svg>
+      );
+    case "image":
+      return (
+        <svg {...props}>
+          <rect x="3" y="4" width="18" height="16" rx="2" />
+          <circle cx="9" cy="10" r="1.7" />
+          <path d="M3 17l5.5-5.5a2 2 0 0 1 2.8 0L17 17" />
+        </svg>
+      );
+    case "template":
+      return (
+        <svg {...props}>
+          <path d="M6 3h9l3 3v15a1 1 0 0 1-1 1H6a1 1 0 0 1-1-1V4a1 1 0 0 1 1-1z" />
+          <path d="M8 9h8M8 13h8M8 17h5" />
         </svg>
       );
     default:

@@ -3,7 +3,9 @@ use zeroize::Zeroize;
 
 // Namespaces every credential in the OS keychain so Helix entries don't
 // collide with unrelated apps using the same account_id as a username.
-const SERVICE_NAME: &str = "dev.helix.app";
+// `pub(crate)` so `cache.rs` can namespace the local cache's on-disk
+// directory and keychain-stored encryption key under the same identifier.
+pub(crate) const SERVICE_NAME: &str = "dev.helix.app";
 
 fn entry_for(account_id: &str) -> Result<Entry, String> {
     Entry::new(SERVICE_NAME, account_id).map_err(|e| e.to_string())

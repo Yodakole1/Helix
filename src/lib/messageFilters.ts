@@ -82,7 +82,7 @@ export function hasActiveFilters(filters: MessageFilters): boolean {
   return filters.query.trim() !== "" || filters.from.trim() !== "" || filters.to.trim() !== "" || filters.dateRange !== "any";
 }
 
-export function filterMessages(messages: SampleMessage[], filters: MessageFilters): SampleMessage[] {
+export function filterMessages<T extends SampleMessage>(messages: T[], filters: MessageFilters): T[] {
   const query = filters.query.trim().toLowerCase();
   const from = filters.from.trim().toLowerCase();
   const to = filters.to.trim().toLowerCase();
@@ -99,7 +99,7 @@ export function filterMessages(messages: SampleMessage[], filters: MessageFilter
   });
 }
 
-export function sortMessages(messages: SampleMessage[], sortKey: SortKey): SampleMessage[] {
+export function sortMessages<T extends SampleMessage>(messages: T[], sortKey: SortKey): T[] {
   const sorted = [...messages];
   switch (sortKey) {
     case "newest":

@@ -151,6 +151,18 @@ raw `<svg>` tags don't exist outside a DOM. The same reasoning applies to
 needs raw pointer events tracked on `window` -- there's no RN
 gesture-responder equivalent wired up here yet.
 
+## A note on react-native-web's Animated module
+
+`react-native-web`'s `Animated` (vendor/react-native/Animated/animations/*)
+calls the bare Node/RN global `global.cancelAnimationFrame` internally.
+Browsers only have `window`, not `global` -- webpack-based RN-web setups
+get this for free from a default polyfill, but Vite doesn't define it, so
+anything using `Animated` throws `global is not defined` until something
+supplies it. `vite.config.ts` sets `define: { global: "window" }` to cover
+this; if a future Vite upgrade or config rewrite drops that, any spinner/
+animation using RN's `Animated` API (e.g. `MessageList`'s refresh icon)
+will break with that exact error.
+
 ## Build / dev workflow
 
 - `npm run dev` — Vite dev server only (browser, no native shell). Useful

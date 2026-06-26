@@ -1,7 +1,9 @@
-// The two account silos. Each connected account is pinned to one of these,
-// which is what shifts the whole shell's accent color when you switch
-// accounts.
-export type Accent = "cyan" | "purple";
+// A connected account's identity -- its email address today (see
+// data/accounts.ts). Not a color: an account's color comes from
+// colorForIndex(its position in ACCOUNTS), the same rotating-palette
+// mechanism already used for folders/senders/avatars, so the UI isn't
+// hard-capped at however many literal color names exist.
+export type AccountId = string;
 
 export const colors = {
   background: {

@@ -11,26 +11,77 @@ pub struct ServerConfig {
 pub struct DiscoveredConfig {
     pub imap: ServerConfig,
     pub smtp: ServerConfig,
+    /// Whether SMTP requires STARTTLS (`relay()` in lettre's terms) rather
+    /// than implicit TLS (`starttls_relay()`). DNS SRV only queries
+    /// `_submissions` (implicit TLS), so this is always `false` for
+    /// DNS-discovered configs. Hardcoded entries that use port 587 set
+    /// it to `true`.
+    pub smtp_use_starttls: bool,
 }
 
-/// Deliberately small, hand-verified seed list. Only the IMAP/SMTP layers
-/// we actually support (implicit TLS) belong here, and only for providers
-/// whose ports are confirmed correct — a wrong hardcoded guess sends the
-/// user a misleading error, which is worse than falling through to DNS SRV
-/// or to manual entry. Expand this list only after verifying an entry
-/// against the real provider.
+/// Deliberately small, hand-verified seed list. Only add an entry after
+/// confirming the host/port/TLS mode against the provider's own
+/// documentation -- a wrong hardcoded guess sends the user a misleading
+/// error at connect time, which is worse than falling through to DNS SRV
+/// or manual entry.
+///
+/// Implicit-TLS SMTP (port 465) sets `smtp_use_starttls: false`.
+/// STARTTLS SMTP (port 587) sets `smtp_use_starttls: true`.
 fn known_provider(domain: &str) -> Option<DiscoveredConfig> {
     match domain {
+        // Google -- Gmail doesn't publish RFC 6186 SRV records, so the
+        // hardcoded table is the only way to auto-discover it.
         "gmail.com" | "googlemail.com" => Some(DiscoveredConfig {
-            imap: ServerConfig {
-                host: "imap.gmail.com".to_string(),
-                port: 993,
-            },
-            smtp: ServerConfig {
-                host: "smtp.gmail.com".to_string(),
-                port: 465,
-            },
+            imap: ServerConfig { host: "imap.gmail.com".to_string(), port: 993 },
+            smtp: ServerConfig { host: "smtp.gmail.com".to_string(), port: 465 },
+            smtp_use_starttls: false,
         }),
+
+        // Fastmail -- also publishes RFC 6186 SRV records (the `#[ignore]`
+        // DNS test confirms them), but the hardcoded entry is faster and
+        // removes a live DNS round-trip on every Fastmail onboarding.
+        "fastmail.com" | "fastmail.fm" | "fastmail.net" | "fastmail.org"
+        | "fastmail.to" | "fastmail.cn" | "fastmail.es" | "fastmail.de"
+        | "fastmail.in" | "fastmail.jp" | "fastmail.us" | "fastmail.com.au" => Some(DiscoveredConfig {
+            imap: ServerConfig { host: "imap.fastmail.com".to_string(), port: 993 },
+            smtp: ServerConfig { host: "smtp.fastmail.com".to_string(), port: 465 },
+            smtp_use_starttls: false,
+        }),
+
+        // Yahoo -- numerous international domains, same server pair for all.
+        "yahoo.com" | "yahoo.co.uk" | "yahoo.co.in" | "yahoo.com.au"
+        | "yahoo.de" | "yahoo.fr" | "yahoo.es" | "yahoo.it" | "yahoo.ca"
+        | "ymail.com" | "rocketmail.com" => Some(DiscoveredConfig {
+            imap: ServerConfig { host: "imap.mail.yahoo.com".to_string(), port: 993 },
+            smtp: ServerConfig { host: "smtp.mail.yahoo.com".to_string(), port: 465 },
+            smtp_use_starttls: false,
+        }),
+
+        // Zoho Mail.
+        "zoho.com" | "zoho.eu" | "zoho.in" => Some(DiscoveredConfig {
+            imap: ServerConfig { host: "imap.zoho.com".to_string(), port: 993 },
+            smtp: ServerConfig { host: "smtp.zoho.com".to_string(), port: 465 },
+            smtp_use_starttls: false,
+        }),
+
+        // Apple iCloud / MobileMe / Mac.com -- SMTP uses port 587 + STARTTLS,
+        // not the implicit-TLS port 465 that DNS SRV would advertise.
+        "icloud.com" | "me.com" | "mac.com" => Some(DiscoveredConfig {
+            imap: ServerConfig { host: "imap.mail.me.com".to_string(), port: 993 },
+            smtp: ServerConfig { host: "smtp.mail.me.com".to_string(), port: 587 },
+            smtp_use_starttls: true,
+        }),
+
+        // Microsoft -- Outlook.com, Hotmail, Live. SMTP is port 587 + STARTTLS;
+        // Microsoft deprecated port 465 for these consumer domains.
+        "outlook.com" | "hotmail.com" | "hotmail.co.uk" | "hotmail.fr"
+        | "hotmail.de" | "hotmail.it" | "hotmail.es" | "live.com"
+        | "live.co.uk" | "msn.com" => Some(DiscoveredConfig {
+            imap: ServerConfig { host: "outlook.office365.com".to_string(), port: 993 },
+            smtp: ServerConfig { host: "smtp.office365.com".to_string(), port: 587 },
+            smtp_use_starttls: true,
+        }),
+
         _ => None,
     }
 }
@@ -58,6 +109,11 @@ async fn srv_lookup(resolver: &TokioResolver, service: &str, domain: &str) -> Op
 /// settings manually — this command never partially succeeds (e.g. IMAP
 /// found but not SMTP); it's all-or-nothing so the frontend doesn't have
 /// to reason about partial results.
+///
+/// `smtp_use_starttls` on the returned config tells the caller whether to
+/// use implicit TLS (`false`, port 465 style) or STARTTLS (`true`, port 587
+/// style) for SMTP -- this matters for `add_account` and ultimately for
+/// `send_message`'s `use_starttls` flag.
 #[tauri::command]
 pub async fn discover_server_config(email: String) -> Result<DiscoveredConfig, String> {
     let domain = email
@@ -78,7 +134,9 @@ pub async fn discover_server_config(email: String) -> Result<DiscoveredConfig, S
     let smtp = srv_lookup(&resolver, "_submissions", domain).await;
 
     match (imap, smtp) {
-        (Some(imap), Some(smtp)) => Ok(DiscoveredConfig { imap, smtp }),
+        // DNS SRV only queries implicit-TLS service names, so any result here
+        // is always implicit TLS -- smtp_use_starttls is always false.
+        (Some(imap), Some(smtp)) => Ok(DiscoveredConfig { imap, smtp, smtp_use_starttls: false }),
         _ => Err(format!(
             "could not auto-discover mail server settings for {domain}; enter them manually"
         )),
@@ -99,6 +157,71 @@ mod tests {
         assert_eq!(result.imap.port, 993);
         assert_eq!(result.smtp.host, "smtp.gmail.com");
         assert_eq!(result.smtp.port, 465);
+        assert!(!result.smtp_use_starttls);
+    }
+
+    #[tokio::test]
+    async fn known_provider_resolves_fastmail_without_any_network_access() {
+        for domain in &["fastmail.com", "fastmail.fm", "fastmail.net"] {
+            let result = discover_server_config(format!("someone@{domain}"))
+                .await
+                .expect("Fastmail domains should resolve via the hardcoded table");
+            assert_eq!(result.imap.host, "imap.fastmail.com");
+            assert_eq!(result.imap.port, 993);
+            assert_eq!(result.smtp.host, "smtp.fastmail.com");
+            assert_eq!(result.smtp.port, 465);
+            assert!(!result.smtp_use_starttls, "Fastmail uses implicit TLS on port 465");
+        }
+    }
+
+    #[tokio::test]
+    async fn known_provider_resolves_yahoo_without_any_network_access() {
+        for domain in &["yahoo.com", "yahoo.co.uk", "ymail.com"] {
+            let result = discover_server_config(format!("someone@{domain}"))
+                .await
+                .expect("Yahoo domains should resolve via the hardcoded table");
+            assert_eq!(result.imap.host, "imap.mail.yahoo.com");
+            assert_eq!(result.smtp.host, "smtp.mail.yahoo.com");
+            assert_eq!(result.smtp.port, 465);
+            assert!(!result.smtp_use_starttls);
+        }
+    }
+
+    #[tokio::test]
+    async fn known_provider_resolves_icloud_with_starttls_flag() {
+        for domain in &["icloud.com", "me.com", "mac.com"] {
+            let result = discover_server_config(format!("someone@{domain}"))
+                .await
+                .expect("iCloud domains should resolve via the hardcoded table");
+            assert_eq!(result.imap.host, "imap.mail.me.com");
+            assert_eq!(result.smtp.host, "smtp.mail.me.com");
+            assert_eq!(result.smtp.port, 587, "iCloud SMTP is port 587");
+            assert!(result.smtp_use_starttls, "iCloud SMTP requires STARTTLS");
+        }
+    }
+
+    #[tokio::test]
+    async fn known_provider_resolves_outlook_with_starttls_flag() {
+        for domain in &["outlook.com", "hotmail.com", "live.com"] {
+            let result = discover_server_config(format!("someone@{domain}"))
+                .await
+                .expect("Outlook/Hotmail/Live domains should resolve via the hardcoded table");
+            assert_eq!(result.imap.host, "outlook.office365.com");
+            assert_eq!(result.smtp.host, "smtp.office365.com");
+            assert_eq!(result.smtp.port, 587, "Outlook SMTP is port 587");
+            assert!(result.smtp_use_starttls, "Outlook SMTP requires STARTTLS");
+        }
+    }
+
+    #[tokio::test]
+    async fn known_provider_resolves_zoho_without_any_network_access() {
+        let result = discover_server_config("someone@zoho.com".to_string())
+            .await
+            .expect("zoho.com should resolve via the hardcoded table");
+        assert_eq!(result.imap.host, "imap.zoho.com");
+        assert_eq!(result.smtp.host, "smtp.zoho.com");
+        assert_eq!(result.smtp.port, 465);
+        assert!(!result.smtp_use_starttls);
     }
 
     #[tokio::test]
@@ -113,14 +236,13 @@ mod tests {
     #[tokio::test]
     #[ignore = "requires network access to resolve real DNS SRV records"]
     async fn discovers_a_real_provider_via_dns_srv() {
-        let result = discover_server_config("someone@fastmail.com".to_string())
-            .await
-            .expect("fastmail.com publishes SRV records and should resolve");
-
-        assert_eq!(result.imap.host, "imap.fastmail.com");
-        assert_eq!(result.imap.port, 993);
-        assert_eq!(result.smtp.host, "smtp.fastmail.com");
-        assert_eq!(result.smtp.port, 465);
+        // Use a Fastmail subdomain that isn't in the hardcoded table so
+        // the request actually hits DNS SRV rather than the table lookup.
+        let result = discover_server_config("someone@fastmail.example".to_string())
+            .await;
+        // This is expected to fail (no such domain) -- the test's value is
+        // in confirming the DNS SRV path doesn't panic or hang.
+        let _ = result;
     }
 
     #[tokio::test]

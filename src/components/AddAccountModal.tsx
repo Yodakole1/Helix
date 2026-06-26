@@ -1,29 +1,35 @@
 import { useRef, useState } from "react";
 import { Pressable, StyleSheet, Text, TextInput, View } from "react-native";
-import { storeCredential } from "../lib/credentials";
-import type { Accent } from "../theme";
+import { isTauri } from "@tauri-apps/api/core";
+import { addAccount } from "../lib/account";
+import { discoverServerConfig } from "../lib/discovery";
 import { colors, fontFamily, fontSize, radii, spacing } from "../theme";
 import { ModalOverlay } from "./ModalOverlay";
+import { Switch } from "./Switch";
 
 type Status = "idle" | "submitting" | "success" | "error";
 
 interface AddAccountModalProps {
   visible: boolean;
-  accent: Accent;
+  accentColor: string;
   onClose: () => void;
-  // Fired a moment after a successful storeCredential call, once the
-  // success message has had time to register -- lets App.tsx move past
-  // the welcome screen without this component knowing anything about it.
+  // Fired a moment after a successful add_account call, once the success
+  // message has had time to register -- lets App.tsx move past the
+  // welcome screen without this component knowing anything about it.
   onAdded?: () => void;
 }
 
 // Connects an account the same way Thunderbird's account wizard does:
 // name/email/password up front, with server settings tucked behind an
 // "advanced" disclosure for people who need a non-default IMAP/SMTP setup.
-// The password is the only thing that actually goes anywhere right now --
-// it's handed to the Rust-side OS keychain via storeCredential. There's no
-// account list or IMAP sync to add it to yet.
-export function AddAccountModal({ visible, accent, onClose, onAdded }: AddAccountModalProps) {
+// Submitting calls the real add_account command (stores the credential,
+// verifies it with a real IMAP login, persists the connection metadata --
+// rolling everything back on failure), auto-discovering the IMAP/SMTP
+// host+port from the email's domain first unless advanced settings are
+// open. The account this adds is real and persisted -- it just isn't
+// wired into the rest of the app's mailbox view yet, which still shows
+// the sample ACCOUNTS list (see docs/technical/frontend-roadmap.md).
+export function AddAccountModal({ visible, accentColor, onClose, onAdded }: AddAccountModalProps) {
   const [name, setName] = useState("");
   const [email, setEmail] = useState("");
   const [password, setPassword] = useState("");
@@ -32,18 +38,27 @@ export function AddAccountModal({ visible, accent, onClose, onAdded }: AddAccoun
   const [imapPort, setImapPort] = useState("993");
   const [smtpHost, setSmtpHost] = useState("");
   const [smtpPort, setSmtpPort] = useState("465");
+  const [smtpUseStarttls, setSmtpUseStarttls] = useState(false);
   const [status, setStatus] = useState<Status>("idle");
   const [errorMessage, setErrorMessage] = useState("");
   const successTimeout = useRef<number | null>(null);
 
-  const accentColor = colors.accent[accent];
-  const canSubmit = email.trim().length > 0 && password.length > 0 && status !== "submitting";
+  const canSubmit =
+    email.trim().length > 0 &&
+    password.length > 0 &&
+    (!showAdvanced || (imapHost.trim().length > 0 && smtpHost.trim().length > 0)) &&
+    status !== "submitting";
 
   function reset() {
     setName("");
     setEmail("");
     setPassword("");
     setShowAdvanced(false);
+    setImapHost("");
+    setImapPort("993");
+    setSmtpHost("");
+    setSmtpPort("465");
+    setSmtpUseStarttls(false);
     setStatus("idle");
     setErrorMessage("");
   }
@@ -58,9 +73,41 @@ export function AddAccountModal({ visible, accent, onClose, onAdded }: AddAccoun
   }
 
   async function handleSubmit() {
+    if (!isTauri()) {
+      setStatus("error");
+      setErrorMessage("Account connections only work inside the desktop app. Run 'npm run tauri dev' to use real accounts.");
+      return;
+    }
     setStatus("submitting");
+    setErrorMessage("");
     try {
-      await storeCredential(email.trim(), password);
+      let imap = { host: imapHost.trim(), port: Number(imapPort) };
+      let smtp = { host: smtpHost.trim(), port: Number(smtpPort) };
+      let useStarttls = smtpUseStarttls;
+
+      // Advanced settings, once expanded, are the user's explicit choice
+      // and always win -- auto-discovery only runs when they haven't
+      // bothered to override it.
+      if (!showAdvanced) {
+        const discovered = await discoverServerConfig(email.trim());
+        imap = discovered.imap;
+        smtp = discovered.smtp;
+        useStarttls = discovered.smtpUseStarttls;
+      }
+
+      await addAccount({
+        accountId: email.trim(),
+        password,
+        displayName: name.trim() === "" ? null : name.trim(),
+        imapHost: imap.host,
+        imapPort: imap.port,
+        smtpHost: smtp.host,
+        smtpPort: smtp.port,
+        smtpUseStarttls: useStarttls,
+        archiveFolder: null,
+        trashFolder: null,
+      });
+
       setStatus("success");
       successTimeout.current = window.setTimeout(() => {
         onAdded?.();
@@ -68,16 +115,19 @@ export function AddAccountModal({ visible, accent, onClose, onAdded }: AddAccoun
       }, 900);
     } catch (err) {
       setStatus("error");
-      setErrorMessage(
-        err instanceof Error
-          ? err.message
-          : "Could not reach the secure storage backend. This only works inside the desktop app.",
-      );
+      const msg = typeof err === "string" ? err : err instanceof Error ? err.message : String(err);
+      // Surface the real IMAP/backend error as-is; only mask the raw JS
+      // internal-invoke error which means the user isn't in Tauri at all.
+      if (msg.includes("invoke") || msg.includes("TAURI")) {
+        setErrorMessage("This feature only works inside the desktop app. Run 'npm run tauri dev'.");
+      } else {
+        setErrorMessage(msg);
+      }
     }
   }
 
   return (
-    <ModalOverlay visible={visible} accent={accent} title="Connect an account" onClose={handleClose}>
+    <ModalOverlay visible={visible} accentColor={accentColor} title="Connect an account" onClose={handleClose}>
       <Text style={styles.label}>Display name</Text>
       <TextInput
         style={styles.input}
@@ -160,11 +210,17 @@ export function AddAccountModal({ visible, accent, onClose, onAdded }: AddAccoun
               />
             </View>
           </View>
+          <View style={styles.starttlsRow}>
+            <Switch value={smtpUseStarttls} onChange={() => setSmtpUseStarttls((value) => !value)} color={accentColor} />
+            <Text style={styles.starttlsLabel}>SMTP uses STARTTLS, not implicit TLS</Text>
+          </View>
         </View>
       )}
 
       {status === "error" && <Text style={styles.error}>{errorMessage}</Text>}
-      {status === "success" && <Text style={styles.success}>Credential stored securely in your OS keychain.</Text>}
+      {status === "success" && (
+        <Text style={styles.success}>Account connected and verified -- credential stored in your OS keychain.</Text>
+      )}
 
       <View style={styles.actions}>
         <Pressable onPress={handleClose} style={styles.secondaryButton}>
@@ -224,6 +280,17 @@ const styles = StyleSheet.create({
   },
   colNarrow: {
     width: 88,
+  },
+  starttlsRow: {
+    flexDirection: "row",
+    alignItems: "center",
+    marginTop: spacing.xs,
+  },
+  starttlsLabel: {
+    fontFamily: fontFamily.ui,
+    fontSize: fontSize.xs,
+    color: colors.text.secondary,
+    marginLeft: spacing.sm,
   },
   error: {
     fontFamily: fontFamily.ui,

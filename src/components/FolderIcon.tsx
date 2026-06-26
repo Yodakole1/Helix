@@ -67,6 +67,12 @@ export function FolderIcon({ id, color, size = 14 }: FolderIconProps) {
         </svg>
       );
     default:
-      return null;
+      // Generic folder shape for server-specific folder names that don't
+      // match any of the well-known ids above.
+      return (
+        <svg {...props}>
+          <path d="M3 7a1 1 0 0 1 1-1h5l2 2h9a1 1 0 0 1 1 1v9a1 1 0 0 1-1 1H4a1 1 0 0 1-1-1V7z" />
+        </svg>
+      );
   }
 }
