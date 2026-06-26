@@ -77,6 +77,8 @@ CREATE TABLE cached_messages (
     date        TEXT,
     seen        INTEGER NOT NULL DEFAULT 0,
     flagged     INTEGER NOT NULL DEFAULT 0,
+    message_id  TEXT,
+    in_reply_to TEXT,
     body_text   TEXT,
     body_html   TEXT,
     fetched_at  TEXT NOT NULL,
@@ -88,6 +90,11 @@ CREATE TABLE cached_messages (
 row's columns on conflict (summary fields vs. body fields), so caching a
 folder listing never clobbers a body fetched earlier for the same UID, and
 vice versa.
+
+`message_id`/`in_reply_to` are stored alongside the summary fields (added
+via additive `ALTER TABLE` migrations in `open_at`, same pattern as
+`accounts.drafts_folder`) so that the offline-read path can reconstruct
+conversation threads, not just a flat list — see "Offline reads" below.
 
 ## Used by the IMAP layer
 
@@ -113,13 +120,39 @@ real frontend-wired commands -- Settings > Data & Storage
 (`src/components/DataStorageSettings.tsx`) shows the real numbers and a
 real (confirm-before-destructive) Clear cache button.
 
+## Offline reads
+
+The cache is now read as well as written. Two commands serve the
+last-cached state without touching the network, so a folder isn't just
+blank when a live fetch can't reach the server:
+
+- `load_cached_messages(account_id, folder, limit)` →
+  `Vec<MessageSummary>`, newest first. Includes `message_id`/`in_reply_to`
+  so a threaded view still works offline. The frontend's intended pattern
+  is to call `fetch_messages` first and fall back to this on a network
+  error, so the user always sees *something*.
+- `load_cached_message_body(account_id, folder, uid)` →
+  `Option<MessageBody>`. `None` means only the summary was cached (or the
+  UID is unknown) and a live fetch is required.
+
+A cached body carries only `text`/`html` and the threading IDs — the
+columns the cache actually stores. Attachment bytes, recipient lists, and
+PGP verification state aren't cached, so those come back at their empty
+defaults: offline reading shows the message text, but downloading an
+attachment or re-running PGP verification still needs a live connection.
+This is a deliberate "show what we have" degradation, not a full offline
+mode.
+
 ## What this doesn't do yet
 
 This is the storage layer only. Still unbuilt, each its own backlog item:
 
-- **Offline reads.** Nothing currently reads from the cache -- there's no
-  fallback path that serves cached rows when there's no network. The
-  schema is shaped to support this later, but it isn't wired up.
+- **Automatic offline fallback.** The read commands above exist, but
+  nothing in the backend *automatically* serves cache on a failed fetch —
+  `fetch_messages` still fails hard on a network error. Whether to fall
+  back is the frontend's decision (so it can tell the user the data is
+  stale), which is why the cache read is a separate command rather than
+  baked into `fetch_messages`.
 - **Draft/outbox queue.** "Auto-send on reconnect" implies a queue table
   and retry logic, neither of which exist here.
 - **Contact/address cache.** This one's actually done -- a `contacts`

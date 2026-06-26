@@ -66,6 +66,8 @@ fn ensure_schema(conn: &Connection) -> Result<(), String> {
             date        TEXT,
             seen        INTEGER NOT NULL DEFAULT 0,
             flagged     INTEGER NOT NULL DEFAULT 0,
+            message_id  TEXT,
+            in_reply_to TEXT,
             body_text   TEXT,
             body_html   TEXT,
             fetched_at  TEXT NOT NULL,
@@ -77,9 +79,13 @@ fn ensure_schema(conn: &Connection) -> Result<(), String> {
             display_name      TEXT,
             imap_host         TEXT NOT NULL,
             imap_port         INTEGER NOT NULL,
+            imap_use_starttls INTEGER NOT NULL DEFAULT 0,
             smtp_host         TEXT NOT NULL,
             smtp_port         INTEGER NOT NULL,
             smtp_use_starttls INTEGER NOT NULL DEFAULT 0,
+            incoming_protocol TEXT NOT NULL DEFAULT 'imap',
+            pop3_host         TEXT,
+            pop3_port         INTEGER,
             archive_folder    TEXT NOT NULL DEFAULT 'Archive',
             trash_folder      TEXT NOT NULL DEFAULT 'Trash',
             created_at        TEXT NOT NULL
@@ -170,6 +176,18 @@ pub(crate) fn open_at(path: &Path, key: &str) -> Result<Connection, String> {
         "ALTER TABLE accounts ADD COLUMN drafts_folder TEXT NOT NULL DEFAULT 'Drafts'",
         [],
     );
+    let _ = conn.execute("ALTER TABLE cached_messages ADD COLUMN message_id TEXT", []);
+    let _ = conn.execute("ALTER TABLE cached_messages ADD COLUMN in_reply_to TEXT", []);
+    let _ = conn.execute(
+        "ALTER TABLE accounts ADD COLUMN imap_use_starttls INTEGER NOT NULL DEFAULT 0",
+        [],
+    );
+    let _ = conn.execute(
+        "ALTER TABLE accounts ADD COLUMN incoming_protocol TEXT NOT NULL DEFAULT 'imap'",
+        [],
+    );
+    let _ = conn.execute("ALTER TABLE accounts ADD COLUMN pop3_host TEXT", []);
+    let _ = conn.execute("ALTER TABLE accounts ADD COLUMN pop3_port INTEGER", []);
 
     Ok(conn)
 }
@@ -252,14 +270,17 @@ pub fn upsert_summaries(
         let Some(uid) = summary.uid else { continue };
         tx.execute(
             "INSERT INTO cached_messages
-                (account_id, folder, uid, subject, from_addr, date, seen, flagged, fetched_at)
-             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9)
+                (account_id, folder, uid, subject, from_addr, date, seen, flagged,
+                 message_id, in_reply_to, fetched_at)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11)
              ON CONFLICT(account_id, folder, uid) DO UPDATE SET
                 subject = excluded.subject,
                 from_addr = excluded.from_addr,
                 date = excluded.date,
                 seen = excluded.seen,
                 flagged = excluded.flagged,
+                message_id = excluded.message_id,
+                in_reply_to = excluded.in_reply_to,
                 fetched_at = excluded.fetched_at",
             params![
                 account_id,
@@ -270,6 +291,8 @@ pub fn upsert_summaries(
                 summary.date,
                 summary.seen,
                 summary.flagged,
+                summary.message_id,
+                summary.in_reply_to,
                 fetched_at,
             ],
         )
@@ -304,6 +327,132 @@ pub fn upsert_body(
     Ok(())
 }
 
+/// Reads cached message summaries for one account/folder back out, newest
+/// first -- the offline-read counterpart to `upsert_summaries`. Every
+/// `fetch_messages` call writes through to the cache (see `imap.rs`), so
+/// when a live fetch can't reach the server the frontend can fall back to
+/// this and still show the last-seen state of the folder.
+///
+/// `message_id`/`in_reply_to` are included so a threaded view still works
+/// offline. Body columns aren't selected here -- a summary list doesn't
+/// need them; use `get_cached_body` for one message's content.
+pub fn get_cached_summaries(
+    conn: &Connection,
+    account_id: &str,
+    folder: &str,
+    limit: u32,
+) -> Result<Vec<MessageSummary>, String> {
+    let mut stmt = conn
+        .prepare(
+            "SELECT uid, subject, from_addr, date, seen, flagged, message_id, in_reply_to
+             FROM cached_messages
+             WHERE account_id = ?1 AND folder = ?2
+             ORDER BY date DESC
+             LIMIT ?3",
+        )
+        .map_err(|e| format!("could not prepare cached summary query: {e}"))?;
+    let rows = stmt
+        .query_map(params![account_id, folder, limit], |row| {
+            Ok(MessageSummary {
+                uid: Some(row.get(0)?),
+                subject: row.get(1)?,
+                from: row.get(2)?,
+                date: row.get(3)?,
+                seen: row.get(4)?,
+                flagged: row.get(5)?,
+                message_id: row.get(6)?,
+                in_reply_to: row.get(7)?,
+            })
+        })
+        .map_err(|e| format!("could not query cached summaries: {e}"))?;
+    rows.collect::<Result<Vec<_>, _>>()
+        .map_err(|e| format!("could not read cached summary row: {e}"))
+}
+
+/// Offline-read command: returns the last-cached summaries for a folder
+/// without touching the network. The frontend calls this when a live
+/// `fetch_messages` fails (offline, server down) so the mailbox isn't just
+/// blank.
+#[tauri::command]
+pub fn load_cached_messages(
+    account_id: String,
+    folder: String,
+    limit: u32,
+) -> Result<Vec<MessageSummary>, String> {
+    let conn = open()?;
+    get_cached_summaries(&conn, &account_id, &folder, limit)
+}
+
+/// Reads one cached message body back out for offline reading. Returns
+/// `Ok(None)` when that UID's body was never cached (only its summary was
+/// fetched, or nothing at all) -- "not cached" is an ordinary state, not
+/// an error.
+///
+/// Only `text`/`html` and the threading IDs are cached; attachment bytes,
+/// recipient lists, and PGP verification state are not, so the returned
+/// `MessageBody` has those at their empty defaults. Offline reading shows
+/// the message text; a live fetch is still needed to download an
+/// attachment or to re-run PGP verification.
+pub fn get_cached_body(
+    conn: &Connection,
+    account_id: &str,
+    folder: &str,
+    uid: u32,
+) -> Result<Option<MessageBody>, String> {
+    let row = conn
+        .query_row(
+            "SELECT body_text, body_html, message_id, in_reply_to
+             FROM cached_messages
+             WHERE account_id = ?1 AND folder = ?2 AND uid = ?3",
+            params![account_id, folder, uid],
+            |row| {
+                Ok((
+                    row.get::<_, Option<String>>(0)?,
+                    row.get::<_, Option<String>>(1)?,
+                    row.get::<_, Option<String>>(2)?,
+                    row.get::<_, Option<String>>(3)?,
+                ))
+            },
+        )
+        .optional()
+        .map_err(|e| format!("could not read cached body: {e}"))?;
+
+    Ok(row.and_then(|(text, html, message_id, in_reply_to)| {
+        // A cached row with neither a text nor an HTML body means only the
+        // summary was ever fetched -- report that as "no body cached"
+        // rather than a blank body the UI would render as an empty message.
+        if text.is_none() && html.is_none() {
+            return None;
+        }
+        Some(MessageBody {
+            text,
+            html,
+            attachments: Vec::new(),
+            pgp_signed_by: None,
+            pgp_signature_valid: None,
+            from: None,
+            to: Vec::new(),
+            cc: Vec::new(),
+            reply_to: None,
+            message_id,
+            in_reply_to,
+            references: Vec::new(),
+        })
+    }))
+}
+
+/// Offline-read command for a single message's body. `Ok(None)` means the
+/// body isn't cached and a live fetch is required.
+#[tauri::command]
+pub fn load_cached_message_body(
+    account_id: String,
+    folder: String,
+    uid: u32,
+) -> Result<Option<MessageBody>, String> {
+    let conn = open()?;
+    get_cached_body(&conn, &account_id, &folder, uid)
+}
+
 /// A stored account's connection metadata. Never carries a password --
 /// that stays keychain-only, exactly like every other command in this
 /// codebase that takes `account_id` rather than a secret.
@@ -313,9 +462,20 @@ pub struct AccountRecord {
     pub display_name: Option<String>,
     pub imap_host: String,
     pub imap_port: u16,
+    /// Whether the IMAP connection uses STARTTLS (port 143 style) rather
+    /// than implicit TLS (port 993 style). For a `pop3` account these IMAP
+    /// fields are unused placeholders -- see `incoming_protocol`.
+    pub imap_use_starttls: bool,
     pub smtp_host: String,
     pub smtp_port: u16,
     pub smtp_use_starttls: bool,
+    /// `"imap"` (the default) or `"pop3"`. For a POP3 account the
+    /// `imap_*` fields are empty placeholders and `pop3_host`/`pop3_port`
+    /// carry the real incoming server -- POP3 has no folders, so there's
+    /// no IMAP server to record. See `pop3.md`/`multi-account.md`.
+    pub incoming_protocol: String,
+    pub pop3_host: Option<String>,
+    pub pop3_port: Option<u16>,
     pub archive_folder: String,
     pub trash_folder: String,
     pub drafts_folder: String,
@@ -330,16 +490,21 @@ pub fn upsert_account(conn: &Connection, account: &AccountRecord) -> Result<(), 
     let created_at = chrono::Utc::now().to_rfc3339();
     conn.execute(
         "INSERT INTO accounts
-            (account_id, display_name, imap_host, imap_port, smtp_host, smtp_port,
-             smtp_use_starttls, archive_folder, trash_folder, drafts_folder, created_at)
-         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11)
+            (account_id, display_name, imap_host, imap_port, imap_use_starttls,
+             smtp_host, smtp_port, smtp_use_starttls, incoming_protocol,
+             pop3_host, pop3_port, archive_folder, trash_folder, drafts_folder, created_at)
+         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15)
          ON CONFLICT(account_id) DO UPDATE SET
             display_name = excluded.display_name,
             imap_host = excluded.imap_host,
             imap_port = excluded.imap_port,
+            imap_use_starttls = excluded.imap_use_starttls,
             smtp_host = excluded.smtp_host,
             smtp_port = excluded.smtp_port,
             smtp_use_starttls = excluded.smtp_use_starttls,
+            incoming_protocol = excluded.incoming_protocol,
+            pop3_host = excluded.pop3_host,
+            pop3_port = excluded.pop3_port,
             archive_folder = excluded.archive_folder,
             trash_folder = excluded.trash_folder,
             drafts_folder = excluded.drafts_folder",
@@ -348,9 +513,13 @@ pub fn upsert_account(conn: &Connection, account: &AccountRecord) -> Result<(), 
             account.display_name,
             account.imap_host,
             account.imap_port,
+            account.imap_use_starttls,
             account.smtp_host,
             account.smtp_port,
             account.smtp_use_starttls,
+            account.incoming_protocol,
+            account.pop3_host,
+            account.pop3_port,
             account.archive_folder,
             account.trash_folder,
             account.drafts_folder,
@@ -364,8 +533,9 @@ pub fn upsert_account(conn: &Connection, account: &AccountRecord) -> Result<(), 
 pub fn list_accounts(conn: &Connection) -> Result<Vec<AccountRecord>, String> {
     let mut stmt = conn
         .prepare(
-            "SELECT account_id, display_name, imap_host, imap_port, smtp_host, smtp_port,
-                    smtp_use_starttls, archive_folder, trash_folder, drafts_folder
+            "SELECT account_id, display_name, imap_host, imap_port, imap_use_starttls,
+                    smtp_host, smtp_port, smtp_use_starttls, incoming_protocol,
+                    pop3_host, pop3_port, archive_folder, trash_folder, drafts_folder
              FROM accounts ORDER BY created_at ASC",
         )
         .map_err(|e| format!("could not prepare account list query: {e}"))?;
@@ -376,17 +546,56 @@ pub fn list_accounts(conn: &Connection) -> Result<Vec<AccountRecord>, String> {
                 display_name: row.get(1)?,
                 imap_host: row.get(2)?,
                 imap_port: row.get(3)?,
-                smtp_host: row.get(4)?,
-                smtp_port: row.get(5)?,
-                smtp_use_starttls: row.get(6)?,
-                archive_folder: row.get(7)?,
-                trash_folder: row.get(8)?,
-                drafts_folder: row.get(9)?,
+                imap_use_starttls: row.get(4)?,
+                smtp_host: row.get(5)?,
+                smtp_port: row.get(6)?,
+                smtp_use_starttls: row.get(7)?,
+                incoming_protocol: row.get(8)?,
+                pop3_host: row.get(9)?,
+                pop3_port: row.get(10)?,
+                archive_folder: row.get(11)?,
+                trash_folder: row.get(12)?,
+                drafts_folder: row.get(13)?,
             })
         })
         .map_err(|e| format!("could not query accounts: {e}"))?;
     rows.collect::<Result<Vec<_>, _>>()
         .map_err(|e| format!("could not read account row: {e}"))
+}
+
+/// Looks up one account's stored metadata by id. `Ok(None)` when there's
+/// no such account -- an ordinary "not found", not an error. Used by the
+/// IMAP layer to resolve an account's STARTTLS setting at login time
+/// (`imap::login_for_account`) and by `update_account` to read the
+/// existing record before applying changes.
+pub fn get_account(conn: &Connection, account_id: &str) -> Result<Option<AccountRecord>, String> {
+    conn.query_row(
+        "SELECT account_id, display_name, imap_host, imap_port, imap_use_starttls,
+                smtp_host, smtp_port, smtp_use_starttls, incoming_protocol,
+                pop3_host, pop3_port, archive_folder, trash_folder, drafts_folder
+         FROM accounts WHERE account_id = ?1",
+        params![account_id],
+        |row| {
+            Ok(AccountRecord {
+                account_id: row.get(0)?,
+                display_name: row.get(1)?,
+                imap_host: row.get(2)?,
+                imap_port: row.get(3)?,
+                imap_use_starttls: row.get(4)?,
+                smtp_host: row.get(5)?,
+                smtp_port: row.get(6)?,
+                smtp_use_starttls: row.get(7)?,
+                incoming_protocol: row.get(8)?,
+                pop3_host: row.get(9)?,
+                pop3_port: row.get(10)?,
+                archive_folder: row.get(11)?,
+                trash_folder: row.get(12)?,
+                drafts_folder: row.get(13)?,
+            })
+        },
+    )
+    .optional()
+    .map_err(|e| format!("could not read account: {e}"))
 }
 
 /// Removes an account and every message cached for it. Account metadata
@@ -486,6 +695,55 @@ fn search_contacts_in(conn: &Connection, query: &str, limit: u32) -> Result<Vec<
 pub fn search_contacts(query: String, limit: u32) -> Result<Vec<ContactRecord>, String> {
     let conn = open()?;
     search_contacts_in(&conn, &query, limit)
+}
+
+/// Lists the whole address book, most-recently-seen first, for a contact-
+/// management view (as opposed to `search_contacts`, which is the
+/// compose-time autocomplete). Split from its command wrapper for the same
+/// temp-dir testability reason as `search_contacts_in`.
+fn list_contacts_in(conn: &Connection, limit: u32) -> Result<Vec<ContactRecord>, String> {
+    let mut stmt = conn
+        .prepare(
+            "SELECT email, display_name FROM contacts
+             ORDER BY last_seen_at DESC
+             LIMIT ?1",
+        )
+        .map_err(|e| format!("could not prepare contact list query: {e}"))?;
+    let rows = stmt
+        .query_map(params![limit], |row| {
+            Ok(ContactRecord {
+                email: row.get(0)?,
+                display_name: row.get(1)?,
+            })
+        })
+        .map_err(|e| format!("could not list contacts: {e}"))?;
+    rows.collect::<Result<Vec<_>, _>>()
+        .map_err(|e| format!("could not read contact row: {e}"))
+}
+
+#[tauri::command]
+pub fn list_contacts(limit: u32) -> Result<Vec<ContactRecord>, String> {
+    let conn = open()?;
+    list_contacts_in(&conn, limit)
+}
+
+/// Removes one harvested contact by email. The address book accumulates
+/// automatically from every message read or sent, so a manual "forget this
+/// contact" needs a way to delete a row -- otherwise a one-off correspondent
+/// (or a typo'd address) lingers in autocomplete forever. Email is
+/// lowercased to match how `upsert_contacts` stored it. Deleting an email
+/// that isn't present is a no-op success, not an error.
+fn delete_contact_in(conn: &Connection, email: &str) -> Result<(), String> {
+    let email = email.trim().to_lowercase();
+    conn.execute("DELETE FROM contacts WHERE email = ?1", params![email])
+        .map_err(|e| format!("could not delete contact: {e}"))?;
+    Ok(())
+}
+
+#[tauri::command]
+pub fn delete_contact(email: String) -> Result<(), String> {
+    let conn = open()?;
+    delete_contact_in(&conn, &email)
 }
 
 /// One account's own PGP identity. `secret_key` is ASCII-armored and
@@ -968,6 +1226,73 @@ mod tests {
     }
 
     #[test]
+    fn get_cached_summaries_returns_cached_rows_newest_first_with_threading_headers() {
+        let path = TempCachePath::new("cached-summaries");
+        let conn = open_at(&path.0, "c1").expect("open should succeed");
+
+        let mut older = sample_summary(1);
+        older.date = Some("2026-06-20T08:00:00+00:00".to_string());
+        older.message_id = Some("older@helix.test".to_string());
+        let mut newer = sample_summary(2);
+        newer.date = Some("2026-06-20T10:00:00+00:00".to_string());
+        newer.message_id = Some("newer@helix.test".to_string());
+        newer.in_reply_to = Some("older@helix.test".to_string());
+
+        upsert_summaries(&conn, "me@helix.test", "INBOX", &[older, newer])
+            .expect("caching summaries should succeed");
+
+        let cached = get_cached_summaries(&conn, "me@helix.test", "INBOX", 10)
+            .expect("read should succeed");
+
+        assert_eq!(cached.len(), 2);
+        assert_eq!(cached[0].uid, Some(2), "newest first");
+        assert_eq!(cached[0].message_id.as_deref(), Some("newer@helix.test"));
+        assert_eq!(
+            cached[0].in_reply_to.as_deref(),
+            Some("older@helix.test"),
+            "threading headers must survive the cache round-trip so offline threading works"
+        );
+        assert_eq!(cached[1].uid, Some(1));
+    }
+
+    #[test]
+    fn get_cached_body_returns_none_when_only_the_summary_was_cached() {
+        let path = TempCachePath::new("cached-body-none");
+        let conn = open_at(&path.0, "c2").expect("open should succeed");
+
+        upsert_summaries(&conn, "me@helix.test", "INBOX", &[sample_summary(1)])
+            .expect("caching summary should succeed");
+
+        let body = get_cached_body(&conn, "me@helix.test", "INBOX", 1).expect("read should succeed");
+        assert!(body.is_none(), "a summary-only row has no cached body to return");
+    }
+
+    #[test]
+    fn get_cached_body_returns_the_body_once_it_has_been_cached() {
+        let path = TempCachePath::new("cached-body-some");
+        let conn = open_at(&path.0, "c3").expect("open should succeed");
+
+        upsert_summaries(&conn, "me@helix.test", "INBOX", &[sample_summary(1)])
+            .expect("caching summary should succeed");
+        upsert_body(&conn, "me@helix.test", "INBOX", 1, &sample_body())
+            .expect("caching body should succeed");
+
+        let body = get_cached_body(&conn, "me@helix.test", "INBOX", 1)
+            .expect("read should succeed")
+            .expect("body should be cached");
+        assert_eq!(body.text.as_deref(), Some("plain text body"));
+        assert_eq!(body.html.as_deref(), Some("<p>html body</p>"));
+    }
+
+    #[test]
+    fn get_cached_body_returns_none_for_an_uncached_uid() {
+        let path = TempCachePath::new("cached-body-missing");
+        let conn = open_at(&path.0, "c4").expect("open should succeed");
+        let body = get_cached_body(&conn, "me@helix.test", "INBOX", 999).expect("read should succeed");
+        assert!(body.is_none(), "a UID that was never cached returns None, not an error");
+    }
+
+    #[test]
     fn reopening_the_same_path_and_key_preserves_data() {
         let path = TempCachePath::new("reopen");
 
@@ -1030,9 +1355,13 @@ mod tests {
             display_name: Some("Test Account".to_string()),
             imap_host: "imap.helix.test".to_string(),
             imap_port: 993,
+            imap_use_starttls: false,
             smtp_host: "smtp.helix.test".to_string(),
             smtp_port: 465,
             smtp_use_starttls: false,
+            incoming_protocol: "imap".to_string(),
+            pop3_host: None,
+            pop3_port: None,
             archive_folder: "Archive".to_string(),
             trash_folder: "Trash".to_string(),
             drafts_folder: "Drafts".to_string(),
@@ -1121,6 +1450,61 @@ mod tests {
 
         let all = search_contacts_in(&conn, "example.com", 10).expect("search should succeed");
         assert_eq!(all.len(), 2, "both contacts should match a broader query");
+    }
+
+    #[test]
+    fn list_contacts_returns_all_rows_and_delete_removes_one() {
+        let path = TempCachePath::new("contacts-list-delete");
+        let conn = open_at(&path.0, "ct").expect("open should succeed");
+
+        upsert_contacts(
+            &conn,
+            &[
+                ("alice@example.com".to_string(), Some("Alice".to_string())),
+                ("bob@example.com".to_string(), None),
+            ],
+        )
+        .expect("upsert should succeed");
+
+        let all = list_contacts_in(&conn, 100).expect("list should succeed");
+        assert_eq!(all.len(), 2, "both harvested contacts should be listed");
+
+        // Mixed-case input must still match the lowercased stored row.
+        delete_contact_in(&conn, "Alice@Example.com").expect("delete should succeed");
+
+        let after = list_contacts_in(&conn, 100).expect("list should succeed");
+        assert_eq!(after.len(), 1);
+        assert_eq!(after[0].email, "bob@example.com", "only the deleted contact should be gone");
+
+        // Deleting something that isn't there is a no-op success.
+        delete_contact_in(&conn, "nobody@example.com").expect("deleting a missing contact should not error");
+    }
+
+    #[test]
+    fn get_account_round_trips_pop3_and_starttls_fields() {
+        let path = TempCachePath::new("get-account-pop3");
+        let conn = open_at(&path.0, "ga").expect("open should succeed");
+
+        let mut pop3 = sample_account("pop@helix.test");
+        pop3.incoming_protocol = "pop3".to_string();
+        pop3.imap_host = String::new();
+        pop3.imap_port = 0;
+        pop3.pop3_host = Some("pop.helix.test".to_string());
+        pop3.pop3_port = Some(995);
+        pop3.imap_use_starttls = false;
+        upsert_account(&conn, &pop3).expect("upsert should succeed");
+
+        let fetched = get_account(&conn, "pop@helix.test")
+            .expect("get should succeed")
+            .expect("account should exist");
+        assert_eq!(fetched.incoming_protocol, "pop3");
+        assert_eq!(fetched.pop3_host.as_deref(), Some("pop.helix.test"));
+        assert_eq!(fetched.pop3_port, Some(995));
+
+        assert!(
+            get_account(&conn, "nobody@helix.test").expect("get should succeed").is_none(),
+            "a missing account returns None, not an error"
+        );
     }
 
     #[test]

@@ -15,11 +15,26 @@ use crate::pgp;
 
 pub(crate) type ImapSession = Session<TlsStream<TcpStream>>;
 
+/// Opens a TLS-protected IMAP connection and logs in. `use_starttls`
+/// selects the transport, mirroring SMTP's `use_starttls` flag:
+///
+/// - `false` — implicit TLS (IMAPS, port 993 style): TLS from the first
+///   byte, then login.
+/// - `true` — STARTTLS (port 143 style): connect in plaintext, issue
+///   `STARTTLS`, upgrade the same socket to TLS, then login. The upgrade
+///   is mandatory — if the server won't `STARTTLS`, this errors rather
+///   than continuing in plaintext, the same no-downgradable-path posture
+///   as SMTP and POP3 here.
+///
+/// Either way the resulting session is `Session<TlsStream<TcpStream>>` —
+/// once the socket is wrapped in TLS there's no protocol difference left,
+/// so the rest of the module is oblivious to which path got us here.
 async fn connect_and_login(
     host: &str,
     port: u16,
     email: &str,
     password: &str,
+    use_starttls: bool,
 ) -> Result<ImapSession, String> {
     let tcp_stream = TcpStream::connect((host, port))
         .await
@@ -29,10 +44,29 @@ async fn connect_and_login(
         tokio_native_tls::native_tls::TlsConnector::new()
             .map_err(|e| format!("TLS setup failed: {e}"))?,
     );
-    let tls_stream = tls_connector
-        .connect(host, tcp_stream)
-        .await
-        .map_err(|e| format!("TLS handshake with {host} failed: {e}"))?;
+
+    let tls_stream = if use_starttls {
+        // Issue STARTTLS over the plaintext socket, then hand the raw
+        // upgraded socket to the TLS connector. async-imap absorbs the
+        // server greeting while parsing the STARTTLS response, the same
+        // way `login` does for the implicit-TLS path, so there's no
+        // separate greeting read here.
+        let mut client = async_imap::Client::new(tcp_stream);
+        client
+            .run_command_and_check_ok("STARTTLS", None)
+            .await
+            .map_err(|e| format!("STARTTLS failed: {e}"))?;
+        let upgraded = client.into_inner();
+        tls_connector
+            .connect(host, upgraded)
+            .await
+            .map_err(|e| format!("TLS handshake with {host} failed: {e}"))?
+    } else {
+        tls_connector
+            .connect(host, tcp_stream)
+            .await
+            .map_err(|e| format!("TLS handshake with {host} failed: {e}"))?
+    };
 
     let client = async_imap::Client::new(tls_stream);
     client
@@ -53,11 +87,33 @@ pub(crate) async fn login_with_stored_credential(
     host: &str,
     port: u16,
     account_id: &str,
+    use_starttls: bool,
 ) -> Result<ImapSession, String> {
     let mut password = credentials::get_credential(account_id.to_string())?;
-    let result = connect_and_login(host, port, account_id, &password).await;
+    let result = connect_and_login(host, port, account_id, &password, use_starttls).await;
     password.zeroize();
     result
+}
+
+/// Resolves the account's stored `imap_use_starttls` setting from the local
+/// cache, then logs in. The data commands use this so none of them needs to
+/// carry a `use_starttls` parameter -- the flag is a fixed property of the
+/// account (chosen at onboarding), not something each fetch should
+/// re-specify. Defaults to implicit TLS (`false`) when the account isn't in
+/// the cache yet (e.g. mid-onboarding, before it's persisted) or the lookup
+/// fails, since implicit TLS on port 993 is the overwhelmingly common case.
+pub(crate) async fn login_for_account(
+    host: &str,
+    port: u16,
+    account_id: &str,
+) -> Result<ImapSession, String> {
+    let use_starttls = cache::open()
+        .and_then(|conn| cache::get_account(&conn, account_id))
+        .ok()
+        .flatten()
+        .map(|a| a.imap_use_starttls)
+        .unwrap_or(false);
+    login_with_stored_credential(host, port, account_id, use_starttls).await
 }
 
 #[tauri::command]
@@ -157,6 +213,32 @@ fn format_address(address: &Address) -> String {
     }
 }
 
+/// Turns one FETCH response row into a `MessageSummary`. Shared by the
+/// recent-messages range fetch and the search-result UID fetch -- both ask
+/// for the same `(UID FLAGS ENVELOPE INTERNALDATE)` items, so the
+/// envelope-to-summary mapping is identical and lives here rather than
+/// being duplicated at each call site.
+fn summary_from_fetch(fetch: &async_imap::types::Fetch) -> MessageSummary {
+    let envelope = fetch.envelope();
+    MessageSummary {
+        uid: fetch.uid,
+        subject: envelope.and_then(|e| decode_header_text(&e.subject)),
+        from: envelope
+            .and_then(|e| e.from.as_ref())
+            .and_then(|addresses| addresses.first())
+            .map(format_address),
+        date: fetch.internal_date().map(|d| d.to_rfc3339()),
+        seen: fetch.flags().any(|flag| flag == async_imap::types::Flag::Seen),
+        flagged: fetch.flags().any(|flag| flag == async_imap::types::Flag::Flagged),
+        message_id: envelope
+            .and_then(|e| decode_lossy(&e.message_id))
+            .map(strip_angle_brackets),
+        in_reply_to: envelope
+            .and_then(|e| decode_lossy(&e.in_reply_to))
+            .map(strip_angle_brackets),
+    }
+}
+
 /// Fetches the most recent `limit` messages in `folder`, newest last (the
 /// order the server reports them in). Opens the folder read-only (EXAMINE)
 /// since this is a preview-only operation — it shouldn't mark anything as
@@ -182,29 +264,207 @@ async fn fetch_recent_messages(
         .fetch(&sequence_set, "(UID FLAGS ENVELOPE INTERNALDATE)")
         .await
         .map_err(|e| format!("FETCH failed: {e}"))?
-        .map_ok(|fetch| {
-            let envelope = fetch.envelope();
-            MessageSummary {
-                uid: fetch.uid,
-                subject: envelope.and_then(|e| decode_header_text(&e.subject)),
-                from: envelope
-                    .and_then(|e| e.from.as_ref())
-                    .and_then(|addresses| addresses.first())
-                    .map(format_address),
-                date: fetch.internal_date().map(|d| d.to_rfc3339()),
-                seen: fetch.flags().any(|flag| flag == async_imap::types::Flag::Seen),
-                flagged: fetch.flags().any(|flag| flag == async_imap::types::Flag::Flagged),
-                message_id: envelope
-                    .and_then(|e| decode_lossy(&e.message_id))
-                    .map(strip_angle_brackets),
-                in_reply_to: envelope
-                    .and_then(|e| decode_lossy(&e.in_reply_to))
-                    .map(strip_angle_brackets),
-            }
-        })
+        .map_ok(|fetch| summary_from_fetch(&fetch))
         .try_collect()
         .await
         .map_err(|e| format!("FETCH failed: {e}"))
+}
+
+/// Escapes a string for use inside an IMAP quoted-string literal (RFC 3501
+/// section 4.3): backslash and double-quote are the only characters that
+/// need escaping, and CR/LF are stripped outright since they'd terminate
+/// the command line and can't legally appear in a quoted string anyway.
+fn imap_quote(value: &str) -> String {
+    let cleaned: String = value.chars().filter(|&c| c != '\r' && c != '\n').collect();
+    let escaped = cleaned.replace('\\', "\\\\").replace('"', "\\\"");
+    format!("\"{escaped}\"")
+}
+
+/// Builds an IMAP SEARCH criteria string that matches `query` as a
+/// substring of the Subject, From, To, or Body of a message. IMAP's `OR`
+/// is strictly binary (it takes exactly two search keys), so a four-way
+/// match is expressed as a left-folded chain in prefix notation:
+/// `OR OR OR SUBJECT q FROM q TO q BODY q`. Pure and string-only so it can
+/// be unit-tested without a server.
+fn build_search_criteria(query: &str) -> String {
+    let q = imap_quote(query);
+    format!("OR OR OR SUBJECT {q} FROM {q} TO {q} BODY {q}")
+}
+
+/// Searches `folder` for messages matching `query` (substring of
+/// Subject/From/To/Body) via IMAP `UID SEARCH`, then fetches summaries for
+/// up to `limit` of the newest matches. Opens the folder with EXAMINE --
+/// searching is read-only and must not mark anything seen.
+///
+/// Non-ASCII queries get a `CHARSET UTF-8` prefix so servers interpret the
+/// bytes correctly; pure-ASCII queries omit it, since some servers reject
+/// an explicit CHARSET they consider redundant.
+async fn search_in_folder(
+    session: &mut ImapSession,
+    folder: &str,
+    query: &str,
+    limit: u32,
+) -> Result<Vec<MessageSummary>, String> {
+    if query.trim().is_empty() || limit == 0 {
+        return Ok(Vec::new());
+    }
+
+    session
+        .examine(folder)
+        .await
+        .map_err(|e| format!("could not open folder {folder}: {e}"))?;
+
+    let criteria = build_search_criteria(query);
+    let full = if query.bytes().any(|b| b >= 0x80) {
+        format!("CHARSET UTF-8 {criteria}")
+    } else {
+        criteria
+    };
+
+    let matches = session
+        .uid_search(full)
+        .await
+        .map_err(|e| format!("SEARCH failed: {e}"))?;
+    if matches.is_empty() {
+        return Ok(Vec::new());
+    }
+
+    // Highest UIDs first (newest arrivals), capped at `limit` so a query
+    // matching thousands of messages doesn't pull them all over IPC.
+    let mut uids: Vec<u32> = matches.into_iter().collect();
+    uids.sort_unstable_by(|a, b| b.cmp(a));
+    uids.truncate(limit as usize);
+
+    let uid_set = uids.iter().map(|u| u.to_string()).collect::<Vec<_>>().join(",");
+    let mut summaries: Vec<MessageSummary> = session
+        .uid_fetch(uid_set, "(UID FLAGS ENVELOPE INTERNALDATE)")
+        .await
+        .map_err(|e| format!("FETCH failed: {e}"))?
+        .map_ok(|fetch| summary_from_fetch(&fetch))
+        .try_collect()
+        .await
+        .map_err(|e| format!("FETCH failed: {e}"))?;
+
+    // The server may return the fetched rows in any order; present them
+    // newest-UID-first to match the truncation order above.
+    summaries.sort_unstable_by(|a, b| b.uid.cmp(&a.uid));
+    Ok(summaries)
+}
+
+#[tauri::command]
+pub async fn search_messages(
+    account_id: String,
+    host: String,
+    port: u16,
+    folder: String,
+    query: String,
+    limit: u32,
+) -> Result<Vec<MessageSummary>, String> {
+    let mut session = login_with_stored_credential(&host, port, &account_id).await?;
+    let result = search_in_folder(&mut session, &folder, &query, limit).await;
+    session.logout().await.ok();
+    result
+}
+
+#[tauri::command]
+pub async fn create_folder(
+    account_id: String,
+    host: String,
+    port: u16,
+    folder: String,
+) -> Result<(), String> {
+    let mut session = login_with_stored_credential(&host, port, &account_id).await?;
+    let result = session
+        .create(&folder)
+        .await
+        .map_err(|e| format!("could not create folder {folder}: {e}"));
+    session.logout().await.ok();
+    result
+}
+
+#[tauri::command]
+pub async fn delete_folder(
+    account_id: String,
+    host: String,
+    port: u16,
+    folder: String,
+) -> Result<(), String> {
+    let mut session = login_with_stored_credential(&host, port, &account_id).await?;
+    let result = session
+        .delete(&folder)
+        .await
+        .map_err(|e| format!("could not delete folder {folder}: {e}"));
+    session.logout().await.ok();
+    result
+}
+
+#[tauri::command]
+pub async fn rename_folder(
+    account_id: String,
+    host: String,
+    port: u16,
+    folder: String,
+    new_name: String,
+) -> Result<(), String> {
+    let mut session = login_with_stored_credential(&host, port, &account_id).await?;
+    let result = session
+        .rename(&folder, &new_name)
+        .await
+        .map_err(|e| format!("could not rename folder {folder} to {new_name}: {e}"));
+    session.logout().await.ok();
+    result
+}
+
+/// Permanently removes every message in `folder` -- the "empty trash" /
+/// "empty spam" action. Marks all messages `\Deleted` via a `1:*` UID
+/// store, then EXPUNGE. Unlike `move_message`'s careful SEARCH-based
+/// fallback, this is deliberately a blunt "remove everything here", so
+/// there's no need to preserve other clients' `\Deleted` state -- the
+/// whole folder is being emptied regardless.
+///
+/// A bare `1:*` store against an already-empty mailbox errors on some
+/// servers, so the `exists == 0` case returns early rather than issuing a
+/// no-op store.
+async fn empty_folder_messages(session: &mut ImapSession, folder: &str) -> Result<(), String> {
+    let mailbox = session
+        .select(folder)
+        .await
+        .map_err(|e| format!("could not open folder {folder}: {e}"))?;
+
+    if mailbox.exists == 0 {
+        return Ok(());
+    }
+
+    session
+        .uid_store("1:*", "+FLAGS.SILENT (\\Deleted)")
+        .await
+        .map_err(|e| format!("STORE failed: {e}"))?
+        .try_collect::<Vec<_>>()
+        .await
+        .map_err(|e| format!("STORE failed: {e}"))?;
+
+    session
+        .expunge()
+        .await
+        .map_err(|e| format!("EXPUNGE failed: {e}"))?
+        .try_collect::<Vec<_>>()
+        .await
+        .map_err(|e| format!("EXPUNGE failed: {e}"))?;
+
+    Ok(())
+}
+
+#[tauri::command]
+pub async fn empty_folder(
+    account_id: String,
+    host: String,
+    port: u16,
+    folder: String,
+) -> Result<(), String> {
+    let mut session = login_with_stored_credential(&host, port, &account_id).await?;
+    let result = empty_folder_messages(&mut session, &folder).await;
+    session.logout().await.ok();
+    result
 }
 
 /// Best-effort write-through into the local encrypted cache. Failures are
@@ -660,13 +920,25 @@ pub async fn fetch_attachment(
     extract_attachment(&result?, attachment_index)
 }
 
-/// Adds or removes one flag on one message via `UID STORE`. Opens the
+/// Joins a slice of UIDs into an IMAP UID set string (`"3,5,9"`), or
+/// `None` when the slice is empty -- a STORE/COPY against an empty set is
+/// a caller error, not a no-op to paper over, so the commands below turn
+/// `None` into an explicit error rather than silently doing nothing.
+fn join_uids(uids: &[u32]) -> Option<String> {
+    if uids.is_empty() {
+        return None;
+    }
+    Some(uids.iter().map(|u| u.to_string()).collect::<Vec<_>>().join(","))
+}
+
+/// Adds or removes one flag across a UID set via `UID STORE`. Opens the
 /// folder with `SELECT`, not `EXAMINE` -- unlike `fetch_messages`, this is
-/// specifically here to mutate mailbox state.
+/// specifically here to mutate mailbox state. `uid_set` is any valid IMAP
+/// UID set: a single UID, a comma list, or `1:*` for the whole folder.
 async fn set_flag(
     session: &mut ImapSession,
     folder: &str,
-    uid: u32,
+    uid_set: &str,
     flag: &str,
     set: bool,
 ) -> Result<(), String> {
@@ -677,7 +949,7 @@ async fn set_flag(
 
     let sign = if set { "+" } else { "-" };
     session
-        .uid_store(uid.to_string(), format!("{sign}FLAGS.SILENT ({flag})"))
+        .uid_store(uid_set, format!("{sign}FLAGS.SILENT ({flag})"))
         .await
         .map_err(|e| format!("STORE failed: {e}"))?
         .try_collect::<Vec<_>>()
@@ -697,7 +969,7 @@ pub async fn set_message_seen(
     seen: bool,
 ) -> Result<(), String> {
     let mut session = login_with_stored_credential(&host, port, &account_id).await?;
-    let result = set_flag(&mut session, &folder, uid, "\\Seen", seen).await;
+    let result = set_flag(&mut session, &folder, &uid.to_string(), "\\Seen", seen).await;
     session.logout().await.ok();
     result
 }
@@ -712,7 +984,80 @@ pub async fn set_message_flagged(
     flagged: bool,
 ) -> Result<(), String> {
     let mut session = login_with_stored_credential(&host, port, &account_id).await?;
-    let result = set_flag(&mut session, &folder, uid, "\\Flagged", flagged).await;
+    let result = set_flag(&mut session, &folder, &uid.to_string(), "\\Flagged", flagged).await;
+    session.logout().await.ok();
+    result
+}
+
+/// Sets/clears `\Seen` across many messages in one `UID STORE` -- the
+/// multi-select "mark as read/unread" action. One round-trip for the whole
+/// selection rather than one per message.
+#[tauri::command]
+pub async fn set_messages_seen(
+    account_id: String,
+    host: String,
+    port: u16,
+    folder: String,
+    uids: Vec<u32>,
+    seen: bool,
+) -> Result<(), String> {
+    let uid_set = join_uids(&uids).ok_or("no messages selected")?;
+    let mut session = login_with_stored_credential(&host, port, &account_id).await?;
+    let result = set_flag(&mut session, &folder, &uid_set, "\\Seen", seen).await;
+    session.logout().await.ok();
+    result
+}
+
+/// Sets/clears `\Flagged` across many messages in one `UID STORE` -- the
+/// multi-select "star/unstar" action.
+#[tauri::command]
+pub async fn set_messages_flagged(
+    account_id: String,
+    host: String,
+    port: u16,
+    folder: String,
+    uids: Vec<u32>,
+    flagged: bool,
+) -> Result<(), String> {
+    let uid_set = join_uids(&uids).ok_or("no messages selected")?;
+    let mut session = login_with_stored_credential(&host, port, &account_id).await?;
+    let result = set_flag(&mut session, &folder, &uid_set, "\\Flagged", flagged).await;
+    session.logout().await.ok();
+    result
+}
+
+/// Marks every message in `folder` `\Seen` (or unseen) in one shot -- the
+/// "mark all as read" action. Uses a `1:*` UID store, short-circuiting on
+/// an empty folder since a `1:*` store errors on some servers when there's
+/// nothing to act on.
+#[tauri::command]
+pub async fn mark_folder_seen(
+    account_id: String,
+    host: String,
+    port: u16,
+    folder: String,
+    seen: bool,
+) -> Result<(), String> {
+    let mut session = login_with_stored_credential(&host, port, &account_id).await?;
+    let result = async {
+        let mailbox = session
+            .select(&folder)
+            .await
+            .map_err(|e| format!("could not open folder {folder}: {e}"))?;
+        if mailbox.exists == 0 {
+            return Ok(());
+        }
+        let sign = if seen { "+" } else { "-" };
+        session
+            .uid_store("1:*", format!("{sign}FLAGS.SILENT (\\Seen)"))
+            .await
+            .map_err(|e| format!("STORE failed: {e}"))?
+            .try_collect::<Vec<_>>()
+            .await
+            .map_err(|e| format!("STORE failed: {e}"))?;
+        Ok(())
+    }
+    .await;
     session.logout().await.ok();
     result
 }
@@ -766,10 +1111,13 @@ async fn move_via_copy_store_uid_expunge(
 /// window is inherent to not having UIDPLUS, not a bug in this function.
 async fn move_via_search_store_expunge(
     session: &mut ImapSession,
-    uid: u32,
+    targets: &[u32],
     destination_folder: &str,
 ) -> Result<(), String> {
-    let uid_str = uid.to_string();
+    let uid_str = match join_uids(targets) {
+        Some(s) => s,
+        None => return Ok(()),
+    };
 
     session
         .uid_copy(&uid_str, destination_folder)
@@ -781,7 +1129,7 @@ async fn move_via_search_store_expunge(
         .await
         .map_err(|e| format!("SEARCH failed: {e}"))?
         .into_iter()
-        .filter(|&other_uid| other_uid != uid)
+        .filter(|other_uid| !targets.contains(other_uid))
         .collect();
     let other_deleted_set = other_deleted
         .iter()
@@ -844,12 +1192,17 @@ async fn move_via_search_store_expunge(
 /// SEARCH-based dance as a last resort. See `mailbox-actions.md` for why
 /// all three exist -- real providers in the wild are split across all
 /// three capability levels.
-async fn move_message(
+async fn move_messages(
     session: &mut ImapSession,
     folder: &str,
-    uid: u32,
+    uids: &[u32],
     destination_folder: &str,
 ) -> Result<(), String> {
+    let uid_set = match join_uids(uids) {
+        Some(s) => s,
+        None => return Ok(()),
+    };
+
     session
         .select(folder)
         .await
@@ -859,20 +1212,19 @@ async fn move_message(
         .capabilities()
         .await
         .map_err(|e| format!("CAPABILITY failed: {e}"))?;
-    let uid_str = uid.to_string();
 
     if capabilities.has_str("MOVE") {
         return session
-            .uid_mv(&uid_str, destination_folder)
+            .uid_mv(&uid_set, destination_folder)
             .await
             .map_err(|e| format!("MOVE failed: {e}"));
     }
 
     if capabilities.has_str("UIDPLUS") {
-        return move_via_copy_store_uid_expunge(session, &uid_str, destination_folder).await;
+        return move_via_copy_store_uid_expunge(session, &uid_set, destination_folder).await;
     }
 
-    move_via_search_store_expunge(session, uid, destination_folder).await
+    move_via_search_store_expunge(session, uids, destination_folder).await
 }
 
 #[tauri::command]
@@ -885,7 +1237,26 @@ pub async fn move_message_to_folder(
     destination_folder: String,
 ) -> Result<(), String> {
     let mut session = login_with_stored_credential(&host, port, &account_id).await?;
-    let result = move_message(&mut session, &folder, uid, &destination_folder).await;
+    let result = move_messages(&mut session, &folder, &[uid], &destination_folder).await;
+    session.logout().await.ok();
+    result
+}
+
+/// Moves many messages into `destination_folder` in one operation -- the
+/// multi-select "move to folder" / "archive selection" action. Goes
+/// through the same three-tier MOVE/UIDPLUS/SEARCH strategy as the
+/// single-message command, just with a UID set instead of one UID.
+#[tauri::command]
+pub async fn move_messages_to_folder(
+    account_id: String,
+    host: String,
+    port: u16,
+    folder: String,
+    uids: Vec<u32>,
+    destination_folder: String,
+) -> Result<(), String> {
+    let mut session = login_with_stored_credential(&host, port, &account_id).await?;
+    let result = move_messages(&mut session, &folder, &uids, &destination_folder).await;
     session.logout().await.ok();
     result
 }
@@ -1181,6 +1552,36 @@ mod tests {
         assert_eq!(replies[1].message.uid, Some(2));
     }
 
+    #[test]
+    fn imap_quote_escapes_quotes_and_backslashes() {
+        assert_eq!(imap_quote("plain"), "\"plain\"");
+        assert_eq!(imap_quote("with \"quotes\""), "\"with \\\"quotes\\\"\"");
+        assert_eq!(imap_quote("back\\slash"), "\"back\\\\slash\"");
+    }
+
+    #[test]
+    fn imap_quote_strips_crlf_so_it_cannot_break_the_command_line() {
+        // A CR or LF in the query would otherwise terminate the IMAP
+        // command and let the rest be interpreted as a new command.
+        assert_eq!(imap_quote("a\r\nLOGOUT"), "\"aLOGOUT\"");
+    }
+
+    #[test]
+    fn build_search_criteria_produces_a_four_way_or_chain() {
+        assert_eq!(
+            build_search_criteria("hi"),
+            "OR OR OR SUBJECT \"hi\" FROM \"hi\" TO \"hi\" BODY \"hi\""
+        );
+    }
+
+    #[test]
+    fn build_search_criteria_escapes_the_query_in_every_field() {
+        // A query containing a quote must stay escaped in all four fields,
+        // not just the first -- otherwise one field could break framing.
+        let criteria = build_search_criteria("a\"b");
+        assert_eq!(criteria.matches("\"a\\\"b\"").count(), 4);
+    }
+
     // Pure, no network: builds a small multipart message by hand to prove
     // extract_attachment's index lookup and base64 encoding work in
     // isolation from any real mail server.
@@ -1263,7 +1664,7 @@ body text\r\n";
     async fn sets_and_clears_the_seen_flag_against_a_local_test_server() {
         let mut session = connect_to_greenmail_and_login().await;
 
-        set_flag(&mut session, "INBOX", 1, "\\Seen", true)
+        set_flag(&mut session, "INBOX", "1", "\\Seen", true)
             .await
             .expect("setting \\Seen should succeed");
         let messages = fetch_recent_messages(&mut session, "INBOX", 1)
@@ -1271,7 +1672,7 @@ body text\r\n";
             .expect("fetch should succeed");
         assert!(messages[0].seen, "message should be seen after setting the flag");
 
-        set_flag(&mut session, "INBOX", 1, "\\Seen", false)
+        set_flag(&mut session, "INBOX", "1", "\\Seen", false)
             .await
             .expect("clearing \\Seen should succeed");
         let messages = fetch_recent_messages(&mut session, "INBOX", 1)
@@ -1288,7 +1689,7 @@ body text\r\n";
     async fn sets_and_clears_the_flagged_flag_against_a_local_test_server() {
         let mut session = connect_to_greenmail_and_login().await;
 
-        set_flag(&mut session, "INBOX", 1, "\\Flagged", true)
+        set_flag(&mut session, "INBOX", "1", "\\Flagged", true)
             .await
             .expect("setting \\Flagged should succeed");
         let messages = fetch_recent_messages(&mut session, "INBOX", 1)
@@ -1296,7 +1697,7 @@ body text\r\n";
             .expect("fetch should succeed");
         assert!(messages[0].flagged, "message should be flagged after setting the flag");
 
-        set_flag(&mut session, "INBOX", 1, "\\Flagged", false)
+        set_flag(&mut session, "INBOX", "1", "\\Flagged", false)
             .await
             .expect("clearing \\Flagged should succeed");
         let messages = fetch_recent_messages(&mut session, "INBOX", 1)
@@ -1320,7 +1721,7 @@ body text\r\n";
             .await
             .expect("creating the destination folder should succeed");
 
-        move_message(&mut session, "INBOX", 1, "Archive")
+        move_messages(&mut session, "INBOX", &[1], "Archive")
             .await
             .expect("move should succeed");
 
@@ -1392,7 +1793,7 @@ body text\r\n";
             .await
             .expect("marking UID 2 deleted should succeed");
 
-        move_via_search_store_expunge(&mut session, 1, "Archive")
+        move_via_search_store_expunge(&mut session, &[1], "Archive")
             .await
             .expect("move should succeed");
 

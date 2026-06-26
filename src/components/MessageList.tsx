@@ -2,7 +2,7 @@ import { useEffect, useRef, useState } from "react";
 import { Animated, Easing, FlatList, Pressable, StyleSheet, Text, TextInput, View } from "react-native";
 import { resolveAccountColor, resolveAccountLabel, type AccountOverrides, type MailAccount } from "../data/accounts";
 import { folderLabel } from "../data/folders";
-import { formatMessageTime, getAttachments } from "../data/messages";
+import { formatMessageTime } from "../data/messages";
 import { useAnchorRect } from "../hooks/useAnchorRect";
 import type { MessageWithFolder } from "../hooks/useMessageStore";
 import type { HoverState } from "../lib/pressable";
@@ -132,7 +132,7 @@ export function MessageList({
     // paperclip + "N attachments" count would be more accurate for a
     // multi-attachment message, but that's a bigger row-layout change than
     // this list view needs right now.
-    const attachment = getAttachments(item.id)[0];
+    const attachment = item.realAttachments?.[0];
     const otherFolderLabel = searchActive && item.folder !== folder ? folderLabel(item.folder) : undefined;
     const accountIndex = unified ? accounts.findIndex((candidate) => candidate.id === item.accountId) : -1;
     const accountInfo = accountIndex === -1 ? undefined : accounts[accountIndex];

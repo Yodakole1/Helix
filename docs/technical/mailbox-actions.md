@@ -1,7 +1,9 @@
 # Mailbox mutation commands
 
-`src-tauri/src/imap.rs` exposes three commands that change mailbox state,
-unlike `fetch_messages`/`fetch_message_body` which are read-only:
+`src-tauri/src/imap.rs` exposes commands that change mailbox state, unlike
+`fetch_messages`/`fetch_message_body` which are read-only.
+
+## Single-message commands
 
 - `set_message_seen(account_id, host, port, folder, uid, seen)` — adds or
   removes `\Seen` via `UID STORE`
@@ -10,15 +12,38 @@ unlike `fetch_messages`/`fetch_message_body` which are read-only:
 - `move_message_to_folder(account_id, host, port, folder, uid,
   destination_folder)` — moves one message into another folder
 
-Archive and Trash aren't separate commands. They're just
-`move_message_to_folder` with the account's actual archive/trash folder
-name as `destination_folder` — those names vary by provider (`INBOX.
-Archive`, `[Gmail]/All Mail`, `Deleted Items`, ...), and resolving "the"
-archive folder for an account via the `SPECIAL-USE` extension (RFC 6154)
-is a separate concern the frontend or a future command will need to
-handle, not something baked into the move primitive itself.
+## Batch (multi-select) commands
 
-All three open the folder with `SELECT`, not `EXAMINE` — they exist
+The single-message commands above are thin wrappers over internal helpers
+that already speak IMAP UID *sets*, so the batch variants are the same
+operation over a `Vec<u32>` of UIDs instead of one — one `UID STORE`/MOVE
+round-trip for the whole selection rather than one per message:
+
+- `set_messages_seen(account_id, host, port, folder, uids, seen)` — mark a
+  multi-selection read/unread
+- `set_messages_flagged(account_id, host, port, folder, uids, flagged)` —
+  star/unstar a multi-selection
+- `move_messages_to_folder(account_id, host, port, folder, uids,
+  destination_folder)` — move/archive a multi-selection, through the same
+  three-tier MOVE/UIDPLUS/SEARCH strategy as the single-message move
+- `mark_folder_seen(account_id, host, port, folder, seen)` — the "mark all
+  as read" action: a `1:*` UID store across the whole folder in one shot.
+  Short-circuits on an empty folder, since a `1:*` store errors on some
+  servers when there's nothing to act on.
+
+An empty `uids` list is an explicit error ("no messages selected"), not a
+silent no-op — `join_uids` returns `None` and the command surfaces it,
+since a STORE/COPY against an empty set is a caller bug worth catching.
+
+Archive and Trash aren't separate commands. They're just the move command
+with the account's actual archive/trash folder name as
+`destination_folder` — those names vary by provider (`INBOX.Archive`,
+`[Gmail]/All Mail`, `Deleted Items`, ...), and resolving "the" archive
+folder for an account via the `SPECIAL-USE` extension (RFC 6154) is a
+separate concern the frontend or a future command will need to handle, not
+something baked into the move primitive itself.
+
+All of these open the folder with `SELECT`, not `EXAMINE` — they exist
 specifically to mutate state, unlike `fetch_messages`'s read-only
 preview.
 

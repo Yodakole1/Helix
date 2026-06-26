@@ -1,7 +1,7 @@
 import { useEffect, useMemo, useRef, useState } from "react";
 import { Pressable, StyleSheet, Text, View } from "react-native";
 import type { SampleMessage } from "../data/messages";
-import { formatMessageTime, getAttachments, getBody, getHtmlBody } from "../data/messages";
+import { formatMessageTime } from "../data/messages";
 import type { RealAttachment } from "../data/messages";
 import type { HoverState } from "../lib/pressable";
 import { sanitizeHtml } from "../lib/sanitizeHtml";
@@ -63,14 +63,11 @@ export function ReaderPane({
     setShowImagesOverride(false);
   }, [message?.id]);
 
-  // Computed unconditionally (message can be undefined) so the useMemo
-  // below always runs in the same order across renders -- the early
-  // "no message" return has to come after every hook call, not before.
-  // Prefer real data (from fetch_message_body) over the static sample lookup.
-  const htmlBody = message ? (message.htmlBody ?? getHtmlBody(message.id)) : undefined;
-  // Remote image detection: sample messages use hasRemoteImage; real HTML
-  // bodies get checked for <img> tags at sanitise time.
-  const imagesBlocked = (message?.hasRemoteImage === true || (!!htmlBody && !!message?.uid)) && blockImages && !showImagesOverride;
+  // Must be computed unconditionally (message can be undefined) so useMemo
+  // always runs in the same hook order -- the early "no message" return
+  // comes after all hook calls, not before.
+  const htmlBody = message?.htmlBody;
+  const imagesBlocked = (message?.hasRemoteImage === true || !!htmlBody) && blockImages && !showImagesOverride;
   const sanitizedBody = useMemo(
     () => (htmlBody ? sanitizeHtml(htmlBody, { blockRemoteImages: imagesBlocked }) : undefined),
     [htmlBody, imagesBlocked],
@@ -85,11 +82,8 @@ export function ReaderPane({
   }
 
   const avatarColor = colorForIndex(avatarIndex);
-  // Real attachments from fetch_message_body; fall back to sample data
-  // stubs for the demo messages.
   const realAtts: RealAttachment[] = message.realAttachments ?? [];
-  const sampleAtts = realAtts.length === 0 ? getAttachments(message.id) : [];
-  const textBody = message.textBody ?? getBody(message.id);
+  const textBody = message.textBody;
 
   return (
     <View style={styles.pane}>
@@ -205,7 +199,6 @@ export function ReaderPane({
           <Text style={[styles.bodyText, lightMode && styles.bodyTextLight]}>{textBody}</Text>
         )}
 
-        {/* Real attachments from fetch_message_body */}
         {realAtts.map((att) => (
           <View
             key={att.index}

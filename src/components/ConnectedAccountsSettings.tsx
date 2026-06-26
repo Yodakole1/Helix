@@ -10,13 +10,6 @@ interface ConnectedAccountsSettingsProps {
 
 type ListStatus = "loading" | "loaded" | "error";
 
-// The real, persisted account list (src-tauri/src/account.rs's
-// list_accounts) -- separate from the sample accounts above, which is
-// what the sidebar/mailbox view actually reads from today. Adding an
-// account via AddAccountModal (opened from the button below) now calls
-// the real add_account command, so it shows up here; this list isn't yet
-// wired into the rest of the app's mailbox view -- see
-// docs/technical/frontend-roadmap.md.
 export function ConnectedAccountsSettings({ accentColor, onAddAccount }: ConnectedAccountsSettingsProps) {
   const [status, setStatus] = useState<ListStatus>("loading");
   const [accounts, setAccounts] = useState<AccountRecord[]>([]);
@@ -54,7 +47,7 @@ export function ConnectedAccountsSettings({ accentColor, onAddAccount }: Connect
   return (
     <View>
       <View style={styles.titleRow}>
-        <Text style={styles.sectionTitle}>Connected accounts (real)</Text>
+        <Text style={styles.sectionTitle}>Connected accounts</Text>
         <View style={styles.titleActions}>
           <Pressable onPress={refresh} style={styles.refreshButton}>
             <Text style={[styles.refresh, { color: accentColor }]}>Refresh</Text>
@@ -72,10 +65,7 @@ export function ConnectedAccountsSettings({ accentColor, onAddAccount }: Connect
       {status === "error" && <Text style={styles.error}>{errorMessage}</Text>}
 
       {status === "loaded" && accounts.length === 0 && (
-        <Text style={styles.hint}>
-          No real accounts yet. Use "Add account" from the sidebar -- it now actually verifies the login over IMAP and
-          persists the connection metadata, instead of just storing a password.
-        </Text>
+        <Text style={styles.hint}>No accounts yet. Use the button above to add one.</Text>
       )}
 
       {status === "loaded" &&
