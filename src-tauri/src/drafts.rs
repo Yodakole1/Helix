@@ -11,10 +11,29 @@ fn generate_id() -> String {
     bytes.iter().map(|b| format!("{b:02x}")).collect()
 }
 
+/// Wraps a base64 string to 76-character lines per RFC 2045 -- some stricter
+/// MIME parsers balk at unbounded single-line base64. The input is already
+/// base64 (the frontend supplies attachment bytes pre-encoded), so this only
+/// re-flows it onto multiple lines, never re-encodes.
+fn wrap_base64(b64: &str) -> String {
+    b64.as_bytes()
+        .chunks(76)
+        .map(|chunk| String::from_utf8_lossy(chunk).into_owned())
+        .collect::<Vec<_>>()
+        .join("\r\n")
+}
+
 /// Builds a minimal but valid RFC 2822 message from draft fields, suitable
 /// for IMAP APPEND. Uses manual construction rather than lettre so that a
 /// missing or incomplete To address (which is normal while composing) doesn't
 /// block the save. The result is only ever stored on the server, never sent.
+///
+/// With no attachments this is a single `text/plain` body, unchanged from
+/// before. With attachments it becomes `multipart/mixed`: the text body as
+/// the first part, then each attachment as a base64 part -- the same
+/// structure `smtp::build_multipart_body` produces for a real send, just
+/// hand-built here for the same incomplete-draft tolerance as the rest of
+/// this function.
 fn build_raw_draft_bytes(
     from: &str,
     to: Option<&str>,
@@ -22,6 +41,7 @@ fn build_raw_draft_bytes(
     body_text: Option<&str>,
     in_reply_to: Option<&str>,
     references: &[String],
+    attachments: &[smtp::OutgoingAttachment],
 ) -> Vec<u8> {
     let date = chrono::Utc::now().format("%a, %d %b %Y %H:%M:%S +0000");
     let mut lines = Vec::new();
@@ -32,7 +52,6 @@ fn build_raw_draft_bytes(
     lines.push(format!("Subject: {}", subject.unwrap_or("")));
     lines.push(format!("Date: {date}"));
     lines.push("MIME-Version: 1.0".to_string());
-    lines.push("Content-Type: text/plain; charset=utf-8".to_string());
     if let Some(irt) = in_reply_to {
         lines.push(format!("In-Reply-To: <{irt}>"));
     }
@@ -40,8 +59,39 @@ fn build_raw_draft_bytes(
         let refs_str = references.iter().map(|r| format!("<{r}>")).collect::<Vec<_>>().join(" ");
         lines.push(format!("References: {refs_str}"));
     }
-    lines.push(String::new()); // blank line separating headers from body
+
+    if attachments.is_empty() {
+        lines.push("Content-Type: text/plain; charset=utf-8".to_string());
+        lines.push(String::new()); // blank line separating headers from body
+        lines.push(body_text.unwrap_or("").to_string());
+        return lines.join("\r\n").into_bytes();
+    }
+
+    let boundary = format!("helix-draft-{}", generate_id());
+    lines.push(format!("Content-Type: multipart/mixed; boundary=\"{boundary}\""));
+    lines.push(String::new());
+
+    lines.push(format!("--{boundary}"));
+    lines.push("Content-Type: text/plain; charset=utf-8".to_string());
+    lines.push(String::new());
     lines.push(body_text.unwrap_or("").to_string());
+
+    for attachment in attachments {
+        lines.push(format!("--{boundary}"));
+        lines.push(format!(
+            "Content-Type: {}; name=\"{}\"",
+            attachment.content_type, attachment.filename
+        ));
+        lines.push(format!(
+            "Content-Disposition: attachment; filename=\"{}\"",
+            attachment.filename
+        ));
+        lines.push("Content-Transfer-Encoding: base64".to_string());
+        lines.push(String::new());
+        lines.push(wrap_base64(&attachment.content_base64));
+    }
+
+    lines.push(format!("--{boundary}--"));
     lines.join("\r\n").into_bytes()
 }
 
@@ -55,6 +105,12 @@ async fn append_draft_to_imap(
     drafts_folder: &str,
     draft: &DraftRecord,
 ) -> Result<(), String> {
+    let attachments: Vec<smtp::OutgoingAttachment> = match &draft.attachments_json {
+        Some(json) => serde_json::from_str(json)
+            .map_err(|e| format!("could not deserialize draft attachments: {e}"))?,
+        None => Vec::new(),
+    };
+
     let raw_bytes = build_raw_draft_bytes(
         account_id,
         draft.to_addr.as_deref(),
@@ -62,9 +118,10 @@ async fn append_draft_to_imap(
         draft.body_text.as_deref(),
         draft.in_reply_to.as_deref(),
         &draft.references,
+        &attachments,
     );
 
-    let mut session = imap::login_with_stored_credential(host, port, account_id).await?;
+    let mut session = imap::login_for_account(host, port, account_id).await?;
 
     // If there's a previously APPENDed copy of this draft on the server,
     // delete it before appending the updated version so we don't accumulate
@@ -133,6 +190,7 @@ pub async fn save_draft(
     body_html: Option<String>,
     in_reply_to: Option<String>,
     references: Vec<String>,
+    attachments: Vec<smtp::OutgoingAttachment>,
 ) -> Result<String, String> {
     let draft_id = draft_id.unwrap_or_else(generate_id);
     let conn = cache::open()?;
@@ -140,6 +198,12 @@ pub async fn save_draft(
     // Preserve any existing imap_uid so append_draft_to_imap can delete the
     // stale server copy before writing the updated one.
     let existing_uid = cache::get_draft(&conn, &draft_id)?.and_then(|d| d.imap_uid);
+
+    let attachments_json = if attachments.is_empty() {
+        None
+    } else {
+        Some(serde_json::to_string(&attachments).map_err(|e| format!("could not serialize draft attachments: {e}"))?)
+    };
 
     let draft = DraftRecord {
         draft_id: draft_id.clone(),
@@ -150,6 +214,7 @@ pub async fn save_draft(
         body_html,
         in_reply_to,
         references,
+        attachments_json,
         imap_uid: existing_uid,
         saved_at: chrono::Utc::now().to_rfc3339(),
     };
@@ -191,7 +256,7 @@ pub async fn delete_draft(
 
     if let Some(uid) = imap_uid {
         if let Err(e) = async {
-            let mut session = imap::login_with_stored_credential(&imap_host, imap_port, &account_id).await?;
+            let mut session = imap::login_for_account(&imap_host, imap_port, &account_id).await?;
             let result = delete_imap_draft_uid(&mut session, &drafts_folder, uid).await;
             session.logout().await.ok();
             result
@@ -359,4 +424,68 @@ pub async fn flush_outbox(account_id: String) -> Result<FlushResult, String> {
     }
 
     Ok(FlushResult { sent, failed })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use mail_parser::MimeHeaders;
+
+    #[test]
+    fn wrap_base64_breaks_long_lines_at_76_without_altering_content() {
+        let long = "a".repeat(200);
+        let wrapped = wrap_base64(&long);
+        for line in wrapped.split("\r\n") {
+            assert!(line.len() <= 76, "no wrapped line should exceed 76 chars");
+        }
+        assert_eq!(wrapped.replace("\r\n", ""), long, "re-flowing must not change the content");
+    }
+
+    #[test]
+    fn builds_a_plain_text_draft_when_there_are_no_attachments() {
+        let raw = build_raw_draft_bytes(
+            "me@helix.test",
+            Some("you@helix.test"),
+            Some("Hi"),
+            Some("body"),
+            None,
+            &[],
+            &[],
+        );
+        let text = String::from_utf8_lossy(&raw);
+        assert!(text.contains("Content-Type: text/plain; charset=utf-8"));
+        assert!(!text.contains("multipart/mixed"), "no attachments means no multipart wrapper");
+    }
+
+    #[test]
+    fn builds_a_multipart_draft_that_round_trips_through_a_parser() {
+        use base64::Engine;
+
+        let attachment = smtp::OutgoingAttachment {
+            filename: "notes.txt".to_string(),
+            content_type: "text/plain".to_string(),
+            content_base64: base64::engine::general_purpose::STANDARD.encode(b"file body"),
+        };
+        let raw = build_raw_draft_bytes(
+            "me@helix.test",
+            None,
+            Some("Draft"),
+            Some("hello"),
+            None,
+            &[],
+            std::slice::from_ref(&attachment),
+        );
+
+        // Parse it back with the same parser the fetch path uses, to prove the
+        // hand-built multipart is well-formed, not just that it didn't panic.
+        let parsed = mail_parser::MessageParser::default()
+            .parse(&raw)
+            .expect("the multipart draft should parse");
+        assert_eq!(parsed.body_text(0).as_deref(), Some("hello"));
+
+        let attachments: Vec<_> = parsed.attachments().collect();
+        assert_eq!(attachments.len(), 1, "the draft should carry exactly one attachment");
+        assert_eq!(attachments[0].attachment_name(), Some("notes.txt"));
+        assert_eq!(attachments[0].contents(), b"file body");
+    }
 }

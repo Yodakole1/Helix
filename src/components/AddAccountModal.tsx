@@ -36,6 +36,7 @@ export function AddAccountModal({ visible, accentColor, onClose, onAdded }: AddA
   const [showAdvanced, setShowAdvanced] = useState(false);
   const [imapHost, setImapHost] = useState("");
   const [imapPort, setImapPort] = useState("993");
+  const [imapUseStarttls, setImapUseStarttls] = useState(false);
   const [smtpHost, setSmtpHost] = useState("");
   const [smtpPort, setSmtpPort] = useState("465");
   const [smtpUseStarttls, setSmtpUseStarttls] = useState(false);
@@ -56,6 +57,7 @@ export function AddAccountModal({ visible, accentColor, onClose, onAdded }: AddA
     setShowAdvanced(false);
     setImapHost("");
     setImapPort("993");
+    setImapUseStarttls(false);
     setSmtpHost("");
     setSmtpPort("465");
     setSmtpUseStarttls(false);
@@ -84,6 +86,7 @@ export function AddAccountModal({ visible, accentColor, onClose, onAdded }: AddA
       let imap = { host: imapHost.trim(), port: Number(imapPort) };
       let smtp = { host: smtpHost.trim(), port: Number(smtpPort) };
       let useStarttls = smtpUseStarttls;
+      let imapStarttls = imapUseStarttls;
 
       // Advanced settings, once expanded, are the user's explicit choice
       // and always win -- auto-discovery only runs when they haven't
@@ -93,6 +96,9 @@ export function AddAccountModal({ visible, accentColor, onClose, onAdded }: AddA
         imap = discovered.imap;
         smtp = discovered.smtp;
         useStarttls = discovered.smtpUseStarttls;
+        // Discovered IMAP configs are always implicit TLS (port 993); the
+        // discovery layer never returns a STARTTLS-only IMAP service.
+        imapStarttls = false;
       }
 
       await addAccount({
@@ -101,6 +107,7 @@ export function AddAccountModal({ visible, accentColor, onClose, onAdded }: AddA
         displayName: name.trim() === "" ? null : name.trim(),
         imapHost: imap.host,
         imapPort: imap.port,
+        imapUseStarttls: imapStarttls,
         smtpHost: smtp.host,
         smtpPort: smtp.port,
         smtpUseStarttls: useStarttls,
@@ -187,6 +194,10 @@ export function AddAccountModal({ visible, accentColor, onClose, onAdded }: AddA
                 keyboardType="number-pad"
               />
             </View>
+          </View>
+          <View style={styles.starttlsRow}>
+            <Switch value={imapUseStarttls} onChange={() => setImapUseStarttls((value) => !value)} color={accentColor} />
+            <Text style={styles.starttlsLabel}>IMAP uses STARTTLS, not implicit TLS</Text>
           </View>
           <View style={styles.row}>
             <View style={styles.col}>

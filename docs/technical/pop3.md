@@ -94,11 +94,19 @@ after fetching the raw bytes over IMAP.
   stable across sessions on every server, and `UIDL` is optional).
   Forcing POP3 into that schema is a separate design problem, not solved
   here — POP3 stays a direct, session-oriented fetch.
-- **No account-model integration.** No `pop3_host`/`pop3_port` fields on
-  `cache::AccountRecord`. `pop3.rs`'s commands take `host`/`port` from
-  the caller directly, like every other protocol command today. Wiring
-  POP3 in as a selectable sync method during onboarding is a frontend-
-  driven follow-up, not part of this pass.
+- **Partial account-model integration.** A POP3 account can now be
+  onboarded and persisted: `cache::AccountRecord` gained
+  `incoming_protocol` (`"imap"`/`"pop3"`), `pop3_host`, and `pop3_port`,
+  and `account::add_pop3_account` stores the credential, verifies it via
+  `pop3::verify_login` (connect + login + `QUIT`), and persists the record
+  with the `imap_*` columns left as empty placeholders. `update_account`
+  also re-verifies a POP3 account over POP3 rather than IMAP. What's still
+  *not* integrated: the POP3 mail commands (`list_messages`/`fetch_message`/
+  `delete_message`) still take `host`/`port` from the caller rather than
+  resolving them from the stored account, and `fetch_unified_inbox` skips
+  POP3 accounts outright (it fans out over IMAP `INBOX`es; POP3 has no
+  folder/UID model to merge in). Surfacing POP3 mail in the unified view
+  is still the separate design problem noted above.
 - **No APOP/SASL.** Plain `USER`/`PASS` only, matching IMAP's plain
   `LOGIN` and SMTP's plain `Credentials` elsewhere in this codebase —
   POP3S's transport encryption already covers what APOP's challenge-

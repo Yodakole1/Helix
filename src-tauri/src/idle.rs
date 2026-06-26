@@ -108,7 +108,7 @@ async fn run_one_idle_session(
     port: u16,
     folder: &str,
 ) -> Result<(), String> {
-    let mut session = imap::login_with_stored_credential(host, port, account_id).await?;
+    let mut session = imap::login_for_account(host, port, account_id).await?;
 
     let mailbox = session
         .select(folder)

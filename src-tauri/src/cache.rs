@@ -121,6 +121,7 @@ fn ensure_schema(conn: &Connection) -> Result<(), String> {
             body_html   TEXT,
             in_reply_to TEXT,
             refs        TEXT,
+            attachments TEXT,
             imap_uid    INTEGER,
             saved_at    TEXT NOT NULL
         );
@@ -188,6 +189,7 @@ pub(crate) fn open_at(path: &Path, key: &str) -> Result<Connection, String> {
     );
     let _ = conn.execute("ALTER TABLE accounts ADD COLUMN pop3_host TEXT", []);
     let _ = conn.execute("ALTER TABLE accounts ADD COLUMN pop3_port INTEGER", []);
+    let _ = conn.execute("ALTER TABLE drafts ADD COLUMN attachments TEXT", []);
 
     Ok(conn)
 }
@@ -857,6 +859,12 @@ pub struct DraftRecord {
     pub body_html: Option<String>,
     pub in_reply_to: Option<String>,
     pub references: Vec<String>,
+    /// JSON-encoded `Vec<smtp::OutgoingAttachment>`, mirroring how
+    /// `OutboxRecord.attachments_json` stores them -- kept as an opaque
+    /// string here so the cache layer doesn't need to depend on `smtp`'s
+    /// attachment type; `drafts.rs` does the (de)serialization. `None`
+    /// for a draft with no attachments.
+    pub attachments_json: Option<String>,
     pub imap_uid: Option<u32>,
     pub saved_at: String,
 }
@@ -899,8 +907,8 @@ pub fn upsert_draft(conn: &Connection, draft: &DraftRecord) -> Result<(), String
     conn.execute(
         "INSERT INTO drafts
             (draft_id, account_id, to_addr, subject, body_text, body_html,
-             in_reply_to, refs, imap_uid, saved_at)
-         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10)
+             in_reply_to, refs, attachments, imap_uid, saved_at)
+         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11)
          ON CONFLICT(draft_id) DO UPDATE SET
             to_addr = excluded.to_addr,
             subject = excluded.subject,
@@ -908,6 +916,7 @@ pub fn upsert_draft(conn: &Connection, draft: &DraftRecord) -> Result<(), String
             body_html = excluded.body_html,
             in_reply_to = excluded.in_reply_to,
             refs = excluded.refs,
+            attachments = excluded.attachments,
             saved_at = excluded.saved_at",
         params![
             draft.draft_id,
@@ -918,6 +927,7 @@ pub fn upsert_draft(conn: &Connection, draft: &DraftRecord) -> Result<(), String
             draft.body_html,
             draft.in_reply_to,
             refs_json,
+            draft.attachments_json,
             draft.imap_uid,
             draft.saved_at,
         ],
@@ -929,7 +939,7 @@ pub fn upsert_draft(conn: &Connection, draft: &DraftRecord) -> Result<(), String
 pub fn get_draft(conn: &Connection, draft_id: &str) -> Result<Option<DraftRecord>, String> {
     conn.query_row(
         "SELECT draft_id, account_id, to_addr, subject, body_text, body_html,
-                in_reply_to, refs, imap_uid, saved_at
+                in_reply_to, refs, attachments, imap_uid, saved_at
          FROM drafts WHERE draft_id = ?1",
         params![draft_id],
         |row| {
@@ -943,19 +953,20 @@ pub fn get_draft(conn: &Connection, draft_id: &str) -> Result<Option<DraftRecord
                 row.get::<_, Option<String>>(5)?,
                 row.get::<_, Option<String>>(6)?,
                 refs_json,
-                row.get::<_, Option<u32>>(8)?,
-                row.get::<_, String>(9)?,
+                row.get::<_, Option<String>>(8)?,
+                row.get::<_, Option<u32>>(9)?,
+                row.get::<_, String>(10)?,
             ))
         },
     )
     .optional()
     .map_err(|e| format!("could not read draft: {e}"))?
-    .map(|(draft_id, account_id, to_addr, subject, body_text, body_html, in_reply_to, refs_json, imap_uid, saved_at)| {
+    .map(|(draft_id, account_id, to_addr, subject, body_text, body_html, in_reply_to, refs_json, attachments_json, imap_uid, saved_at)| {
         let references = refs_json
             .as_deref()
             .and_then(|s| serde_json::from_str(s).ok())
             .unwrap_or_default();
-        Ok(DraftRecord { draft_id, account_id, to_addr, subject, body_text, body_html, in_reply_to, references, imap_uid, saved_at })
+        Ok(DraftRecord { draft_id, account_id, to_addr, subject, body_text, body_html, in_reply_to, references, attachments_json, imap_uid, saved_at })
     })
     .transpose()
 }
@@ -1535,6 +1546,7 @@ mod tests {
             body_html: None,
             in_reply_to: None,
             references: vec!["root@helix.test".to_string()],
+            attachments_json: None,
             imap_uid: None,
             saved_at: "2026-06-26T00:00:00+00:00".to_string(),
         }

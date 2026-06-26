@@ -116,26 +116,45 @@ pub(crate) async fn login_for_account(
     login_with_stored_credential(host, port, account_id, use_starttls).await
 }
 
-#[tauri::command]
-pub async fn list_folders(
-    account_id: String,
-    host: String,
-    port: u16,
-) -> Result<Vec<String>, String> {
-    let mut session = login_with_stored_credential(&host, port, &account_id).await?;
-
-    let folders: Vec<String> = session
+async fn collect_folder_names(session: &mut ImapSession) -> Result<Vec<String>, String> {
+    session
         .list(None, Some("*"))
         .await
         .map_err(|e| format!("LIST failed: {e}"))?
         .map_ok(|name| name.name().to_string())
         .try_collect()
         .await
-        .map_err(|e| format!("LIST failed: {e}"))?;
+        .map_err(|e| format!("LIST failed: {e}"))
+}
 
+#[tauri::command]
+pub async fn list_folders(
+    account_id: String,
+    host: String,
+    port: u16,
+) -> Result<Vec<String>, String> {
+    let mut session = login_for_account(&host, port, &account_id).await?;
+    let folders = collect_folder_names(&mut session).await;
     session.logout().await.ok();
+    folders
+}
 
-    Ok(folders)
+/// Logs in with an *explicit* STARTTLS flag and lists folders -- the
+/// onboarding/verification path, which knows the flag from the user's form
+/// but can't use `login_for_account`'s cache lookup yet because the account
+/// isn't persisted at verification time. `add_account` (and the IMAP branch
+/// of `update_account`) call this to prove a credential works before
+/// committing it.
+pub(crate) async fn verify_and_list_folders(
+    host: &str,
+    port: u16,
+    account_id: &str,
+    use_starttls: bool,
+) -> Result<Vec<String>, String> {
+    let mut session = login_with_stored_credential(host, port, account_id, use_starttls).await?;
+    let folders = collect_folder_names(&mut session).await;
+    session.logout().await.ok();
+    folders
 }
 
 #[derive(Debug, Serialize)]
@@ -360,7 +379,7 @@ pub async fn search_messages(
     query: String,
     limit: u32,
 ) -> Result<Vec<MessageSummary>, String> {
-    let mut session = login_with_stored_credential(&host, port, &account_id).await?;
+    let mut session = login_for_account(&host, port, &account_id).await?;
     let result = search_in_folder(&mut session, &folder, &query, limit).await;
     session.logout().await.ok();
     result
@@ -373,7 +392,7 @@ pub async fn create_folder(
     port: u16,
     folder: String,
 ) -> Result<(), String> {
-    let mut session = login_with_stored_credential(&host, port, &account_id).await?;
+    let mut session = login_for_account(&host, port, &account_id).await?;
     let result = session
         .create(&folder)
         .await
@@ -389,7 +408,7 @@ pub async fn delete_folder(
     port: u16,
     folder: String,
 ) -> Result<(), String> {
-    let mut session = login_with_stored_credential(&host, port, &account_id).await?;
+    let mut session = login_for_account(&host, port, &account_id).await?;
     let result = session
         .delete(&folder)
         .await
@@ -406,7 +425,7 @@ pub async fn rename_folder(
     folder: String,
     new_name: String,
 ) -> Result<(), String> {
-    let mut session = login_with_stored_credential(&host, port, &account_id).await?;
+    let mut session = login_for_account(&host, port, &account_id).await?;
     let result = session
         .rename(&folder, &new_name)
         .await
@@ -461,7 +480,7 @@ pub async fn empty_folder(
     port: u16,
     folder: String,
 ) -> Result<(), String> {
-    let mut session = login_with_stored_credential(&host, port, &account_id).await?;
+    let mut session = login_for_account(&host, port, &account_id).await?;
     let result = empty_folder_messages(&mut session, &folder).await;
     session.logout().await.ok();
     result
@@ -486,7 +505,7 @@ pub async fn fetch_messages(
     folder: String,
     limit: u32,
 ) -> Result<Vec<MessageSummary>, String> {
-    let mut session = login_with_stored_credential(&host, port, &account_id).await?;
+    let mut session = login_for_account(&host, port, &account_id).await?;
     let result = fetch_recent_messages(&mut session, &folder, limit).await;
     session.logout().await.ok();
 
@@ -584,7 +603,7 @@ pub async fn fetch_threaded_messages(
     folder: String,
     limit: u32,
 ) -> Result<Vec<ThreadedMessage>, String> {
-    let mut session = login_with_stored_credential(&host, port, &account_id).await?;
+    let mut session = login_for_account(&host, port, &account_id).await?;
     let result = fetch_recent_messages(&mut session, &folder, limit).await;
     session.logout().await.ok();
 
@@ -892,7 +911,7 @@ pub async fn fetch_message_body(
     folder: String,
     uid: u32,
 ) -> Result<MessageBody, String> {
-    let mut session = login_with_stored_credential(&host, port, &account_id).await?;
+    let mut session = login_for_account(&host, port, &account_id).await?;
     let result = fetch_body_by_uid(&mut session, &folder, uid).await;
     session.logout().await.ok();
 
@@ -913,7 +932,7 @@ pub async fn fetch_attachment(
     uid: u32,
     attachment_index: usize,
 ) -> Result<AttachmentContent, String> {
-    let mut session = login_with_stored_credential(&host, port, &account_id).await?;
+    let mut session = login_for_account(&host, port, &account_id).await?;
     let result = fetch_raw_message_by_uid(&mut session, &folder, uid).await;
     session.logout().await.ok();
 
@@ -968,7 +987,7 @@ pub async fn set_message_seen(
     uid: u32,
     seen: bool,
 ) -> Result<(), String> {
-    let mut session = login_with_stored_credential(&host, port, &account_id).await?;
+    let mut session = login_for_account(&host, port, &account_id).await?;
     let result = set_flag(&mut session, &folder, &uid.to_string(), "\\Seen", seen).await;
     session.logout().await.ok();
     result
@@ -983,7 +1002,7 @@ pub async fn set_message_flagged(
     uid: u32,
     flagged: bool,
 ) -> Result<(), String> {
-    let mut session = login_with_stored_credential(&host, port, &account_id).await?;
+    let mut session = login_for_account(&host, port, &account_id).await?;
     let result = set_flag(&mut session, &folder, &uid.to_string(), "\\Flagged", flagged).await;
     session.logout().await.ok();
     result
@@ -1002,7 +1021,7 @@ pub async fn set_messages_seen(
     seen: bool,
 ) -> Result<(), String> {
     let uid_set = join_uids(&uids).ok_or("no messages selected")?;
-    let mut session = login_with_stored_credential(&host, port, &account_id).await?;
+    let mut session = login_for_account(&host, port, &account_id).await?;
     let result = set_flag(&mut session, &folder, &uid_set, "\\Seen", seen).await;
     session.logout().await.ok();
     result
@@ -1020,7 +1039,7 @@ pub async fn set_messages_flagged(
     flagged: bool,
 ) -> Result<(), String> {
     let uid_set = join_uids(&uids).ok_or("no messages selected")?;
-    let mut session = login_with_stored_credential(&host, port, &account_id).await?;
+    let mut session = login_for_account(&host, port, &account_id).await?;
     let result = set_flag(&mut session, &folder, &uid_set, "\\Flagged", flagged).await;
     session.logout().await.ok();
     result
@@ -1038,7 +1057,7 @@ pub async fn mark_folder_seen(
     folder: String,
     seen: bool,
 ) -> Result<(), String> {
-    let mut session = login_with_stored_credential(&host, port, &account_id).await?;
+    let mut session = login_for_account(&host, port, &account_id).await?;
     let result = async {
         let mailbox = session
             .select(&folder)
@@ -1236,7 +1255,7 @@ pub async fn move_message_to_folder(
     uid: u32,
     destination_folder: String,
 ) -> Result<(), String> {
-    let mut session = login_with_stored_credential(&host, port, &account_id).await?;
+    let mut session = login_for_account(&host, port, &account_id).await?;
     let result = move_messages(&mut session, &folder, &[uid], &destination_folder).await;
     session.logout().await.ok();
     result
@@ -1255,7 +1274,7 @@ pub async fn move_messages_to_folder(
     uids: Vec<u32>,
     destination_folder: String,
 ) -> Result<(), String> {
-    let mut session = login_with_stored_credential(&host, port, &account_id).await?;
+    let mut session = login_for_account(&host, port, &account_id).await?;
     let result = move_messages(&mut session, &folder, &uids, &destination_folder).await;
     session.logout().await.ok();
     result

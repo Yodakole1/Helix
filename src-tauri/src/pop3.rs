@@ -177,6 +177,17 @@ async fn login_with_stored_credential(
     result
 }
 
+/// Verifies a stored POP3 credential by connecting, logging in, and
+/// cleanly quitting -- the POP3 equivalent of `imap::verify_and_list_folders`,
+/// used by account onboarding (`account::add_pop3_account`) to prove a
+/// credential works before committing it. POP3 has no folders to list, so
+/// a successful login is the whole verification.
+pub(crate) async fn verify_login(host: &str, port: u16, account_id: &str) -> Result<(), String> {
+    let mut session = login_with_stored_credential(host, port, account_id).await?;
+    quit(&mut session).await;
+    Ok(())
+}
+
 /// Ends the session with `QUIT` -- POP3 deletions (`DELE`) are only
 /// committed by the server on a clean `QUIT` (RFC 1939 §6); a dropped
 /// connection aborts them instead. Best-effort: a failure here doesn't

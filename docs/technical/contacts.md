@@ -26,6 +26,15 @@ mailbox.
   ORDER BY last_seen_at DESC`). `%`/`_` are stripped from `query` first so
   user input can't be read as extra SQL `LIKE` wildcards. Exposed as the
   `#[tauri::command] search_contacts` wrapper.
+- `cache::list_contacts_in(conn, limit)` -- lists the whole address book
+  most-recently-seen first, for a contact-management view rather than
+  compose-time autocomplete. Exposed as `list_contacts`.
+- `cache::delete_contact_in(conn, email)` -- removes one harvested contact
+  (email lowercased to match storage; deleting a missing one is a no-op
+  success). Exposed as `delete_contact`. Since the address book
+  accumulates automatically from every message read or sent, this is the
+  only way to forget a one-off correspondent or a mistyped address that
+  would otherwise linger in autocomplete forever.
 
 ## Where contacts get harvested from
 

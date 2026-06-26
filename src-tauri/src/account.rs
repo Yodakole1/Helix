@@ -6,6 +6,7 @@ use crate::cache::AccountRecord;
 use crate::credentials;
 use crate::imap;
 use crate::imap::MessageSummary;
+use crate::pop3;
 
 #[derive(Debug, Serialize)]
 pub struct AddAccountResult {
@@ -29,6 +30,7 @@ pub async fn add_account(
     display_name: Option<String>,
     imap_host: String,
     imap_port: u16,
+    imap_use_starttls: bool,
     smtp_host: String,
     smtp_port: u16,
     smtp_use_starttls: bool,
@@ -38,7 +40,10 @@ pub async fn add_account(
 ) -> Result<AddAccountResult, String> {
     credentials::store_credential(account_id.clone(), password)?;
 
-    let folders = match imap::list_folders(account_id.clone(), imap_host.clone(), imap_port).await {
+    // Verify with the explicit STARTTLS flag, not `imap::list_folders`
+    // (which would resolve the flag from the cache -- but the account isn't
+    // persisted yet, so that lookup would always default to implicit TLS).
+    let folders = match imap::verify_and_list_folders(&imap_host, imap_port, &account_id, imap_use_starttls).await {
         Ok(folders) => folders,
         Err(e) => {
             credentials::delete_credential(account_id).ok();
@@ -51,9 +56,13 @@ pub async fn add_account(
         display_name,
         imap_host,
         imap_port,
+        imap_use_starttls,
         smtp_host,
         smtp_port,
         smtp_use_starttls,
+        incoming_protocol: "imap".to_string(),
+        pop3_host: None,
+        pop3_port: None,
         archive_folder: archive_folder.unwrap_or_else(|| "Archive".to_string()),
         trash_folder: trash_folder.unwrap_or_else(|| "Trash".to_string()),
         drafts_folder: drafts_folder.unwrap_or_else(|| "Drafts".to_string()),
@@ -65,6 +74,139 @@ pub async fn add_account(
     }
 
     Ok(AddAccountResult { account_id, folders })
+}
+
+/// Onboards a POP3 account: stores the credential, verifies it with a real
+/// POP3 login, then persists the account with `incoming_protocol = "pop3"`.
+/// The `imap_*` columns are left as empty placeholders -- POP3 has no
+/// folders or IMAP server -- and `pop3_host`/`pop3_port` carry the real
+/// incoming server. Same store-verify-persist-or-roll-back discipline as
+/// `add_account`: a credential is never left in the keychain unverified or
+/// unrecorded.
+///
+/// SMTP is still configured the same way (a POP3 account sends mail over
+/// SMTP like any other). Returns `["INBOX"]` as the folder list -- POP3 is
+/// a single, implicit mailbox, so this keeps the result shape identical to
+/// `add_account` for the frontend.
+#[tauri::command]
+pub async fn add_pop3_account(
+    account_id: String,
+    password: String,
+    display_name: Option<String>,
+    pop3_host: String,
+    pop3_port: u16,
+    smtp_host: String,
+    smtp_port: u16,
+    smtp_use_starttls: bool,
+) -> Result<AddAccountResult, String> {
+    credentials::store_credential(account_id.clone(), password)?;
+
+    if let Err(e) = pop3::verify_login(&pop3_host, pop3_port, &account_id).await {
+        credentials::delete_credential(account_id).ok();
+        return Err(e);
+    }
+
+    let record = AccountRecord {
+        account_id: account_id.clone(),
+        display_name,
+        imap_host: String::new(),
+        imap_port: 0,
+        imap_use_starttls: false,
+        smtp_host,
+        smtp_port,
+        smtp_use_starttls,
+        incoming_protocol: "pop3".to_string(),
+        pop3_host: Some(pop3_host),
+        pop3_port: Some(pop3_port),
+        archive_folder: "Archive".to_string(),
+        trash_folder: "Trash".to_string(),
+        drafts_folder: "Drafts".to_string(),
+    };
+
+    if let Err(e) = cache::open().and_then(|conn| cache::upsert_account(&conn, &record)) {
+        credentials::delete_credential(account_id).ok();
+        return Err(e);
+    }
+
+    Ok(AddAccountResult { account_id, folders: vec!["INBOX".to_string()] })
+}
+
+/// Updates an existing account's settings -- the counterpart that lets a
+/// user rotate a password or move to a new server without removing and
+/// re-adding the account (which would lose its cached mail and identity).
+///
+/// `password` is optional: `Some` rotates the keychain credential, `None`
+/// leaves it untouched (a host/port-only change). The new connection
+/// settings are re-verified before they're committed, and -- crucially --
+/// if a rotated password fails verification, the *old* password is restored
+/// to the keychain, so a failed update never locks the user out of an
+/// account that was working a moment ago.
+#[tauri::command]
+pub async fn update_account(
+    account_id: String,
+    password: Option<String>,
+    display_name: Option<String>,
+    imap_host: String,
+    imap_port: u16,
+    imap_use_starttls: bool,
+    smtp_host: String,
+    smtp_port: u16,
+    smtp_use_starttls: bool,
+) -> Result<(), String> {
+    let conn = cache::open()?;
+    let existing = cache::get_account(&conn, &account_id)?
+        .ok_or_else(|| format!("no account {account_id} to update"))?;
+
+    // If rotating the password, keep the old one so we can restore it if
+    // verification of the new settings fails.
+    let old_password = if password.is_some() {
+        Some(credentials::get_credential(account_id.clone())?)
+    } else {
+        None
+    };
+    if let Some(new_password) = password {
+        credentials::store_credential(account_id.clone(), new_password)?;
+    }
+
+    // Re-verify with the protocol the account actually uses.
+    let verify = if existing.incoming_protocol == "pop3" {
+        let host = existing.pop3_host.clone().unwrap_or_default();
+        let port = existing.pop3_port.unwrap_or(995);
+        pop3::verify_login(&host, port, &account_id).await.map(|_| ())
+    } else {
+        imap::verify_and_list_folders(&imap_host, imap_port, &account_id, imap_use_starttls)
+            .await
+            .map(|_| ())
+    };
+
+    if let Err(e) = verify {
+        // Roll the credential back to what was working before, if we changed it.
+        if let Some(old) = old_password {
+            credentials::store_credential(account_id.clone(), old).ok();
+        }
+        return Err(e);
+    }
+
+    // Preserve protocol-specific and folder fields; only the connection
+    // settings exposed by this command change. A POP3 account keeps its
+    // pop3_host/port (this command doesn't expose editing them yet).
+    let record = AccountRecord {
+        account_id: account_id.clone(),
+        display_name,
+        imap_host,
+        imap_port,
+        imap_use_starttls,
+        smtp_host,
+        smtp_port,
+        smtp_use_starttls,
+        incoming_protocol: existing.incoming_protocol,
+        pop3_host: existing.pop3_host,
+        pop3_port: existing.pop3_port,
+        archive_folder: existing.archive_folder,
+        trash_folder: existing.trash_folder,
+        drafts_folder: existing.drafts_folder,
+    };
+    cache::upsert_account(&conn, &record)
 }
 
 #[tauri::command]
@@ -157,7 +299,14 @@ fn merge_and_sort_summaries(
 pub async fn fetch_unified_inbox(limit: u32) -> Result<Vec<UnifiedMessageSummary>, String> {
     let accounts = list_accounts()?;
 
-    let fetches = accounts.into_iter().map(|account| async move {
+    // POP3 accounts have no IMAP INBOX to fan out to (no folders, no stable
+    // UID model), so they're skipped here rather than fetched with the wrong
+    // protocol. Surfacing POP3 mail in the unified view is a separate design
+    // problem -- see pop3.md. IMAP accounts are the only ones fetched.
+    let fetches = accounts
+        .into_iter()
+        .filter(|account| account.incoming_protocol == "imap")
+        .map(|account| async move {
         let result = imap::fetch_messages(
             account.account_id.clone(),
             account.imap_host,
@@ -199,6 +348,7 @@ mod tests {
             None,
             "imap.gmail.com".to_string(),
             993,
+            false,
             "smtp.gmail.com".to_string(),
             465,
             false,

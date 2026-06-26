@@ -18,6 +18,9 @@ export interface DraftRecord {
   body_html: string | null;
   in_reply_to: string | null;
   references: string[];
+  // JSON-encoded OutgoingAttachment[] (or null). Decode with JSON.parse when
+  // reopening a draft that carried attachments.
+  attachments_json: string | null;
   imap_uid: number | null;
   saved_at: string;
 }
@@ -61,6 +64,7 @@ export function saveDraft(args: {
   bodyText: string | null;
   inReplyTo: string | null;
   references: string[];
+  attachments?: OutgoingAttachment[];
 }): Promise<string> {
   if (!isTauri()) return Promise.resolve(args.draftId ?? crypto.randomUUID());
   return invoke("save_draft", {
@@ -75,6 +79,7 @@ export function saveDraft(args: {
     bodyHtml: null,
     inReplyTo: args.inReplyTo ?? null,
     references: args.references,
+    attachments: args.attachments ?? [],
   });
 }
 

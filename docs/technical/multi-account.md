@@ -43,11 +43,34 @@ mistyped host) updates the row in place rather than erroring, while
   not treated as a command failure, the same posture as cache writes
   elsewhere.
 
-There's still no `update_account` command -- onboarding deliberately
-didn't add one (see `account-onboarding.md`), and persisting account
-metadata doesn't change that calculus. Calling `add_account` again for
-the same address works as an update via the upsert above, if that's ever
-needed before a dedicated command exists.
+- **`add_pop3_account`** -- onboards a POP3 account: store credential,
+  verify via `pop3::verify_login` (connect + login + `QUIT` -- POP3 has no
+  folders to list, so a clean login is the whole check), persist with
+  `incoming_protocol = "pop3"`, `pop3_host`/`pop3_port` set, and the
+  `imap_*` columns left as empty placeholders. Same store-verify-persist-
+  or-roll-back discipline as `add_account`. SMTP is configured the same way
+  (POP3 accounts still send over SMTP).
+- **`update_account`** -- the credential-rotation / server-migration
+  counterpart that lets a user change a password or host/port without the
+  remove-and-re-add that would lose the account's cached mail and PGP
+  identity. `password` is optional: `Some` rotates the keychain credential,
+  `None` leaves it untouched. The new settings are re-verified *before*
+  they're committed (over IMAP or POP3, matching the account's
+  `incoming_protocol`), and a rotated password that fails verification is
+  rolled back to the previously-working one -- a failed update never locks
+  the user out of an account that worked a moment ago.
+
+### Account record fields
+
+`AccountRecord` gained `imap_use_starttls` (port-143-style STARTTLS vs.
+implicit TLS on 993, mirroring the existing `smtp_use_starttls`),
+`incoming_protocol`, `pop3_host`, and `pop3_port`. All are additive
+`ALTER TABLE` migrations (`incoming_protocol` defaults to `'imap'`), so an
+existing cache upgrades in place. The IMAP data commands resolve an
+account's STARTTLS setting from this record at login time
+(`imap::login_for_account`), so their signatures didn't change -- only
+onboarding/verification passes the flag explicitly, since the account
+isn't persisted yet at verify time.
 
 ## Unified vs. siloed inbox
 
@@ -104,9 +127,13 @@ up anywhere else in the app. See `docs/technical/frontend-roadmap.md`.
 
 ## What this doesn't do yet
 
-- `fetch_unified_inbox` has no frontend caller yet (Settings' "Unified
-  inbox" toggle still merges the sample data client-side).
-- `add_account` doesn't verify SMTP credentials, only IMAP.
+- `add_account` doesn't verify SMTP credentials, only IMAP (POP3 accounts
+  likewise verify only the incoming POP3 login, not SMTP).
 - No multi-folder unified view, only INBOX.
+- `fetch_unified_inbox` skips POP3 accounts -- it fans out over IMAP
+  `INBOX`es, and POP3 has no folder/UID model to merge in (see `pop3.md`).
+- `update_account` doesn't expose editing a POP3 account's `pop3_host`/
+  `pop3_port` yet -- it preserves them and edits the shared connection
+  fields only.
 - No live update/IDLE for the unified view -- it's a one-shot fetch, same
   as every other fetch command today.
