@@ -40,7 +40,17 @@ export const accentCycle = [
 ] as const;
 
 export function colorForIndex(index: number): string {
-  return accentCycle[index % accentCycle.length];
+  return accentCycle[((index % accentCycle.length) + accentCycle.length) % accentCycle.length];
+}
+
+// Stable color for a string key (a sender's email, a folder name). Unlike
+// colorForIndex fed a row position, the same key always lands on the same
+// cycle color -- so a sender's avatar doesn't change color when the list
+// re-sorts, a search reorders rows, or new mail shifts everything down.
+export function colorForKey(key: string): string {
+  let hash = 0;
+  for (let i = 0; i < key.length; i++) hash = (hash * 31 + key.charCodeAt(i)) | 0;
+  return colorForIndex(Math.abs(hash));
 }
 
 export function withAlpha(hex: string, alpha: number): string {

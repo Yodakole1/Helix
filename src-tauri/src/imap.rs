@@ -12,23 +12,12 @@ use zeroize::Zeroize;
 use crate::cache;
 use crate::credentials;
 use crate::pgp;
+use crate::smime;
 
 pub(crate) type ImapSession = Session<TlsStream<TcpStream>>;
 
-/// Opens a TLS-protected IMAP connection and logs in. `use_starttls`
-/// selects the transport, mirroring SMTP's `use_starttls` flag:
-///
-/// - `false` — implicit TLS (IMAPS, port 993 style): TLS from the first
-///   byte, then login.
-/// - `true` — STARTTLS (port 143 style): connect in plaintext, issue
-///   `STARTTLS`, upgrade the same socket to TLS, then login. The upgrade
-///   is mandatory — if the server won't `STARTTLS`, this errors rather
-///   than continuing in plaintext, the same no-downgradable-path posture
-///   as SMTP and POP3 here.
-///
-/// Either way the resulting session is `Session<TlsStream<TcpStream>>` —
-/// once the socket is wrapped in TLS there's no protocol difference left,
-/// so the rest of the module is oblivious to which path got us here.
+// `use_starttls = false` → implicit TLS (IMAPS/993); `true` → STARTTLS upgrade on 143.
+// STARTTLS upgrade is mandatory — bails out if the server won't do it, never continues plaintext.
 async fn connect_and_login(
     host: &str,
     port: u16,
@@ -46,11 +35,8 @@ async fn connect_and_login(
     );
 
     let tls_stream = if use_starttls {
-        // Issue STARTTLS over the plaintext socket, then hand the raw
-        // upgraded socket to the TLS connector. async-imap absorbs the
-        // server greeting while parsing the STARTTLS response, the same
-        // way `login` does for the implicit-TLS path, so there's no
-        // separate greeting read here.
+        // async-imap absorbs the server greeting while parsing the STARTTLS response,
+        // so there's no separate greeting read here.
         let mut client = async_imap::Client::new(tcp_stream);
         client
             .run_command_and_check_ok("STARTTLS", None)
@@ -75,14 +61,7 @@ async fn connect_and_login(
         .map_err(|(e, _client)| format!("login failed: {e}"))
 }
 
-/// Looks up the password for `account_id` in the OS keychain and uses it to
-/// log in. `account_id` doubles as the IMAP login username — accounts are
-/// identified by their email address, and that's what every mail server
-/// here expects as the username too.
-///
-/// The password only ever exists as a plain `String` for the duration of
-/// this call; it's wiped from memory immediately after, success or failure,
-/// rather than just left for the allocator to reclaim whenever.
+// Password is zeroized immediately after the login attempt, success or failure.
 pub(crate) async fn login_with_stored_credential(
     host: &str,
     port: u16,
@@ -95,13 +74,8 @@ pub(crate) async fn login_with_stored_credential(
     result
 }
 
-/// Resolves the account's stored `imap_use_starttls` setting from the local
-/// cache, then logs in. The data commands use this so none of them needs to
-/// carry a `use_starttls` parameter -- the flag is a fixed property of the
-/// account (chosen at onboarding), not something each fetch should
-/// re-specify. Defaults to implicit TLS (`false`) when the account isn't in
-/// the cache yet (e.g. mid-onboarding, before it's persisted) or the lookup
-/// fails, since implicit TLS on port 993 is the overwhelmingly common case.
+// Resolves imap_use_starttls from the cache so callers don't have to pass it.
+// Defaults to false (implicit TLS) when the lookup fails — overwhelmingly the common case.
 pub(crate) async fn login_for_account(
     host: &str,
     port: u16,
@@ -116,26 +90,153 @@ pub(crate) async fn login_for_account(
     login_with_stored_credential(host, port, account_id, use_starttls).await
 }
 
-#[tauri::command]
-pub async fn list_folders(
-    account_id: String,
-    host: String,
-    port: u16,
-) -> Result<Vec<String>, String> {
-    let mut session = login_with_stored_credential(&host, port, &account_id).await?;
+// pub(crate) alias so smtp.rs/drafts.rs can LIST inside a session they
+// already hold when healing a bad special-folder name after a failed APPEND.
+pub(crate) async fn list_folder_names(session: &mut ImapSession) -> Result<Vec<String>, String> {
+    collect_folder_names(session).await
+}
 
-    let folders: Vec<String> = session
+async fn collect_folder_names(session: &mut ImapSession) -> Result<Vec<String>, String> {
+    session
         .list(None, Some("*"))
         .await
         .map_err(|e| format!("LIST failed: {e}"))?
         .map_ok(|name| name.name().to_string())
         .try_collect()
         .await
-        .map_err(|e| format!("LIST failed: {e}"))?;
+        .map_err(|e| format!("LIST failed: {e}"))
+}
 
+/// The last path segment of an IMAP folder name -- "INBOX.Sent" and
+/// "[Gmail]/Sent Mail" both need to be recognized by what they're called,
+/// not where they sit in the hierarchy. Splits on both common delimiters;
+/// a folder legitimately containing '.' in its leaf name only matters here
+/// if that leaf also collides with a special-folder synonym, which is a
+/// harmless false positive (we'd still pick a folder the user calls Sent).
+fn folder_leaf(name: &str) -> &str {
+    name.rsplit(['/', '.']).next().unwrap_or(name)
+}
+
+/// Maps a special-mailbox role to the leaf names servers actually use for
+/// it. Order matters: earlier synonyms win when a server has several
+/// candidates (e.g. both "INBOX.spam" and "INBOX.Junk" exist in the wild
+/// on the same account).
+fn special_folder_synonyms(role: &str) -> &'static [&'static str] {
+    match role {
+        "sent" => &["sent", "sent items", "sent mail", "sent messages", "sent-mail"],
+        "trash" => &["trash", "deleted items", "deleted messages", "deleted", "bin"],
+        "archive" => &["archive", "archives", "all mail"],
+        "drafts" => &["drafts", "draft"],
+        "spam" => &["spam", "junk", "junk mail", "junk e-mail", "bulk mail"],
+        _ => &[],
+    }
+}
+
+/// Picks the real server folder for a special-mailbox role out of a LIST
+/// response. Hardcoded defaults like "Sent" name a folder that simply
+/// doesn't exist on providers that nest everything under the INBOX
+/// namespace (cPanel/Dovecot's "INBOX.Sent") or a display prefix (Gmail's
+/// "[Gmail]/Sent Mail") -- this resolves by leaf name instead. Ties go to
+/// the shortest full name, i.e. the least-nested candidate.
+pub(crate) fn resolve_special_folder(folders: &[String], role: &str) -> Option<String> {
+    for synonym in special_folder_synonyms(role) {
+        let mut candidates: Vec<&String> = folders
+            .iter()
+            .filter(|f| folder_leaf(f).eq_ignore_ascii_case(synonym))
+            .collect();
+        candidates.sort_by_key(|f| f.len());
+        if let Some(found) = candidates.first() {
+            return Some((*found).to_string());
+        }
+    }
+    None
+}
+
+/// Finds the folder a caller-supplied name was *meant* to address when the
+/// name itself isn't in the LIST response: first a leaf-name match (asked
+/// for "Sent", server has "INBOX.Sent"), then role synonyms (asked for
+/// "Spam", server only has "INBOX.Junk"). Returns None when the requested
+/// folder exists as-is (nothing to heal) or nothing plausible matches.
+pub(crate) fn resolve_equivalent_folder(folders: &[String], requested: &str) -> Option<String> {
+    if folders.iter().any(|f| f == requested) {
+        return None;
+    }
+    let requested_leaf = folder_leaf(requested);
+    let mut leaf_matches: Vec<&String> = folders
+        .iter()
+        .filter(|f| folder_leaf(f).eq_ignore_ascii_case(requested_leaf))
+        .collect();
+    leaf_matches.sort_by_key(|f| f.len());
+    if let Some(found) = leaf_matches.first() {
+        return Some((*found).to_string());
+    }
+    for role in ["sent", "trash", "archive", "drafts", "spam"] {
+        if special_folder_synonyms(role)
+            .iter()
+            .any(|s| s.eq_ignore_ascii_case(requested_leaf))
+        {
+            return resolve_special_folder(folders, role);
+        }
+    }
+    None
+}
+
+/// Rewrites any special-folder field on the cached account record that
+/// still holds `wrong` to `correct`, so a runtime folder-name heal (a
+/// failed APPEND or move that succeeded on retry against the real folder)
+/// sticks for every later operation instead of re-failing each time.
+pub(crate) fn persist_folder_correction(account_id: &str, wrong: &str, correct: &str) {
+    let result = cache::open().and_then(|conn| {
+        let Some(mut account) = cache::get_account(&conn, account_id)? else {
+            return Ok(());
+        };
+        let mut changed = false;
+        for field in [
+            &mut account.sent_folder,
+            &mut account.trash_folder,
+            &mut account.archive_folder,
+            &mut account.drafts_folder,
+            &mut account.spam_folder,
+        ] {
+            if field == wrong {
+                *field = correct.to_string();
+                changed = true;
+            }
+        }
+        if changed {
+            cache::upsert_account(&conn, &account)?;
+        }
+        Ok(())
+    });
+    if let Err(e) = result {
+        log::warn!("could not persist folder correction {wrong} -> {correct} for {account_id}: {e}");
+    }
+}
+
+#[tauri::command]
+pub async fn list_folders(
+    account_id: String,
+    host: String,
+    port: u16,
+) -> Result<Vec<String>, String> {
+    let mut session = login_for_account(&host, port, &account_id).await?;
+    let folders = collect_folder_names(&mut session).await;
     session.logout().await.ok();
+    folders
+}
 
-    Ok(folders)
+// Used during onboarding before the account is persisted — can't use login_for_account
+// yet because the cache lookup would fall back to the wrong default.
+pub(crate) async fn verify_and_list_folders(
+    host: &str,
+    port: u16,
+    account_id: &str,
+    use_starttls: bool,
+) -> Result<Vec<String>, String> {
+    let mut session = login_with_stored_credential(host, port, account_id, use_starttls).await?;
+    let folders = collect_folder_names(&mut session).await;
+    session.logout().await.ok();
+    folders
 }
 
 #[derive(Debug, Serialize)]
@@ -146,30 +247,20 @@ pub struct MessageSummary {
     pub date: Option<String>,
     pub seen: bool,
     pub flagged: bool,
-    /// This message's own `Message-ID`, stripped of angle brackets. Used
-    /// by `group_into_threads` to identify conversation roots and by reply
-    /// composition to set `In-Reply-To` on the outgoing message.
     pub message_id: Option<String>,
-    /// The `In-Reply-To` value (angle brackets stripped), pointing at the
-    /// parent message's `Message-ID`. `None` for original messages.
-    /// Used by `group_into_threads` to link replies to their parents.
     pub in_reply_to: Option<String>,
+    /// Client-side only — never touches a server flag. False when the model is undertrained.
+    pub is_spam: bool,
 }
 
-/// One conversation thread: a root message and its nested reply chain.
-/// Replies within a thread are themselves `ThreadedMessage`s so multi-level
-/// conversations (A → B → C) are represented naturally as nested structs
-/// rather than a flat list that the frontend would have to reconstruct.
 #[derive(Debug, Serialize)]
 pub struct ThreadedMessage {
     pub message: MessageSummary,
     pub replies: Vec<ThreadedMessage>,
 }
 
-/// IMAP ENVELOPE returns `Message-ID` and `In-Reply-To` as their raw header
-/// values, angle brackets included (e.g. `<abc@example.com>`). Strips them
-/// so callers get a bare ID string that compares equal to what `mail_parser`
-/// returns from a parsed message body (which also strips them).
+// IMAP ENVELOPE includes angle brackets on message IDs; strip them so they
+// compare equal to what mail_parser returns from the parsed body.
 fn strip_angle_brackets(s: String) -> String {
     let t = s.trim();
     if t.starts_with('<') && t.ends_with('>') {
@@ -179,19 +270,14 @@ fn strip_angle_brackets(s: String) -> String {
     }
 }
 
-/// Plain UTF-8 decoding for header parts that are never RFC 2047 encoded —
-/// the mailbox/host parts of an address are restricted to ASCII by the mail
-/// protocols involved, so there's no encoded-word syntax to look for there.
+// Addresses are ASCII-only by protocol, so no RFC 2047 decoding needed.
 fn decode_lossy(bytes: &Option<Cow<[u8]>>) -> Option<String> {
     bytes
         .as_ref()
         .map(|b| String::from_utf8_lossy(b).into_owned())
 }
 
-/// Decodes header text that may contain RFC 2047 encoded words (e.g.
-/// `=?UTF-8?B?...?=`), which is how non-ASCII subjects and display names
-/// are represented in mail headers. Falls back to plain UTF-8 if a header
-/// is malformed rather than dropping the field entirely.
+// Handles RFC 2047 encoded words (non-ASCII subjects/display names); falls back to lossy UTF-8.
 fn decode_header_text(bytes: &Option<Cow<[u8]>>) -> Option<String> {
     bytes.as_ref().map(|b| {
         rfc2047_decoder::decode(b.as_ref()).unwrap_or_else(|_| String::from_utf8_lossy(b).into_owned())
@@ -213,11 +299,7 @@ fn format_address(address: &Address) -> String {
     }
 }
 
-/// Turns one FETCH response row into a `MessageSummary`. Shared by the
-/// recent-messages range fetch and the search-result UID fetch -- both ask
-/// for the same `(UID FLAGS ENVELOPE INTERNALDATE)` items, so the
-/// envelope-to-summary mapping is identical and lives here rather than
-/// being duplicated at each call site.
+// Shared by range-fetch and search-result-fetch — both request the same FETCH items.
 fn summary_from_fetch(fetch: &async_imap::types::Fetch) -> MessageSummary {
     let envelope = fetch.envelope();
     MessageSummary {
@@ -236,13 +318,11 @@ fn summary_from_fetch(fetch: &async_imap::types::Fetch) -> MessageSummary {
         in_reply_to: envelope
             .and_then(|e| decode_lossy(&e.in_reply_to))
             .map(strip_angle_brackets),
+        is_spam: false,
     }
 }
 
-/// Fetches the most recent `limit` messages in `folder`, newest last (the
-/// order the server reports them in). Opens the folder read-only (EXAMINE)
-/// since this is a preview-only operation — it shouldn't mark anything as
-/// read or otherwise change mailbox state.
+// EXAMINE, not SELECT — preview-only, must not mark messages seen.
 async fn fetch_recent_messages(
     session: &mut ImapSession,
     folder: &str,
@@ -270,35 +350,21 @@ async fn fetch_recent_messages(
         .map_err(|e| format!("FETCH failed: {e}"))
 }
 
-/// Escapes a string for use inside an IMAP quoted-string literal (RFC 3501
-/// section 4.3): backslash and double-quote are the only characters that
-/// need escaping, and CR/LF are stripped outright since they'd terminate
-/// the command line and can't legally appear in a quoted string anyway.
+// CR/LF stripped (would terminate the command line); backslash and quote escaped.
 fn imap_quote(value: &str) -> String {
     let cleaned: String = value.chars().filter(|&c| c != '\r' && c != '\n').collect();
     let escaped = cleaned.replace('\\', "\\\\").replace('"', "\\\"");
     format!("\"{escaped}\"")
 }
 
-/// Builds an IMAP SEARCH criteria string that matches `query` as a
-/// substring of the Subject, From, To, or Body of a message. IMAP's `OR`
-/// is strictly binary (it takes exactly two search keys), so a four-way
-/// match is expressed as a left-folded chain in prefix notation:
-/// `OR OR OR SUBJECT q FROM q TO q BODY q`. Pure and string-only so it can
-/// be unit-tested without a server.
+// IMAP OR is binary, so a four-way match is a left-folded chain: OR OR OR SUBJECT FROM TO BODY.
 fn build_search_criteria(query: &str) -> String {
     let q = imap_quote(query);
     format!("OR OR OR SUBJECT {q} FROM {q} TO {q} BODY {q}")
 }
 
-/// Searches `folder` for messages matching `query` (substring of
-/// Subject/From/To/Body) via IMAP `UID SEARCH`, then fetches summaries for
-/// up to `limit` of the newest matches. Opens the folder with EXAMINE --
-/// searching is read-only and must not mark anything seen.
-///
-/// Non-ASCII queries get a `CHARSET UTF-8` prefix so servers interpret the
-/// bytes correctly; pure-ASCII queries omit it, since some servers reject
-/// an explicit CHARSET they consider redundant.
+// Non-ASCII queries get CHARSET UTF-8; pure-ASCII omits it since some servers reject
+// the explicit CHARSET even when the default would be fine.
 async fn search_in_folder(
     session: &mut ImapSession,
     folder: &str,
@@ -329,8 +395,7 @@ async fn search_in_folder(
         return Ok(Vec::new());
     }
 
-    // Highest UIDs first (newest arrivals), capped at `limit` so a query
-    // matching thousands of messages doesn't pull them all over IPC.
+    // Highest UIDs first; cap at limit so a broad query doesn't pull thousands of messages.
     let mut uids: Vec<u32> = matches.into_iter().collect();
     uids.sort_unstable_by(|a, b| b.cmp(a));
     uids.truncate(limit as usize);
@@ -345,8 +410,7 @@ async fn search_in_folder(
         .await
         .map_err(|e| format!("FETCH failed: {e}"))?;
 
-    // The server may return the fetched rows in any order; present them
-    // newest-UID-first to match the truncation order above.
+    // Server may return rows in any order; sort to match the newest-first truncation above.
     summaries.sort_unstable_by(|a, b| b.uid.cmp(&a.uid));
     Ok(summaries)
 }
@@ -360,10 +424,27 @@ pub async fn search_messages(
     query: String,
     limit: u32,
 ) -> Result<Vec<MessageSummary>, String> {
-    let mut session = login_with_stored_credential(&host, port, &account_id).await?;
+    let mut session = login_for_account(&host, port, &account_id).await?;
     let result = search_in_folder(&mut session, &folder, &query, limit).await;
     session.logout().await.ok();
     result
+}
+
+/// The mailbox-name prefix new top-level folders need on this server, if
+/// any. Providers that nest user mailboxes under the INBOX namespace
+/// (cPanel/Dovecot) reject a bare `CREATE Projects` -- everything they LIST
+/// besides INBOX itself starts with "INBOX." (or "INBOX/"), and new folders
+/// must too. Detected from the LIST response rather than NAMESPACE, which
+/// async-imap doesn't expose a typed API for.
+fn detect_namespace_prefix(folders: &[String]) -> Option<String> {
+    for delimiter in ['.', '/'] {
+        let prefix = format!("INBOX{delimiter}");
+        let non_inbox: Vec<&String> = folders.iter().filter(|f| f.as_str() != "INBOX").collect();
+        if !non_inbox.is_empty() && non_inbox.iter().all(|f| f.starts_with(&prefix)) {
+            return Some(prefix);
+        }
+    }
+    None
 }
 
 #[tauri::command]
@@ -373,11 +454,26 @@ pub async fn create_folder(
     port: u16,
     folder: String,
 ) -> Result<(), String> {
-    let mut session = login_with_stored_credential(&host, port, &account_id).await?;
-    let result = session
-        .create(&folder)
-        .await
-        .map_err(|e| format!("could not create folder {folder}: {e}"));
+    let mut session = login_for_account(&host, port, &account_id).await?;
+    let result = async {
+        let first_error = match session.create(&folder).await {
+            Ok(()) => return Ok(()),
+            Err(e) => format!("could not create folder {folder}: {e}"),
+        };
+        // Retry inside the server's INBOX namespace if it has one -- the
+        // caller passes the bare name the user typed, which many providers
+        // only accept as "INBOX.<name>".
+        let folders = collect_folder_names(&mut session).await.map_err(|_| first_error.clone())?;
+        let Some(prefix) = detect_namespace_prefix(&folders) else {
+            return Err(first_error);
+        };
+        let prefixed = format!("{prefix}{folder}");
+        session
+            .create(&prefixed)
+            .await
+            .map_err(|e| format!("could not create folder {folder} (or {prefixed}): {e}"))
+    }
+    .await;
     session.logout().await.ok();
     result
 }
@@ -389,7 +485,7 @@ pub async fn delete_folder(
     port: u16,
     folder: String,
 ) -> Result<(), String> {
-    let mut session = login_with_stored_credential(&host, port, &account_id).await?;
+    let mut session = login_for_account(&host, port, &account_id).await?;
     let result = session
         .delete(&folder)
         .await
@@ -406,7 +502,7 @@ pub async fn rename_folder(
     folder: String,
     new_name: String,
 ) -> Result<(), String> {
-    let mut session = login_with_stored_credential(&host, port, &account_id).await?;
+    let mut session = login_for_account(&host, port, &account_id).await?;
     let result = session
         .rename(&folder, &new_name)
         .await
@@ -415,16 +511,7 @@ pub async fn rename_folder(
     result
 }
 
-/// Permanently removes every message in `folder` -- the "empty trash" /
-/// "empty spam" action. Marks all messages `\Deleted` via a `1:*` UID
-/// store, then EXPUNGE. Unlike `move_message`'s careful SEARCH-based
-/// fallback, this is deliberately a blunt "remove everything here", so
-/// there's no need to preserve other clients' `\Deleted` state -- the
-/// whole folder is being emptied regardless.
-///
-/// A bare `1:*` store against an already-empty mailbox errors on some
-/// servers, so the `exists == 0` case returns early rather than issuing a
-/// no-op store.
+// Some servers error on 1:* STORE against an empty mailbox, so bail early in that case.
 async fn empty_folder_messages(session: &mut ImapSession, folder: &str) -> Result<(), String> {
     let mailbox = session
         .select(folder)
@@ -461,16 +548,65 @@ pub async fn empty_folder(
     port: u16,
     folder: String,
 ) -> Result<(), String> {
-    let mut session = login_with_stored_credential(&host, port, &account_id).await?;
+    let mut session = login_for_account(&host, port, &account_id).await?;
     let result = empty_folder_messages(&mut session, &folder).await;
     session.logout().await.ok();
     result
 }
 
-/// Best-effort write-through into the local encrypted cache. Failures are
-/// logged, not propagated -- IMAP stays the source of truth, the cache is
-/// just a local mirror for future offline use, so a cache hiccup must
-/// never turn a successful fetch into a user-visible error.
+#[tauri::command]
+pub async fn subscribe_folder(
+    account_id: String,
+    host: String,
+    port: u16,
+    folder: String,
+) -> Result<(), String> {
+    let mut session = login_for_account(&host, port, &account_id).await?;
+    let result = session
+        .subscribe(&folder)
+        .await
+        .map_err(|e| format!("SUBSCRIBE failed for {folder}: {e}"));
+    session.logout().await.ok();
+    result
+}
+
+#[tauri::command]
+pub async fn unsubscribe_folder(
+    account_id: String,
+    host: String,
+    port: u16,
+    folder: String,
+) -> Result<(), String> {
+    let mut session = login_for_account(&host, port, &account_id).await?;
+    let result = session
+        .unsubscribe(&folder)
+        .await
+        .map_err(|e| format!("UNSUBSCRIBE failed for {folder}: {e}"));
+    session.logout().await.ok();
+    result
+}
+
+// LSUB instead of LIST — returns only explicitly subscribed folders.
+#[tauri::command]
+pub async fn list_subscribed_folders(
+    account_id: String,
+    host: String,
+    port: u16,
+) -> Result<Vec<String>, String> {
+    let mut session = login_for_account(&host, port, &account_id).await?;
+    let result = session
+        .lsub(None, Some("*"))
+        .await
+        .map_err(|e| format!("LSUB failed: {e}"))?
+        .map_ok(|name| name.name().to_string())
+        .try_collect()
+        .await
+        .map_err(|e| format!("LSUB failed: {e}"));
+    session.logout().await.ok();
+    result
+}
+
+// Cache failures are logged, never surfaced — IMAP is the source of truth.
 fn cache_summaries(account_id: &str, folder: &str, summaries: &[MessageSummary]) {
     let result = cache::open().and_then(|conn| cache::upsert_summaries(&conn, account_id, folder, summaries));
     if let Err(e) = result {
@@ -486,7 +622,7 @@ pub async fn fetch_messages(
     folder: String,
     limit: u32,
 ) -> Result<Vec<MessageSummary>, String> {
-    let mut session = login_with_stored_credential(&host, port, &account_id).await?;
+    let mut session = login_for_account(&host, port, &account_id).await?;
     let result = fetch_recent_messages(&mut session, &folder, limit).await;
     session.logout().await.ok();
 
@@ -494,12 +630,20 @@ pub async fn fetch_messages(
         cache_summaries(&account_id, &folder, summaries);
     }
 
+    // Spam scoring is best-effort — failures leave is_spam = false, never break the fetch.
+    let mut result = result;
+    if let Ok(summaries) = &mut result {
+        if let Ok(conn) = cache::open() {
+            for s in summaries.iter_mut() {
+                s.is_spam = crate::bayes::score_summary(&conn, s.subject.as_deref(), s.from.as_deref());
+            }
+        }
+    }
+
     result
 }
 
-/// Recursively builds one `ThreadedMessage` from a slot vec, consuming
-/// each slot exactly once. Called only from `group_into_threads`; not a
-/// Tauri command.
+// Takes ownership of each slot exactly once via Option::take.
 fn build_thread(
     idx: usize,
     slots: &mut Vec<Option<MessageSummary>>,
@@ -514,31 +658,17 @@ fn build_thread(
     ThreadedMessage { message, replies }
 }
 
-/// Groups a flat list of message summaries into conversation threads using
-/// `In-Reply-To` / `Message-ID` matching.
-///
-/// Messages whose parent is absent from the list (or that have no
-/// `in_reply_to`) become thread roots. Replies are nested directly under
-/// their parent and sorted chronologically. Pathological cycles (A
-/// replies to B, B replies to A) result in both messages being silently
-/// dropped rather than an infinite loop -- this can't occur in real RFC
-/// 5322 mail and isn't worth a more complex defence.
-///
-/// `pub` so `account.rs`'s `fetch_unified_inbox` can thread the merged
-/// result in the future without duplicating this logic.
+// Cycles (A replies to B, B replies to A) can't occur in real mail but are silently dropped
+// rather than looping — not worth defending against more explicitly.
 pub fn group_into_threads(messages: Vec<MessageSummary>) -> Vec<ThreadedMessage> {
     use std::collections::HashMap;
 
-    // Map from message_id -> index. Messages without a message_id can't
-    // be identified as parents, so they're excluded from the lookup.
     let id_to_idx: HashMap<&str, usize> = messages
         .iter()
         .enumerate()
         .filter_map(|(i, m)| m.message_id.as_deref().map(|id| (id, i)))
         .collect();
 
-    // For each message, the index of its parent within this set -- None if
-    // it's a root (no in_reply_to, or the parent isn't in this fetch).
     let parent_of: Vec<Option<usize>> = messages
         .iter()
         .enumerate()
@@ -550,8 +680,6 @@ pub fn group_into_threads(messages: Vec<MessageSummary>) -> Vec<ThreadedMessage>
         })
         .collect();
 
-    // Build the children list: children[p] = indices of messages whose
-    // parent index is p.
     let mut children: Vec<Vec<usize>> = vec![Vec::new(); messages.len()];
     for (i, opt_parent) in parent_of.iter().enumerate() {
         if let Some(p) = *opt_parent {
@@ -559,8 +687,6 @@ pub fn group_into_threads(messages: Vec<MessageSummary>) -> Vec<ThreadedMessage>
         }
     }
 
-    // Move each MessageSummary into an Option slot so build_thread can
-    // take ownership of them one at a time without cloning.
     let mut slots: Vec<Option<MessageSummary>> = messages.into_iter().map(Some).collect();
 
     let mut roots: Vec<ThreadedMessage> = parent_of
@@ -573,9 +699,7 @@ pub fn group_into_threads(messages: Vec<MessageSummary>) -> Vec<ThreadedMessage>
     roots
 }
 
-/// Same as `fetch_messages` but groups the result into conversation threads
-/// before returning. Caches the flat summary list (write-through) on the
-/// way out, same as `fetch_messages` does.
+// Apply spam scoring before threading so is_spam is visible on summaries inside the tree.
 #[tauri::command]
 pub async fn fetch_threaded_messages(
     account_id: String,
@@ -584,41 +708,35 @@ pub async fn fetch_threaded_messages(
     folder: String,
     limit: u32,
 ) -> Result<Vec<ThreadedMessage>, String> {
-    let mut session = login_with_stored_credential(&host, port, &account_id).await?;
+    let mut session = login_for_account(&host, port, &account_id).await?;
     let result = fetch_recent_messages(&mut session, &folder, limit).await;
     session.logout().await.ok();
 
-    let messages = result?;
+    let mut messages = result?;
     cache_summaries(&account_id, &folder, &messages);
+    // Apply Bayesian spam scoring before threading so the is_spam flag is
+    // visible on summaries inside the returned ThreadedMessage tree.
+    if let Ok(conn) = cache::open() {
+        for s in messages.iter_mut() {
+            s.is_spam = crate::bayes::score_summary(&conn, s.subject.as_deref(), s.from.as_deref());
+        }
+    }
     Ok(group_into_threads(messages))
 }
 
 #[derive(Debug, Serialize)]
 pub struct AttachmentInfo {
-    /// Position in the parsed message's attachment list -- pass this back
-    /// to `fetch_attachment`/`pop3::fetch_attachment` to download this
-    /// specific attachment's bytes. Stable for a given raw message, since
-    /// it's just `parse_message_body`'s iteration order over the same
-    /// `mail_parser::Message::attachments()` call both times.
     pub index: usize,
     pub filename: Option<String>,
     pub content_type: Option<String>,
     pub size: usize,
 }
 
-/// One attachment's actual content, returned by `fetch_attachment`/
-/// `pop3::fetch_attachment`. Deliberately a separate command from
-/// `fetch_message_body` rather than an extra field there -- a message
-/// preview has no use for attachment bytes, and fetching them eagerly
-/// for every open would waste bandwidth on attachments nobody asked to
-/// download.
 #[derive(Debug, Serialize)]
 pub struct AttachmentContent {
     pub filename: Option<String>,
     pub content_type: Option<String>,
-    /// Base64-encoded (standard alphabet). IPC payloads go through JSON,
-    /// where a `Vec<u8>` would serialize as an array of numbers -- far
-    /// more bytes over the wire than a base64 string for the same content.
+    /// Base64-encoded — Vec<u8> would serialize as a JSON array of numbers (much larger).
     pub content_base64: String,
 }
 
@@ -627,19 +745,14 @@ pub struct MessageBody {
     pub text: Option<String>,
     pub html: Option<String>,
     pub attachments: Vec<AttachmentInfo>,
-    /// Set by `pgp::maybe_decrypt` when `text` turned out to be an
-    /// inline-armored PGP message with a known signer -- `None` for
-    /// ordinary mail, or encrypted mail whose signer isn't on file.
     pub pgp_signed_by: Option<String>,
-    /// `None` for ordinary mail. `Some(false)`/`Some(true)` once
-    /// decryption was attempted -- whether the signature actually
-    /// verified, independent of whether the signer was known at all.
     pub pgp_signature_valid: Option<bool>,
-    /// Formatted `"Name <email>"` (or just `"email"` with no display
-    /// name) -- same convention as `MessageSummary.from`. Distinct from
-    /// `parse_message_body`'s separate bare-email `sender_email` return
-    /// value, which exists for PGP verification/contact harvesting and
-    /// has no use for a display name.
+    pub smime_signed: bool,
+    /// `None` = not signed (or detection not attempted); `Some(true/false)` = verified/failed.
+    pub smime_verified: Option<bool>,
+    pub smime_encrypted: bool,
+    /// Email address extracted from the signer's X.509 certificate SAN/emailAddress RDN.
+    pub smime_signer_email: Option<String>,
     pub from: Option<String>,
     pub to: Vec<String>,
     pub cc: Vec<String>,
@@ -648,22 +761,12 @@ pub struct MessageBody {
     /// the header existing -- but resolving that preference is left to
     /// the caller composing the reply, not decided here.
     pub reply_to: Option<String>,
-    /// This message's own `Message-ID`. What a reply to *this* message
-    /// should put in its own `In-Reply-To`, and append to its own
-    /// `References` (see `references` below and `smtp.rs`'s
-    /// `send_message`). Angle brackets already stripped, same as
-    /// `mail_parser`'s own `message_id()`/`references()` accessors.
     pub message_id: Option<String>,
-    /// This message's own `In-Reply-To`, if it's itself a reply --
-    /// groundwork for thread reconstruction (grouping messages by
-    /// `References`/`In-Reply-To`/`Message-ID`), not used by reply/forward
-    /// composition itself.
     pub in_reply_to: Option<String>,
-    /// This message's own `References` chain. A reply to *this* message
-    /// should send `references + [message_id]` as its own `References`
-    /// (RFC 5322 section 3.6.4) -- that chaining is the caller's job, not
-    /// done here, since this field is just what's already on the message.
     pub references: Vec<String>,
+    /// Non-empty when the sender requested a read receipt (`Disposition-Notification-To` header).
+    /// Contains the address to send the MDN to.
+    pub disposition_notification_to: Option<String>,
 }
 
 fn content_type_string(content_type: &mail_parser::ContentType) -> String {
@@ -673,11 +776,6 @@ fn content_type_string(content_type: &mail_parser::ContentType) -> String {
     }
 }
 
-/// Formats one already-parsed address as `"Name <email>"`, or just
-/// `"email"` with no display name. Same convention as this module's own
-/// `format_address` above, just for `mail_parser::Addr` instead of
-/// `imap_proto`'s address type -- can't share the name `format_address`
-/// for both, since Rust doesn't dispatch free functions by parameter type.
 fn format_parsed_address(addr: &mail_parser::Addr) -> String {
     let email = addr.address().unwrap_or_default();
     match addr.name() {
@@ -686,22 +784,13 @@ fn format_parsed_address(addr: &mail_parser::Addr) -> String {
     }
 }
 
-/// Flattens an optional address-list header (`To`/`Cc`) into formatted
-/// strings, one per address -- `None` (header absent) and an empty list
-/// both come back as an empty `Vec`, so callers don't need to distinguish
-/// the two.
 fn format_address_list(address: Option<&mail_parser::Address>) -> Vec<String> {
     address
         .map(|addr| addr.iter().map(format_parsed_address).collect())
         .unwrap_or_default()
 }
 
-/// Flattens a `Message-ID`/`In-Reply-To`/`References`-shaped header value
-/// into a list of IDs (angle brackets already stripped by `mail_parser`'s
-/// own parsing). These headers parse to `HeaderValue::Text` when there's
-/// exactly one ID, `HeaderValue::TextList` for more than one, or `Empty`
-/// when the header is absent -- this collapses all three into one `Vec`
-/// rather than making every caller match on the variant itself.
+// HeaderValue is Text, TextList, or Empty depending on how many IDs are present — flatten all three.
 fn header_value_to_id_list(value: &mail_parser::HeaderValue) -> Vec<String> {
     if let Some(list) = value.as_text_list() {
         list.iter().map(|s| s.to_string()).collect()
@@ -712,12 +801,7 @@ fn header_value_to_id_list(value: &mail_parser::HeaderValue) -> Vec<String> {
     }
 }
 
-/// Pulls `(email, display_name)` candidates for the local contact cache
-/// out of an already-parsed message's From/To/Cc headers. Opening a
-/// message to read it is a genuine "I interacted with this address"
-/// signal for the sender and every other recipient on the thread, unlike
-/// a folder listing -- which is why this lives here rather than in
-/// `fetch_recent_messages`.
+// Harvested on open (not on folder listing) — opening a message is an actual correspondence signal.
 fn extract_contact_candidates(message: &mail_parser::Message) -> Vec<(String, Option<String>)> {
     let mut candidates = Vec::new();
     for header in [message.from(), message.to(), message.cc()] {
@@ -731,13 +815,7 @@ fn extract_contact_candidates(message: &mail_parser::Message) -> Vec<(String, Op
     candidates
 }
 
-/// Parses raw RFC 822 message bytes into a plain text body, an HTML body
-/// (if present), attachment metadata, the sender's email (for PGP
-/// signature verification -- see `pgp::maybe_decrypt`), and contact
-/// candidates harvested from the From/To/Cc headers. Shared by both the
-/// IMAP (`BODY[]`) and POP3 (`RETR`) fetch paths -- once you have the raw
-/// bytes of a message, there's no protocol-specific difference left in
-/// turning them into a `MessageBody`.
+// pub(crate) so pop3.rs can reuse — once you have raw bytes, parsing is identical.
 pub(crate) fn parse_message_body(
     raw_message: &[u8],
 ) -> Result<(MessageBody, Option<String>, Vec<(String, Option<String>)>), String> {
@@ -771,6 +849,10 @@ pub(crate) fn parse_message_body(
     let message_id = message.message_id().map(|s| s.to_string());
     let in_reply_to = header_value_to_id_list(message.in_reply_to()).into_iter().next();
     let references = header_value_to_id_list(message.references());
+    let disposition_notification_to = message
+        .header("Disposition-Notification-To")
+        .and_then(|v| v.as_text())
+        .map(|s| s.to_string());
 
     Ok((
         MessageBody {
@@ -779,6 +861,10 @@ pub(crate) fn parse_message_body(
             attachments,
             pgp_signed_by: None,
             pgp_signature_valid: None,
+            smime_signed: false,
+            smime_verified: None,
+            smime_encrypted: false,
+            smime_signer_email: None,
             from,
             to,
             cc,
@@ -786,22 +872,15 @@ pub(crate) fn parse_message_body(
             message_id,
             in_reply_to,
             references,
+            disposition_notification_to,
         },
         sender_email,
         contacts,
     ))
 }
 
-/// Re-parses a message's raw bytes and pulls out one attachment's already-
-/// decoded content (`mail_parser` undoes base64/quoted-printable for us) by
-/// its position in `parse_message_body`'s attachment list.
-///
-/// This re-fetches and re-parses the whole message rather than asking IMAP
-/// for just the one MIME part via `BODY[<section>]` -- that would save
-/// bandwidth on large messages, but needs mapping `mail_parser`'s
-/// attachment ordering to IMAP's own section-number scheme, which isn't
-/// implemented yet. Revisit if large attachments make that cost real;
-/// not worth the complexity speculatively.
+// Re-parses the whole message rather than a BODY[section] partial fetch — mapping mail_parser's
+// attachment ordering to IMAP section numbers isn't implemented; revisit if large attachments hurt.
 pub(crate) fn extract_attachment(raw_message: &[u8], attachment_index: usize) -> Result<AttachmentContent, String> {
     use base64::Engine;
 
@@ -821,16 +900,7 @@ pub(crate) fn extract_attachment(raw_message: &[u8], attachment_index: usize) ->
     })
 }
 
-/// Opens `folder` and fetches one message's raw RFC 822 bytes by UID.
-/// Split out from `fetch_body_by_uid` so `fetch_attachment` can re-fetch
-/// the same raw bytes without going through the full body-parsing path.
-/// `pub(crate)`, same reason as `fetch_body_by_uid` below -- `smtp.rs`'s
-/// GreenMail round-trip test needs it to verify a sent attachment landed
-/// correctly, over a session it authenticates itself.
-///
-/// `SELECT`, not `EXAMINE` — unlike `fetch_messages`, this represents the
-/// user actually opening a message to read it (or download something from
-/// it), so marking it `\Seen` is expected, same as any other mail client.
+// SELECT, not EXAMINE — marking \Seen is intentional when the user opens a message.
 pub(crate) async fn fetch_raw_message_by_uid(session: &mut ImapSession, folder: &str, uid: u32) -> Result<Vec<u8>, String> {
     session
         .select(folder)
@@ -848,12 +918,6 @@ pub(crate) async fn fetch_raw_message_by_uid(session: &mut ImapSession, folder: 
         .ok_or_else(|| format!("no message with UID {uid} in {folder}"))
 }
 
-/// Fetches the full content of a single message by UID via IMAP.
-/// `pub(crate)` (not just module-private) so `smtp.rs`'s GreenMail
-/// encrypt/decrypt round-trip test can fetch a message back over a
-/// session it authenticates itself, the same way it already builds its
-/// own permissive-TLS SMTP transport instead of going through
-/// `send_message`'s certificate-validating path.
 pub(crate) async fn fetch_body_by_uid(
     session: &mut ImapSession,
     folder: &str,
@@ -863,8 +927,6 @@ pub(crate) async fn fetch_body_by_uid(
     parse_message_body(&raw_message)
 }
 
-/// Same best-effort, log-and-continue caching as `cache_summaries`, for a
-/// single message body.
 fn cache_body(account_id: &str, folder: &str, uid: u32, body: &MessageBody) {
     let result = cache::open().and_then(|conn| cache::upsert_body(&conn, account_id, folder, uid, body));
     if let Err(e) = result {
@@ -872,8 +934,32 @@ fn cache_body(account_id: &str, folder: &str, uid: u32, body: &MessageBody) {
     }
 }
 
-/// Same best-effort, log-and-continue caching as `cache_body`, for the
-/// contact candidates harvested alongside it.
+fn cache_attachment(account_id: &str, folder: &str, uid: u32, idx: usize, content: &AttachmentContent) {
+    use base64::Engine;
+    let bytes = match base64::engine::general_purpose::STANDARD.decode(&content.content_base64) {
+        Ok(bytes) => bytes,
+        Err(e) => {
+            log::warn!("could not decode attachment for caching ({account_id}/{folder}/{uid}#{idx}): {e}");
+            return;
+        }
+    };
+    let result = cache::open().and_then(|conn| {
+        cache::upsert_attachment(
+            &conn,
+            account_id,
+            folder,
+            uid,
+            idx,
+            content.filename.as_deref(),
+            content.content_type.as_deref(),
+            &bytes,
+        )
+    });
+    if let Err(e) = result {
+        log::warn!("could not cache attachment {account_id}/{folder}/{uid}#{idx}: {e}");
+    }
+}
+
 fn cache_contacts(contacts: &[(String, Option<String>)]) {
     if contacts.is_empty() {
         return;
@@ -892,14 +978,16 @@ pub async fn fetch_message_body(
     folder: String,
     uid: u32,
 ) -> Result<MessageBody, String> {
-    let mut session = login_with_stored_credential(&host, port, &account_id).await?;
-    let result = fetch_body_by_uid(&mut session, &folder, uid).await;
+    let mut session = login_for_account(&host, port, &account_id).await?;
+    let raw_result = fetch_raw_message_by_uid(&mut session, &folder, uid).await;
     session.logout().await.ok();
 
-    let (body, sender_email, contacts) = result?;
+    let raw = raw_result?;
+    let (body, sender_email, contacts) = parse_message_body(&raw)?;
     cache_body(&account_id, &folder, uid, &body);
     cache_contacts(&contacts);
     let body = pgp::maybe_decrypt(&account_id, sender_email.as_deref(), body);
+    let body = smime::maybe_process_smime(&account_id, body, &raw);
 
     Ok(body)
 }
@@ -913,11 +1001,45 @@ pub async fn fetch_attachment(
     uid: u32,
     attachment_index: usize,
 ) -> Result<AttachmentContent, String> {
-    let mut session = login_with_stored_credential(&host, port, &account_id).await?;
+    let mut session = login_for_account(&host, port, &account_id).await?;
     let result = fetch_raw_message_by_uid(&mut session, &folder, uid).await;
     session.logout().await.ok();
 
-    extract_attachment(&result?, attachment_index)
+    let content = extract_attachment(&result?, attachment_index)?;
+    cache_attachment(&account_id, &folder, uid, attachment_index, &content);
+    Ok(content)
+}
+
+// EXAMINE path — no \Seen side effect. Raw RFC 822 bytes are also the .eml format.
+#[tauri::command]
+pub async fn fetch_message_source(
+    account_id: String,
+    host: String,
+    port: u16,
+    folder: String,
+    uid: u32,
+) -> Result<String, String> {
+    use base64::Engine;
+    let mut session = login_for_account(&host, port, &account_id).await?;
+    let raw = fetch_raw_message_by_uid(&mut session, &folder, uid).await;
+    session.logout().await.ok();
+    Ok(base64::engine::general_purpose::STANDARD.encode(raw?))
+}
+
+// Same EXAMINE path as fetch_message_source — no \Seen side effect.
+#[tauri::command]
+pub async fn export_message_eml(
+    account_id: String,
+    host: String,
+    port: u16,
+    folder: String,
+    uid: u32,
+    path: String,
+) -> Result<(), String> {
+    let mut session = login_for_account(&host, port, &account_id).await?;
+    let raw = fetch_raw_message_by_uid(&mut session, &folder, uid).await;
+    session.logout().await.ok();
+    std::fs::write(&path, raw?).map_err(|e| format!("could not write {path}: {e}"))
 }
 
 /// Joins a slice of UIDs into an IMAP UID set string (`"3,5,9"`), or
@@ -968,7 +1090,7 @@ pub async fn set_message_seen(
     uid: u32,
     seen: bool,
 ) -> Result<(), String> {
-    let mut session = login_with_stored_credential(&host, port, &account_id).await?;
+    let mut session = login_for_account(&host, port, &account_id).await?;
     let result = set_flag(&mut session, &folder, &uid.to_string(), "\\Seen", seen).await;
     session.logout().await.ok();
     result
@@ -983,8 +1105,28 @@ pub async fn set_message_flagged(
     uid: u32,
     flagged: bool,
 ) -> Result<(), String> {
-    let mut session = login_with_stored_credential(&host, port, &account_id).await?;
+    let mut session = login_for_account(&host, port, &account_id).await?;
     let result = set_flag(&mut session, &folder, &uid.to_string(), "\\Flagged", flagged).await;
+    session.logout().await.ok();
+    result
+}
+
+/// Sets or clears an arbitrary IMAP keyword flag on a single message.
+/// Used for non-system flags like `$Junk`/`$NotJunk` that aren't first-class
+/// commands but are recognised by many server-side filters. `pub(crate)` so
+/// `account::report_spam` can tag `$Junk` without duplicating the
+/// login/logout dance.
+pub(crate) async fn set_message_keyword(
+    account_id: &str,
+    host: &str,
+    port: u16,
+    folder: &str,
+    uid: u32,
+    keyword: &str,
+    set: bool,
+) -> Result<(), String> {
+    let mut session = login_for_account(host, port, account_id).await?;
+    let result = set_flag(&mut session, folder, &uid.to_string(), keyword, set).await;
     session.logout().await.ok();
     result
 }
@@ -1002,7 +1144,7 @@ pub async fn set_messages_seen(
     seen: bool,
 ) -> Result<(), String> {
     let uid_set = join_uids(&uids).ok_or("no messages selected")?;
-    let mut session = login_with_stored_credential(&host, port, &account_id).await?;
+    let mut session = login_for_account(&host, port, &account_id).await?;
     let result = set_flag(&mut session, &folder, &uid_set, "\\Seen", seen).await;
     session.logout().await.ok();
     result
@@ -1020,7 +1162,7 @@ pub async fn set_messages_flagged(
     flagged: bool,
 ) -> Result<(), String> {
     let uid_set = join_uids(&uids).ok_or("no messages selected")?;
-    let mut session = login_with_stored_credential(&host, port, &account_id).await?;
+    let mut session = login_for_account(&host, port, &account_id).await?;
     let result = set_flag(&mut session, &folder, &uid_set, "\\Flagged", flagged).await;
     session.logout().await.ok();
     result
@@ -1038,7 +1180,7 @@ pub async fn mark_folder_seen(
     folder: String,
     seen: bool,
 ) -> Result<(), String> {
-    let mut session = login_with_stored_credential(&host, port, &account_id).await?;
+    let mut session = login_for_account(&host, port, &account_id).await?;
     let result = async {
         let mailbox = session
             .select(&folder)
@@ -1227,6 +1369,34 @@ async fn move_messages(
     move_via_search_store_expunge(session, uids, destination_folder).await
 }
 
+/// Runs the move, and when it fails, checks whether the destination folder
+/// simply doesn't exist under that name on this server (the configured
+/// "Trash" vs the real "INBOX.Trash") -- if an equivalent folder does, the
+/// move is retried against it and the corrected name is persisted to the
+/// account record so subsequent moves go straight to the right place.
+async fn move_messages_with_heal(
+    session: &mut ImapSession,
+    account_id: &str,
+    folder: &str,
+    uids: &[u32],
+    destination_folder: &str,
+) -> Result<(), String> {
+    let first_error = match move_messages(session, folder, uids, destination_folder).await {
+        Ok(()) => return Ok(()),
+        Err(e) => e,
+    };
+    let Ok(folders) = collect_folder_names(session).await else {
+        return Err(first_error);
+    };
+    let Some(real_folder) = resolve_equivalent_folder(&folders, destination_folder) else {
+        return Err(first_error);
+    };
+    log::info!("move to {destination_folder:?} failed ({first_error}); retrying against {real_folder:?}");
+    move_messages(session, folder, uids, &real_folder).await?;
+    persist_folder_correction(account_id, destination_folder, &real_folder);
+    Ok(())
+}
+
 #[tauri::command]
 pub async fn move_message_to_folder(
     account_id: String,
@@ -1236,8 +1406,8 @@ pub async fn move_message_to_folder(
     uid: u32,
     destination_folder: String,
 ) -> Result<(), String> {
-    let mut session = login_with_stored_credential(&host, port, &account_id).await?;
-    let result = move_messages(&mut session, &folder, &[uid], &destination_folder).await;
+    let mut session = login_for_account(&host, port, &account_id).await?;
+    let result = move_messages_with_heal(&mut session, &account_id, &folder, &[uid], &destination_folder).await;
     session.logout().await.ok();
     result
 }
@@ -1255,8 +1425,8 @@ pub async fn move_messages_to_folder(
     uids: Vec<u32>,
     destination_folder: String,
 ) -> Result<(), String> {
-    let mut session = login_with_stored_credential(&host, port, &account_id).await?;
-    let result = move_messages(&mut session, &folder, &uids, &destination_folder).await;
+    let mut session = login_for_account(&host, port, &account_id).await?;
+    let result = move_messages_with_heal(&mut session, &account_id, &folder, &uids, &destination_folder).await;
     session.logout().await.ok();
     result
 }
@@ -1473,6 +1643,73 @@ mod tests {
         assert_eq!(decoded, b"fake pdf bytes here");
     }
 
+    #[test]
+    fn resolve_special_folder_handles_nested_and_prefixed_names() {
+        let cpanel = vec![
+            "INBOX".to_string(),
+            "INBOX.Archive".to_string(),
+            "INBOX.Junk".to_string(),
+            "INBOX.Sent".to_string(),
+            "INBOX.spam".to_string(),
+            "INBOX.Trash".to_string(),
+            "INBOX.Drafts".to_string(),
+        ];
+        assert_eq!(resolve_special_folder(&cpanel, "sent").as_deref(), Some("INBOX.Sent"));
+        assert_eq!(resolve_special_folder(&cpanel, "trash").as_deref(), Some("INBOX.Trash"));
+        assert_eq!(resolve_special_folder(&cpanel, "archive").as_deref(), Some("INBOX.Archive"));
+        assert_eq!(resolve_special_folder(&cpanel, "drafts").as_deref(), Some("INBOX.Drafts"));
+        // "spam" outranks "junk" when both exist.
+        assert_eq!(resolve_special_folder(&cpanel, "spam").as_deref(), Some("INBOX.spam"));
+
+        let gmail = vec![
+            "INBOX".to_string(),
+            "[Gmail]/All Mail".to_string(),
+            "[Gmail]/Drafts".to_string(),
+            "[Gmail]/Sent Mail".to_string(),
+            "[Gmail]/Spam".to_string(),
+            "[Gmail]/Trash".to_string(),
+        ];
+        assert_eq!(resolve_special_folder(&gmail, "sent").as_deref(), Some("[Gmail]/Sent Mail"));
+        assert_eq!(resolve_special_folder(&gmail, "archive").as_deref(), Some("[Gmail]/All Mail"));
+
+        let flat = vec!["INBOX".to_string(), "Sent".to_string(), "Trash".to_string()];
+        assert_eq!(resolve_special_folder(&flat, "sent").as_deref(), Some("Sent"));
+        assert_eq!(resolve_special_folder(&flat, "archive"), None);
+    }
+
+    #[test]
+    fn resolve_equivalent_folder_heals_names_and_respects_existing_ones() {
+        let folders = vec![
+            "INBOX".to_string(),
+            "INBOX.Sent".to_string(),
+            "INBOX.Junk".to_string(),
+        ];
+        // Exists as-is: nothing to heal.
+        assert_eq!(resolve_equivalent_folder(&folders, "INBOX.Sent"), None);
+        // Leaf-name match.
+        assert_eq!(resolve_equivalent_folder(&folders, "Sent").as_deref(), Some("INBOX.Sent"));
+        // Role-synonym match: asked for Spam, server only has Junk.
+        assert_eq!(resolve_equivalent_folder(&folders, "Spam").as_deref(), Some("INBOX.Junk"));
+        // No plausible target.
+        assert_eq!(resolve_equivalent_folder(&folders, "Projects"), None);
+    }
+
+    #[test]
+    fn detect_namespace_prefix_finds_the_inbox_namespace() {
+        let cpanel = vec![
+            "INBOX".to_string(),
+            "INBOX.Sent".to_string(),
+            "INBOX.Trash".to_string(),
+        ];
+        assert_eq!(detect_namespace_prefix(&cpanel).as_deref(), Some("INBOX."));
+
+        let flat = vec!["INBOX".to_string(), "Sent".to_string()];
+        assert_eq!(detect_namespace_prefix(&flat), None);
+
+        let empty: Vec<String> = vec!["INBOX".to_string()];
+        assert_eq!(detect_namespace_prefix(&empty), None);
+    }
+
     fn summary_with_threading(uid: u32, message_id: &str, in_reply_to: Option<&str>) -> MessageSummary {
         MessageSummary {
             uid: Some(uid),
@@ -1483,6 +1720,7 @@ mod tests {
             flagged: false,
             message_id: Some(message_id.to_string()),
             in_reply_to: in_reply_to.map(|s| s.to_string()),
+            is_spam: false,
         }
     }
 

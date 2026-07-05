@@ -1,26 +1,36 @@
 use lettre::message::header::{ContentType, InReplyTo, References};
-use lettre::message::{Attachment, Mailbox, MultiPart, SinglePart};
+use lettre::message::{Attachment, Mailbox, Mailboxes, MultiPart, SinglePart};
 use lettre::transport::smtp::authentication::Credentials;
 use lettre::{AsyncSmtpTransport, AsyncTransport, Message, Tokio1Executor};
 use serde::{Deserialize, Serialize};
+use zeroize::Zeroize;
 
 use crate::cache;
 use crate::credentials;
+use crate::imap;
 use crate::pgp;
+use crate::smime;
 
-/// One outgoing attachment, as supplied by the caller. Mirrors
-/// `imap::AttachmentContent`'s shape (base64 over IPC, for the same
-/// reason: a `Vec<u8>` would serialize as a much larger JSON array of
-/// numbers) but is its own type rather than a reuse — that one is a
-/// *downloaded* attachment's content (always has bytes, filename,
-/// content-type all populated from a real parsed message), this one is
-/// caller-supplied input with no relationship to a message that's been
-/// fetched from anywhere.
+/// One outgoing attachment. `content_id`, when set, marks this as an inline
+/// resource referenced from the HTML body via `<img src="cid:<content_id>">`.
 #[derive(Debug, Serialize, Deserialize)]
 pub struct OutgoingAttachment {
     pub filename: String,
     pub content_type: String,
     pub content_base64: String,
+    #[serde(default)]
+    pub content_id: Option<String>,
+}
+
+// Empty string yields an empty list so Cc/Bcc can be passed unconditionally without special-casing.
+fn parse_address_list(raw: &str) -> Result<Vec<Mailbox>, String> {
+    if raw.trim().is_empty() {
+        return Ok(Vec::new());
+    }
+    let mailboxes: Mailboxes = raw
+        .parse()
+        .map_err(|e| format!("invalid address list {raw:?}: {e}"))?;
+    Ok(mailboxes.into_iter().collect())
 }
 
 fn attachment_part(attachment: &OutgoingAttachment) -> Result<SinglePart, String> {
@@ -32,35 +42,54 @@ fn attachment_part(attachment: &OutgoingAttachment) -> Result<SinglePart, String
         .decode(&attachment.content_base64)
         .map_err(|e| format!("invalid base64 content for attachment {}: {e}", attachment.filename))?;
 
-    Ok(Attachment::new(attachment.filename.clone()).body(bytes, content_type))
+    if let Some(cid) = &attachment.content_id {
+        // Strip surrounding <> if the caller supplied them.
+        let bare = cid.trim_matches(|c| c == '<' || c == '>');
+        Ok(Attachment::new_inline(format!("<{bare}>")).body(bytes, content_type))
+    } else {
+        Ok(Attachment::new(attachment.filename.clone()).body(bytes, content_type))
+    }
 }
 
-/// Builds the multipart body for a message that has an HTML alternative
-/// and/or attachments — `send_message` only takes this path when there's
-/// something beyond plain text to send; a plain-text-only message stays a
-/// single `TEXT_PLAIN` body, unchanged from before this existed.
-///
-/// `text` is always included alongside `html`, not replaced by it: a
-/// plain-text fallback part is standard practice for HTML mail (some
-/// clients/spam filters treat HTML-only mail with suspicion), and the
-/// receiving side of this codebase already expects both to coexist
-/// (`imap::MessageBody` has separate `text`/`html` fields).
+// plain text is always included alongside html — some spam filters distrust html-only mail.
+// When the html body references inline images via cid:, those parts are wrapped in
+// multipart/related alongside the alternative block; regular attachments go in the outer
+// multipart/mixed, which is what Thunderbird, Apple Mail, and Gmail all expect.
 fn build_multipart_body(text: String, html: Option<String>, attachments: &[OutgoingAttachment]) -> Result<MultiPart, String> {
-    let mut body = match html {
-        Some(html) => MultiPart::mixed().multipart(MultiPart::alternative_plain_html(text, html)),
-        None => MultiPart::mixed().singlepart(SinglePart::plain(text)),
+    let (inline_atts, regular_atts): (Vec<_>, Vec<_>) =
+        attachments.iter().partition(|a| a.content_id.is_some());
+
+    let content_part = match html {
+        Some(html) if !inline_atts.is_empty() => {
+            // multipart/related: html + all inline images
+            let mut related = MultiPart::related()
+                .singlepart(SinglePart::html(html));
+            for att in &inline_atts {
+                related = related.singlepart(attachment_part(att)?);
+            }
+            // wrap in alternative so plain-text fallback is available
+            MultiPart::alternative()
+                .singlepart(SinglePart::plain(text))
+                .multipart(related)
+        }
+        Some(html) => MultiPart::alternative_plain_html(text, html),
+        None => {
+            // no HTML — regular_atts already contains everything
+            let mut mixed = MultiPart::mixed().singlepart(SinglePart::plain(text));
+            for att in attachments {
+                mixed = mixed.singlepart(attachment_part(att)?);
+            }
+            return Ok(mixed);
+        }
     };
 
-    for attachment in attachments {
-        body = body.singlepart(attachment_part(attachment)?);
+    let mut mixed = MultiPart::mixed().multipart(content_part);
+    for att in &regular_atts {
+        mixed = mixed.singlepart(attachment_part(att)?);
     }
-
-    Ok(body)
+    Ok(mixed)
 }
 
-/// Best-effort, log-and-continue caching of one address into the local
-/// contact cache -- same posture as the IMAP layer's `cache_summaries`/
-/// `cache_body`.
 fn cache_contact(email: &str, name: Option<&str>) {
     let result = cache::open()
         .and_then(|conn| cache::upsert_contacts(&conn, &[(email.to_string(), name.map(|n| n.to_string()))]));
@@ -69,51 +98,61 @@ fn cache_contact(email: &str, name: Option<&str>) {
     }
 }
 
-/// `account_id` doubles as both the SMTP login username and the message's
-/// From address, same convention as the IMAP layer — accounts are
-/// identified by their email address.
-///
-/// `use_starttls` picks which of lettre's two TLS strategies to use:
-/// `false` for implicit TLS (`relay()`, the SMTPS/port-465 style, TLS from
-/// the first byte) or `true` for STARTTLS (`starttls_relay()`, connects
-/// in plaintext and then upgrades, the port-587 style). This is an
-/// explicit caller-supplied flag rather than something inferred from
-/// `port` — some providers run implicit TLS on nonstandard ports, and
-/// guessing wrong would silently attempt the wrong handshake instead of
-/// failing clearly. Either way the upgrade/connection is required, not
-/// opportunistic: `starttls_relay()` refuses to send anything, including
-/// credentials, if the server won't upgrade.
-///
-/// `encrypt` mirrors Compose's "Encrypt" toggle (currently inert UI
-/// state, see `docs/technical/encryption.md`). Unlike the cache/contact
-/// writes elsewhere in this codebase, PGP encryption here is **not**
-/// best-effort: if the caller asked for encryption and it fails (no
-/// recipient key on file, etc.), the send itself fails rather than
-/// silently mailing plaintext the user explicitly asked to encrypt. The
-/// same hard-fail posture applies to combining `encrypt` with `html`/
-/// `attachments` — PGP support in this codebase is inline-armored
-/// plain-text only (see `pgp.md`), so encrypting a message that also
-/// carries an HTML body or attachments would mean either silently
-/// encrypting only part of what the user asked to encrypt, or silently
-/// sending the rest in the clear. Neither is acceptable, so it's a clean
-/// upfront error instead.
-///
-/// `html` is optional; `body` (the plain-text version) is always
-/// required and always sent, even alongside `html` — see
-/// `build_multipart_body`. `attachments` defaults to an empty list for a
-/// plain message; supplying either makes this build a real multipart MIME
-/// message instead of the single `TEXT_PLAIN` body this command used to
-/// always send.
-///
-/// `in_reply_to`/`references` are how a reply actually threads in a real
-/// mail client (Gmail/Outlook/Apple Mail group by these headers, not just
-/// matching subjects) — building them is the caller's job, using the
-/// message being replied to: `in_reply_to` is that message's own
-/// `message_id` (see `imap::MessageBody`), and `references` is that
-/// message's own `references` with its `message_id` appended (RFC 5322
-/// section 3.6.4). Neither is validated against the other here — this
-/// command just sets whatever it's given, since it has no way to know
-/// what message either ID is supposed to refer to.
+/// Best-effort IMAP APPEND of a just-sent message to the account's Sent
+/// folder. Skipped for POP3 accounts (no IMAP server) and any account not
+/// found in the local cache. Errors are logged and never returned to the
+/// caller so a Sent-folder failure never blocks the user from sending.
+async fn append_to_sent(account_id: &str, raw_bytes: &[u8]) {
+    let account = match cache::open()
+        .and_then(|conn| cache::get_account(&conn, account_id))
+    {
+        Ok(Some(a)) => a,
+        _ => return,
+    };
+    if account.imap_host.is_empty() {
+        return; // POP3 account — no IMAP server to APPEND to
+    }
+    let result: Result<(), String> = async {
+        let mut session = imap::login_for_account(
+            &account.imap_host,
+            account.imap_port,
+            account_id,
+        )
+        .await?;
+        let append_result = session
+            .append(&account.sent_folder, Some("(\\Seen)"), None, raw_bytes)
+            .await
+            .map_err(|e| format!("APPEND to {} failed: {e}", account.sent_folder));
+
+        // The configured folder name may simply not exist on this server
+        // ("Sent" vs cPanel/Dovecot's "INBOX.Sent") -- resolve the real one
+        // from LIST, retry, and persist the correction so the next send
+        // APPENDs straight to the right place.
+        if let Err(first_error) = append_result {
+            let folders = imap::list_folder_names(&mut session)
+                .await
+                .map_err(|_| first_error.clone())?;
+            let real_folder = imap::resolve_equivalent_folder(&folders, &account.sent_folder)
+                .ok_or(first_error)?;
+            session
+                .append(&real_folder, Some("(\\Seen)"), None, raw_bytes)
+                .await
+                .map_err(|e| format!("APPEND to {real_folder} failed: {e}"))?;
+            imap::persist_folder_correction(account_id, &account.sent_folder, &real_folder);
+        }
+        session.logout().await.ok();
+        Ok(())
+    }
+    .await;
+    if let Err(e) = result {
+        log::warn!("could not save sent message to {}: {e}", account.sent_folder);
+    }
+}
+
+// PGP encrypt is hard-fail — never silently sends plaintext when the caller asked to encrypt.
+// Combining encrypt with html/attachments is also a hard error (PGP here is inline plain text only).
+// Same constraint for S/MIME: encrypting only part of a multipart message is worse than not encrypting.
+// STARTTLS upgrade is mandatory — starttls_relay() refuses to send credentials if the server won't upgrade.
 #[tauri::command]
 pub async fn send_message(
     account_id: String,
@@ -121,6 +160,8 @@ pub async fn send_message(
     port: u16,
     use_starttls: bool,
     to: String,
+    cc: String,
+    bcc: String,
     subject: String,
     body: String,
     html: Option<String>,
@@ -128,6 +169,9 @@ pub async fn send_message(
     in_reply_to: Option<String>,
     references: Vec<String>,
     encrypt: bool,
+    from_override: Option<String>,
+    smime_sign: Option<bool>,
+    smime_encrypt: Option<bool>,
 ) -> Result<(), String> {
     if encrypt && (html.is_some() || !attachments.is_empty()) {
         return Err(
@@ -136,22 +180,67 @@ pub async fn send_message(
         );
     }
 
-    let password = credentials::get_credential(account_id.clone())?;
+    let do_smime_sign = smime_sign.unwrap_or(false);
+    let do_smime_encrypt = smime_encrypt.unwrap_or(false);
 
-    let to_mailbox: Mailbox = to.parse().map_err(|e| format!("invalid to address {to}: {e}"))?;
-    let to_email = to_mailbox.email.to_string();
-    let to_name = to_mailbox.name.clone();
+    if (do_smime_sign || do_smime_encrypt) && (html.is_some() || !attachments.is_empty()) {
+        return Err(
+            "S/MIME signing and encryption only support a plain-text body -- remove the HTML body and attachments, or disable S/MIME"
+                .to_string(),
+        );
+    }
+
+    let to_list = parse_address_list(&to)?;
+    let cc_list = parse_address_list(&cc)?;
+    let bcc_list = parse_address_list(&bcc)?;
+    if to_list.is_empty() {
+        return Err("a message needs at least one To recipient".to_string());
+    }
+
+    // PGP encrypts to one key — adding more recipients would silently leave some unable to decrypt.
+    if encrypt && (to_list.len() > 1 || !cc_list.is_empty() || !bcc_list.is_empty()) {
+        return Err(
+            "PGP encryption supports only a single recipient -- remove Cc/Bcc and any extra To addresses, or disable encryption"
+                .to_string(),
+        );
+    }
+
+    // Reject a spoofed From address -- it must be the account itself or a
+    // configured identity for it. Checking here (not at call sites) so every
+    // code path through send_message enforces the invariant in one place.
+    if let Some(addr) = &from_override {
+        if addr != &account_id {
+            let conn = cache::open().map_err(|e| format!("could not validate from address: {e}"))?;
+            let identities = cache::list_identities(&conn, &account_id)?;
+            if !identities.iter().any(|i| i.address == *addr) {
+                return Err(format!("from address {addr} is not a configured identity for {account_id}"));
+            }
+        }
+    }
+
+    let mut password = credentials::get_credential(account_id.clone())?;
 
     let body = if encrypt {
+        let to_email = to_list[0].email.to_string();
         pgp::encrypt_and_sign(&account_id, &to_email, &body)?
     } else {
         body
     };
 
-    let from = account_id
+    let from_addr = from_override.as_deref().unwrap_or(&account_id);
+    let from = from_addr
         .parse()
-        .map_err(|e| format!("invalid from address {account_id}: {e}"))?;
-    let mut email_builder = Message::builder().from(from).to(to_mailbox).subject(subject);
+        .map_err(|e| format!("invalid from address {from_addr}: {e}"))?;
+    let mut email_builder = Message::builder().from(from).subject(subject);
+    for mailbox in &to_list {
+        email_builder = email_builder.to(mailbox.clone());
+    }
+    for mailbox in &cc_list {
+        email_builder = email_builder.cc(mailbox.clone());
+    }
+    for mailbox in &bcc_list {
+        email_builder = email_builder.bcc(mailbox.clone());
+    }
 
     if let Some(in_reply_to) = &in_reply_to {
         email_builder = email_builder.header(InReplyTo::from(format!("<{in_reply_to}>")));
@@ -161,7 +250,19 @@ pub async fn send_message(
         email_builder = email_builder.header(References::from(joined));
     }
 
-    let email = if html.is_none() && attachments.is_empty() {
+    let email = if do_smime_sign || do_smime_encrypt {
+        let (ct_str, smime_body) = if do_smime_sign {
+            smime::sign_body(&account_id, body.as_bytes())?
+        } else {
+            let to_email = to_list[0].email.to_string();
+            smime::encrypt_body(&to_email, body.as_bytes())?
+        };
+        let ct = ContentType::parse(&ct_str)
+            .map_err(|e| format!("invalid S/MIME content type from openssl: {e}"))?;
+        email_builder
+            .singlepart(SinglePart::builder().header(ct).body(smime_body))
+            .map_err(|e| format!("could not build S/MIME message: {e}"))?
+    } else if html.is_none() && attachments.is_empty() {
         email_builder
             .header(ContentType::TEXT_PLAIN)
             .body(body)
@@ -179,24 +280,139 @@ pub async fn send_message(
     }
     .map_err(|e| format!("could not configure SMTP relay for {host}: {e}"))?;
 
+    let creds = Credentials::new(account_id.clone(), password.clone());
+    password.zeroize();
     let mailer: AsyncSmtpTransport<Tokio1Executor> = builder
         .port(port)
-        .credentials(Credentials::new(account_id, password))
+        .credentials(creds)
         .build();
+
+    // Capture the raw bytes before moving email into the transport. BCC
+    // recipients are in the SMTP envelope but RFC 5322 requires they be
+    // stripped from the message headers, which lettre does automatically --
+    // so these bytes are safe to store as-is.
+    let raw_bytes = email.formatted();
 
     mailer
         .send(email)
         .await
         .map_err(|e| format!("send failed: {e}"))?;
 
-    cache_contact(&to_email, to_name.as_deref());
+    // Harvest every recipient into the contact cache -- sending to someone is
+    // a real correspondence signal regardless of which field they were in.
+    for mailbox in to_list.iter().chain(cc_list.iter()).chain(bcc_list.iter()) {
+        cache_contact(&mailbox.email.to_string(), mailbox.name.as_deref());
+    }
+
+    // Best-effort: save a copy to the account's Sent folder.
+    append_to_sent(&account_id, &raw_bytes).await;
 
     Ok(())
+}
+
+/// Sends an RFC 8098 Message Disposition Notification (MDN) — a read receipt.
+/// Called by the frontend when the user chooses to send one after seeing a
+/// `Disposition-Notification-To` header. The caller must supply:
+/// - `account_id` / SMTP connection params (same as `send_message`)
+/// - `notify_address`: the address from the `Disposition-Notification-To` header
+/// - `original_message_id`: the `Message-ID` of the message being receipted
+/// - `original_subject`: used to compose a human-readable subject line
+/// - `recipient_display_address`: the account's own address/display name
+#[tauri::command]
+pub async fn send_mdn(
+    account_id: String,
+    host: String,
+    port: u16,
+    use_starttls: bool,
+    notify_address: String,
+    original_message_id: String,
+    original_subject: String,
+    recipient_display_address: String,
+) -> Result<(), String> {
+    let mut password = credentials::get_credential(account_id.clone())?;
+
+    let from: Mailbox = recipient_display_address
+        .parse()
+        .map_err(|e| format!("invalid from address {recipient_display_address:?}: {e}"))?;
+    let to: Mailbox = notify_address
+        .parse()
+        .map_err(|e| format!("invalid notify address {notify_address:?}: {e}"))?;
+
+    // RFC 8098 §3.2: the MDN report body is a multipart/report with a human-readable
+    // text/plain part and a message/disposition-notification part.
+    // We use a simplified form that most MUAs will understand.
+    // RFC 8098 §3.2 specifies multipart/report with a machine-readable
+    // message/disposition-notification part. We send a human-readable
+    // text/plain body instead — sufficient for interoperability with
+    // modern MUAs that only surface the human-readable part anyway.
+    let original_id_bare = original_message_id.trim_matches(|c| c == '<' || c == '>');
+    let mdn_body = format!(
+        "This is a read receipt for the message:\r\n\
+         Subject: {original_subject}\r\n\
+         Message-ID: <{original_id_bare}>\r\n\r\n\
+         The message has been displayed.\r\n\
+         \r\nReporting-UA: Helix Mail\r\n\
+         Final-Recipient: rfc822; {}\r\n\
+         Original-Message-ID: <{original_id_bare}>\r\n\
+         Disposition: manual-action/MDN-sent-manually; displayed",
+        from.email,
+    );
+
+    let email = Message::builder()
+        .from(from)
+        .to(to)
+        .subject(format!("Read: {original_subject}"))
+        .header(InReplyTo::from(format!("<{original_id_bare}>")))
+        .body(mdn_body)
+        .map_err(|e| format!("could not build MDN: {e}"))?;
+
+    let creds = Credentials::new(account_id.clone(), password.clone());
+    password.zeroize();
+
+    let mailer = if use_starttls {
+        AsyncSmtpTransport::<Tokio1Executor>::starttls_relay(&host)
+            .map_err(|e| format!("STARTTLS setup failed for {host}: {e}"))?
+            .port(port)
+            .credentials(creds)
+            .build()
+    } else {
+        AsyncSmtpTransport::<Tokio1Executor>::relay(&host)
+            .map_err(|e| format!("relay setup failed for {host}: {e}"))?
+            .port(port)
+            .credentials(creds)
+            .build()
+    };
+
+    mailer
+        .send(email)
+        .await
+        .map(|_| ())
+        .map_err(|e| format!("MDN send failed: {e}"))
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn parse_address_list_handles_empty_single_and_multiple() {
+        assert!(parse_address_list("").expect("empty is ok").is_empty());
+        assert!(parse_address_list("   ").expect("whitespace is ok").is_empty());
+
+        let one = parse_address_list("alice@helix.test").expect("single address");
+        assert_eq!(one.len(), 1);
+        assert_eq!(one[0].email.to_string(), "alice@helix.test");
+
+        let many = parse_address_list("alice@helix.test, Bob <bob@helix.test>").expect("two addresses");
+        assert_eq!(many.len(), 2);
+        assert_eq!(many[1].email.to_string(), "bob@helix.test");
+        assert_eq!(many[1].name.as_deref(), Some("Bob"));
+    }
+
+    #[test]
+    fn parse_address_list_rejects_a_malformed_address() {
+        assert!(parse_address_list("not-an-email").is_err());
+    }
 
     // Hits a real external SMTP server, so it's excluded from the default
     // test run. There's no real credential to send a message with, so
@@ -219,6 +435,8 @@ mod tests {
             465,
             false,
             "nobody@example.com".to_string(),
+            String::new(),
+            String::new(),
             "test".to_string(),
             "test body".to_string(),
             None,
@@ -226,6 +444,9 @@ mod tests {
             None,
             Vec::new(),
             false,
+            None,
+            None,
+            None,
         )
         .await;
 
@@ -261,6 +482,8 @@ mod tests {
             587,
             true,
             "nobody@example.com".to_string(),
+            String::new(),
+            String::new(),
             "test".to_string(),
             "test body".to_string(),
             None,
@@ -268,6 +491,9 @@ mod tests {
             None,
             Vec::new(),
             false,
+            None,
+            None,
+            None,
         )
         .await;
 
@@ -445,6 +671,7 @@ mod tests {
             filename: "notes.txt".to_string(),
             content_type: "text/plain".to_string(),
             content_base64: base64::engine::general_purpose::STANDARD.encode(b"attachment contents"),
+            content_id: None,
         };
         let body = build_multipart_body(
             "This is the plain text body.".to_string(),

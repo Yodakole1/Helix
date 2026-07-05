@@ -27,6 +27,12 @@ export interface SampleMessage {
   encrypted?: boolean;
   pgpSignedBy?: string;
   pgpSignatureValid?: boolean;
+  // S/MIME metadata -- populated by fetch_message_body when the message
+  // carried an S/MIME signature or was S/MIME encrypted.
+  smimeSigned?: boolean;
+  smimeVerified?: boolean | null;
+  smimeEncrypted?: boolean;
+  smimeSignerEmail?: string;
 
   // --- Fields populated after fetch_message_body is called ---
 
@@ -39,11 +45,22 @@ export interface SampleMessage {
   inReplyTo?: string;
   references?: string[];
   replyTo?: string;
+  // Non-null when the sender requested a read receipt (Disposition-Notification-To).
+  dispositionNotificationTo?: string;
   // Set once fetch_message_body has been called, so the reader pane
   // doesn't trigger redundant fetches on every re-render.
   bodyLoaded?: boolean;
   // IMAP UID. For real messages id === uid.
   uid?: number;
+  // POP3 message number (this session). POP3 has no stable UID, so body
+  // fetch and attachment download address messages by this number instead
+  // of a uid. Set only for messages from a POP3 account.
+  pop3Number?: number;
+  // POP3 UIDL -- the stable per-message identifier from the RFC 1939 UIDL
+  // command. Survives across sessions (unlike `pop3Number`), so it is used
+  // as the cache key for offline body/attachment lookups. null for servers
+  // that don't implement UIDL (rare) -- those messages aren't cached.
+  pop3Uidl?: string;
 }
 
 // Whole-calendar-day difference between "now" and the given date.
@@ -87,7 +104,12 @@ export function summaryToMessage(
   const id = summary.uid ?? fallbackIndex;
   return {
     id,
-    uid: id,
+    // Only a real IMAP UID may be used for server mutations -- when the
+    // summary has none, uid stays undefined (id falls back to the list
+    // index purely for React keys/selection) so seen/flag/move calls are
+    // skipped instead of targeting whatever message happens to own the
+    // fabricated UID on the server.
+    uid: summary.uid ?? undefined,
     sender,
     senderEmail,
     to: "",

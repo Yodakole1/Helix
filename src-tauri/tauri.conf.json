@@ -2,7 +2,7 @@
   "$schema": "../node_modules/@tauri-apps/cli/config.schema.json",
   "productName": "Helix",
   "version": "0.1.0",
-  "identifier": "com.tauri.dev",
+  "identifier": "com.helix.helix",
   "build": {
     "frontendDist": "../dist",
     "devUrl": "http://localhost:1420",
@@ -13,14 +13,18 @@
     "windows": [
       {
         "title": "Helix",
-        "width": 800,
-        "height": 600,
+        "width": 1280,
+        "height": 800,
+        "minWidth": 900,
+        "minHeight": 600,
+        "maximized": true,
         "resizable": true,
-        "fullscreen": false
+        "fullscreen": false,
+        "decorations": false
       }
     ],
     "security": {
-      "csp": null
+      "csp": "default-src 'self'; script-src 'self'; style-src 'self' 'unsafe-inline'; img-src 'self' data: blob: asset:; connect-src 'self' ipc: tauri: https://ipc.localhost http://localhost:*; font-src 'self' data:"
     }
   },
   "bundle": {

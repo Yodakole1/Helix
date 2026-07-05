@@ -3,8 +3,14 @@ import { Pressable, StyleSheet, Text, View } from "react-native";
 import { cacheStats, clearCache, type CacheStats } from "../lib/cache";
 import { colors, fontFamily, fontSize, radii, spacing } from "../theme";
 
+export type SyncDepth = "headers" | "bodies";
+
 interface DataStorageSettingsProps {
   accentColor: string;
+  // Controls whether the app eagerly pre-fetches message bodies (and later,
+  // attachments) after loading a folder, or stops at headers (lazy on open).
+  syncDepth: SyncDepth;
+  onSyncDepthChange: (depth: SyncDepth) => void;
 }
 
 type Status = "loading" | "loaded" | "error";
@@ -19,7 +25,7 @@ function formatBytes(bytes: number): string {
 // specifically for this section. clear_cache only ever touches cached
 // message summaries/bodies -- accounts, contacts, and PGP keys survive
 // it, see the doc comment on the Rust side for why.
-export function DataStorageSettings({ accentColor }: DataStorageSettingsProps) {
+export function DataStorageSettings({ accentColor, syncDepth, onSyncDepthChange }: DataStorageSettingsProps) {
   const [status, setStatus] = useState<Status>("loading");
   const [stats, setStats] = useState<CacheStats | null>(null);
   const [errorMessage, setErrorMessage] = useState("");
@@ -55,9 +61,40 @@ export function DataStorageSettings({ accentColor }: DataStorageSettingsProps) {
     }
   }
 
+  const SYNC_OPTIONS: { key: SyncDepth; label: string; desc: string }[] = [
+    { key: "headers", label: "Headers only", desc: "Bodies load on demand when you open a message" },
+    { key: "bodies", label: "Headers + bodies", desc: "Message text pre-fetched when opening a folder" },
+  ];
+
   return (
     <View>
-      <Text style={styles.sectionTitle}>Local encrypted cache</Text>
+      <Text style={styles.sectionTitle}>Automatic sync</Text>
+      <Text style={styles.hint}>
+        Controls how much is downloaded when you open a folder. Attachments are always fetched on demand regardless of
+        this setting.
+      </Text>
+      <View style={styles.syncOptions}>
+        {SYNC_OPTIONS.map((option) => {
+          const active = syncDepth === option.key;
+          return (
+            <Pressable
+              key={option.key}
+              onPress={() => onSyncDepthChange(option.key)}
+              style={[styles.syncOption, active && { borderColor: accentColor }]}
+            >
+              <View style={[styles.syncRadio, active && { borderColor: accentColor }]}>
+                {active && <View style={[styles.syncRadioDot, { backgroundColor: accentColor }]} />}
+              </View>
+              <View style={styles.syncOptionText}>
+                <Text style={[styles.syncOptionLabel, active && { color: accentColor }]}>{option.label}</Text>
+                <Text style={styles.syncOptionDesc}>{option.desc}</Text>
+              </View>
+            </Pressable>
+          );
+        })}
+      </View>
+
+      <Text style={[styles.sectionTitle, { marginTop: spacing.xl }]}>Local encrypted cache</Text>
       <Text style={styles.hint}>
         Cached mail is stored in a SQLCipher-encrypted database on this device, separate from your account
         credentials (OS keychain) and PGP keys (same database, a different table -- clearing the cache below never
@@ -130,6 +167,49 @@ const styles = StyleSheet.create({
     fontSize: fontSize.xs,
     color: colors.accent.amber,
     marginBottom: spacing.md,
+  },
+  syncOptions: {
+    marginBottom: spacing.lg,
+    gap: spacing.sm,
+  },
+  syncOption: {
+    flexDirection: "row",
+    alignItems: "flex-start",
+    padding: spacing.md,
+    borderRadius: radii.sm,
+    borderWidth: 1,
+    borderColor: colors.border.subtle,
+    backgroundColor: colors.background.surface,
+  },
+  syncRadio: {
+    width: 18,
+    height: 18,
+    borderRadius: 9,
+    borderWidth: 2,
+    borderColor: colors.border.subtle,
+    alignItems: "center",
+    justifyContent: "center",
+    marginRight: spacing.sm,
+    marginTop: 1,
+  },
+  syncRadioDot: {
+    width: 8,
+    height: 8,
+    borderRadius: 4,
+  },
+  syncOptionText: { flex: 1 },
+  syncOptionLabel: {
+    fontFamily: fontFamily.ui,
+    fontSize: fontSize.sm,
+    fontWeight: "600",
+    color: colors.text.primary,
+    marginBottom: 2,
+  },
+  syncOptionDesc: {
+    fontFamily: fontFamily.ui,
+    fontSize: fontSize.xs,
+    color: colors.text.muted,
+    lineHeight: 16,
   },
   statsRow: {
     flexDirection: "row",

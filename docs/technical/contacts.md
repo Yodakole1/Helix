@@ -26,6 +26,15 @@ mailbox.
   ORDER BY last_seen_at DESC`). `%`/`_` are stripped from `query` first so
   user input can't be read as extra SQL `LIKE` wildcards. Exposed as the
   `#[tauri::command] search_contacts` wrapper.
+- `cache::list_contacts_in(conn, limit)` -- lists the whole address book
+  most-recently-seen first, for a contact-management view rather than
+  compose-time autocomplete. Exposed as `list_contacts`.
+- `cache::delete_contact_in(conn, email)` -- removes one harvested contact
+  (email lowercased to match storage; deleting a missing one is a no-op
+  success). Exposed as `delete_contact`. Since the address book
+  accumulates automatically from every message read or sent, this is the
+  only way to forget a one-off correspondent or a mistyped address that
+  would otherwise linger in autocomplete forever.
 
 ## Where contacts get harvested from
 
@@ -70,3 +79,17 @@ write-through in `imap.rs`.
   contacts.
 - No ranking beyond "most recently seen first" (e.g. frequency-weighted
   autocomplete).
+
+## Source tagging and the address-book tab (added later)
+
+The `contacts` table gained a `source` column (additive migration via
+`add_column_if_missing`; default `'local'`). Mail harvesting and manual
+adds write `'local'`; CardDAV sync writes `'carddav:<source_id>'` (an
+upsert conflict keeps the existing row's source). `list_contacts`/
+`search_contacts` take an optional source filter, and two new commands --
+`update_contact` (rename: set/clear display name; the email is the row's
+identity) and `add_contact` (manual add, validated to contain `@`) --
+back the address-book tab (`src/components/AddressBookView.tsx`): a
+full-page contacts view opened from the sidebar, with the sidebar listing
+the available books (All / Collected locally / each CardDAV book) as the
+filter, plus search, inline rename, add, remove, and per-book sync.

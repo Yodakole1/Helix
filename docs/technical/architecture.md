@@ -13,7 +13,8 @@
 
 ## Why React Native Web instead of plain React?
 
-Helix's goal is one codebase across desktop and mobile. Writing components
+Helix's goal is one codebase across desktop (Windows, macOS, Linux) and,
+later, mobile (iOS/Android). Writing components
 against the React Native API means the same component tree can run on web
 today (via `react-native-web`) and on iOS/Android later (via real React
 Native), instead of maintaining separate UIs per platform.

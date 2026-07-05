@@ -83,10 +83,13 @@ before grouping, same as `fetch_messages` does.
   where the direct parent isn't in the fetch window (e.g. a reply thread
   starting outside the `limit` window), which this treats the same way as
   orphaned replies: the reply becomes its own root.
-- **Frontend wiring**: `fetch_threaded_messages` is a real backend
-  command, but the frontend still calls `fetch_messages` and displays a
-  flat list. Wiring the threaded view is frontend work tracked in
-  `frontend-roadmap.md`.
+- **Frontend wiring**: now done. A Settings > General "Conversation view"
+  toggle switches `App.tsx`'s `loadFolder` to `fetch_threaded_messages`;
+  `buildThreadData` flattens the returned tree into store rows plus a
+  `ThreadMeta` grouping that `MessageList` re-applies to show one row per
+  conversation with replies expandable. Off in the unified inbox and while
+  searching; a threaded fetch that fails falls back to the flat path. See
+  the per-feature docs in `docs/technical/`.
 
 ## Verification
 

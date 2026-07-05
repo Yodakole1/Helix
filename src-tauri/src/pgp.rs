@@ -191,6 +191,39 @@ pub fn import_contact_key(email: String, armored_public_key: String) -> Result<S
     import_contact_key_in(&conn, email, armored_public_key)
 }
 
+/// Lists every account's own key (public half only) so the key-management
+/// UI can redisplay what's stored after a reload -- without this, the only
+/// keys visible are whatever was imported in the current session. The
+/// secret half never leaves `cache.rs`, so `StoredOwnKey` carries no
+/// secret to hand back.
+#[tauri::command]
+pub fn list_own_keys() -> Result<Vec<cache::StoredOwnKey>, String> {
+    let conn = cache::open()?;
+    cache::list_own_keys(&conn)
+}
+
+/// Lists every imported recipient public key, for the same redisplay-
+/// after-reload reason as `list_own_keys`.
+#[tauri::command]
+pub fn list_contact_keys() -> Result<Vec<cache::StoredContactKey>, String> {
+    let conn = cache::open()?;
+    cache::list_contact_keys(&conn)
+}
+
+/// Forgets an account's own keypair (e.g. to revoke or replace it).
+#[tauri::command]
+pub fn delete_own_key(account_id: String) -> Result<(), String> {
+    let conn = cache::open()?;
+    cache::delete_own_key(&conn, &account_id)
+}
+
+/// Forgets a recipient's imported public key.
+#[tauri::command]
+pub fn delete_contact_key(email: String) -> Result<(), String> {
+    let conn = cache::open()?;
+    cache::delete_contact_key(&conn, &email)
+}
+
 fn encryption_subkey(public_key: &SignedPublicKey) -> Result<&pgp::composed::SignedPublicSubKey, String> {
     public_key
         .public_subkeys
@@ -337,6 +370,86 @@ pub fn maybe_decrypt(account_id: &str, sender_email: Option<&str>, body: Message
     maybe_decrypt_in(&conn, account_id, sender_email, body)
 }
 
+// ---------------------------------------------------------------------------
+// Web Key Directory (WKD) auto-discovery -- RFC 9580 / draft-ietf-openpgp-wks
+// ---------------------------------------------------------------------------
+
+/// Fetches a contact's OpenPGP public key via WKD (Web Key Directory) and
+/// returns it for the caller to review and import explicitly. Does NOT
+/// auto-import -- the frontend calls `import_contact_key` after showing
+/// the fingerprint to the user, so there's a clear user-visible action
+/// rather than silently writing to the keystore.
+///
+/// Returns `Err` if WKD is not available for the domain, the key cannot
+/// be fetched, or the key cannot be parsed.
+///
+/// The WKD URL is built using the "direct method": the hash is the first ten
+/// bytes of the SHA-1 hash of the lowercased local-part, z-base-32 encoded.
+/// Most public mail providers (Proton, Fastmail, many others) publish keys
+/// this way; it's the approach with the widest deployment.
+#[tauri::command]
+pub async fn discover_pgp_key_wkd(email: String) -> Result<PublicKeyInfo, String> {
+    let (local, domain) = email
+        .split_once('@')
+        .ok_or_else(|| format!("invalid email address: {email}"))?;
+
+    // SHA-1 of the lowercased local-part, take the first 10 bytes.
+    use sha1::{Digest, Sha1};
+    let hash_bytes = Sha1::digest(local.to_lowercase().as_bytes());
+    let hash10 = &hash_bytes[..10];
+
+    // z-base-32 encode: custom alphabet used by the WKD spec.
+    let zbase32_alphabet = b"ybndrfg8ejkmcpqxot1uwisza345h769";
+    let mut encoded = String::new();
+    let mut buf: u32 = 0;
+    let mut bits: u8 = 0;
+    for &byte in hash10 {
+        buf = (buf << 8) | (byte as u32);
+        bits += 8;
+        while bits >= 5 {
+            bits -= 5;
+            encoded.push(zbase32_alphabet[((buf >> bits) & 0x1f) as usize] as char);
+        }
+    }
+    if bits > 0 {
+        encoded.push(zbase32_alphabet[((buf << (5 - bits)) & 0x1f) as usize] as char);
+    }
+
+    // Fetch from the WKD direct method URL.
+    let url = format!(
+        "https://{}/.well-known/openpgpkey/hu/{}?l={}",
+        domain, encoded, local
+    );
+    let response = reqwest::Client::new()
+        .get(&url)
+        .send()
+        .await
+        .map_err(|e| format!("WKD fetch failed for {email}: {e}"))?;
+
+    if !response.status().is_success() {
+        return Err(format!(
+            "WKD key not found for {email} (HTTP {})",
+            response.status()
+        ));
+    }
+
+    let key_bytes = response
+        .bytes()
+        .await
+        .map_err(|e| format!("could not read WKD response for {email}: {e}"))?;
+
+    // The WKD response is binary (Transferable Public Key format), not armored.
+    let key = SignedPublicKey::from_bytes(std::io::Cursor::new(&key_bytes))
+        .map_err(|e| format!("could not parse WKD key for {email}: {e}"))?;
+
+    let fingerprint = fingerprint_hex(&key);
+    let public_key = key
+        .to_armored_string(Default::default())
+        .map_err(|e| format!("could not armor WKD key: {e}"))?;
+
+    Ok(PublicKeyInfo { public_key, fingerprint })
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -434,6 +547,45 @@ mod tests {
     }
 
     #[test]
+    fn lists_and_deletes_own_and_contact_keys() {
+        let conn = temp_connection("list-delete");
+
+        generate_keypair_in(&conn, "alice@helix.test".to_string(), "Alice".to_string())
+            .expect("keygen should succeed");
+        generate_keypair_in(&conn, "bob@helix.test".to_string(), "Bob".to_string()).expect("keygen should succeed");
+
+        let own = cache::list_own_keys(&conn).expect("list own keys should succeed");
+        assert_eq!(own.len(), 2, "both generated identities should be listed");
+        // The listing must never expose the secret half -- StoredOwnKey has
+        // no field for it, this asserts the public half is what's returned.
+        assert!(own.iter().all(|k| k.public_key.contains("BEGIN PGP PUBLIC KEY")));
+
+        let alice_public_key = export_public_key_in(&conn, "alice@helix.test")
+            .expect("export should succeed")
+            .public_key;
+        import_contact_key_in(&conn, "Alice@Helix.test".to_string(), alice_public_key).expect("import should succeed");
+
+        let contacts = cache::list_contact_keys(&conn).expect("list contact keys should succeed");
+        assert_eq!(contacts.len(), 1);
+        assert_eq!(contacts[0].email, "alice@helix.test", "email should be stored lowercased");
+
+        cache::delete_own_key(&conn, "alice@helix.test").expect("delete own key should succeed");
+        assert_eq!(cache::list_own_keys(&conn).unwrap().len(), 1, "alice's key should be gone");
+        assert!(
+            cache::get_own_key(&conn, "alice@helix.test").unwrap().is_none(),
+            "deleted own key must not be retrievable"
+        );
+
+        // Delete is keyed case-insensitively, same as import/lookup.
+        cache::delete_contact_key(&conn, "ALICE@helix.test").expect("delete contact key should succeed");
+        assert!(cache::list_contact_keys(&conn).unwrap().is_empty(), "alice's contact key should be gone");
+
+        // Deleting something already absent is a no-op success, not an error.
+        cache::delete_own_key(&conn, "nobody@helix.test").expect("deleting absent own key should be ok");
+        cache::delete_contact_key(&conn, "nobody@helix.test").expect("deleting absent contact key should be ok");
+    }
+
+    #[test]
     fn maybe_decrypt_leaves_ordinary_mail_untouched() {
         let conn = temp_connection("ordinary-mail");
 
@@ -443,6 +595,10 @@ mod tests {
             attachments: Vec::<AttachmentInfo>::new(),
             pgp_signed_by: None,
             pgp_signature_valid: None,
+            smime_signed: false,
+            smime_verified: None,
+            smime_encrypted: false,
+            smime_signer_email: None,
             from: None,
             to: Vec::new(),
             cc: Vec::new(),
@@ -450,6 +606,7 @@ mod tests {
             message_id: None,
             in_reply_to: None,
             references: Vec::new(),
+            disposition_notification_to: None,
         };
 
         let result = maybe_decrypt_in(&conn, "alice@helix.test", Some("someone@helix.test"), body);

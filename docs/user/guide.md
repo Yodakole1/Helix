@@ -1,158 +1,230 @@
 # Using Helix
 
-A walkthrough of what's actually usable today. See `docs/user/overview.md`
-first for the real-vs-sample-data distinction this guide assumes throughout
--- in short: account setup, PGP keys, notifications, the local cache,
-templates, rules, and shortcuts are real; the inbox you read and write mail
-in is still a sample-data preview.
+The full manual. Everything described here is real, working behavior in
+the current build, on all three desktop platforms Helix runs on (Windows,
+macOS, Linux); mobile apps (iOS/Android) are planned but not built yet.
+Getting Helix onto your machine in the first place is covered in
+[installation.md](installation.md).
 
-## Connecting an account
+## Adding an account
 
-The welcome screen's "Add account" button, or Settings > Accounts' "+ Add
-account" button, both open the same connect-an-account dialog:
+The welcome screen's "Add your first account" button -- or, once you have
+one, Settings > Accounts > "Add account" -- opens the account setup page
+(it opens as its own tab, so it never blocks the rest of the app):
 
 1. Enter a display name (optional), your email address, and your password
-   (an app-specific password, if your provider requires one for IMAP/SMTP
-   access).
-2. Leave "advanced server settings" collapsed and Helix will try to
-   auto-detect your IMAP/SMTP host and port from your email address. If
-   that fails, or you need a non-default setup, expand it and enter the
-   IMAP host/port and SMTP host/port (and whether SMTP uses STARTTLS)
-   yourself.
-3. Press Connect. Helix verifies the login against your real IMAP server
-   before saving anything -- if it fails, nothing is stored. If it
-   succeeds, the password goes straight into your OS's keychain (never into
-   app storage), and the account's connection details are saved.
+   (an app-specific password if your provider requires one for IMAP/SMTP).
+2. Pick the incoming protocol: IMAP (default, recommended) or POP3.
+3. With "advanced server settings" collapsed, Helix auto-detects your
+   IMAP/SMTP host and port from your email address. Expand it to enter
+   hosts, ports, and STARTTLS settings yourself (POP3 always needs manual
+   entry -- it has no auto-discovery).
+4. Press Connect. Helix verifies the login against the real server before
+   saving anything; on failure nothing is stored. On success the password
+   goes into your OS keychain and Helix reads the server's actual folder
+   list to find your real Sent/Trash/Archive/Drafts/Spam folders --
+   including providers that call them `INBOX.Sent` or `[Gmail]/Sent Mail`.
+5. Helix then checks whether the same provider offers a **calendar
+   (CalDAV)** and an **address book (CardDAV)** with the same credentials,
+   and shows a checkmark per service. Press Continue to add whatever
+   worked and open your inbox; anything that didn't work can be added
+   later from Settings, and "Skip, just mail" sets up only the mailbox.
 
-The account now shows up in Settings > Accounts' "Connected accounts" list,
-with a Remove button. It does **not** yet show up in the sidebar or change
-what mail you see -- the sidebar's account list is still the sample-data
-one described in the overview. Connecting an account today is for setting
-up and testing the real onboarding/PGP/notification features below, not yet
-for reading your real mail in the main window.
+Remove or edit an account later from Settings > Accounts. Removing an
+account deletes its keychain credential and its cached mail.
 
-## The three-pane layout
+## The window
 
-- **Sidebar** (left): your accounts, each with its own folder tree and
-  accent color. Click an account to switch to it; click a folder to open
-  it. Right-click an account to rename it or pick a different color.
-- **Message list** (middle): the open folder's messages. Search reaches
-  every folder in the account at once; the filter panel (funnel icon) and
-  sort menu stay scoped to the open folder. The refresh icon re-applies
-  your rules (see below) -- it doesn't fetch new mail yet.
-- **Reader pane** (right): the selected message. On narrower windows the
-  sidebar becomes a dismissable overlay (corner menu button), and below
-  that, the list and reader pane share one view with a back button.
+Helix draws its own window title bar. From left to right:
 
-## Reading and organizing mail
+- **Tabs.** Browser-style tabs, each an independent view -- a mailbox
+  (any account/folder), the calendar, or the address book. `+` opens a
+  new tab; tabs shrink evenly as more open, exactly like a browser, so
+  they always fit. `Ctrl+Tab` / `Ctrl+Shift+Tab` cycle through them.
+- **Drag space.** The empty middle is the window drag area; double-click
+  it to maximize.
+- **Search.** Searches the open account's mail: what's on screen narrows
+  instantly, the server is searched live over IMAP, and the local offline
+  index (every message Helix has ever cached, across folders) fills in
+  matches the live window misses. The funnel button opens structured
+  filters -- From, To, date ranges, unread/starred/has-attachment.
+  Press `/` to focus search from anywhere.
+- **Refresh.** Re-fetches the open folder and re-applies your rules.
+- **Window controls.** Minimize, maximize, close.
 
-- **Reply / Reply All / Forward**: buttons in the reader pane's header.
-  Reply-All includes any Cc participants on the original message; Forward
-  starts with an empty "To" and a labeled block of the original message
-  instead of quoting it.
-- **Star, archive, mark as spam, delete, mark unread**: the icon row next
-  to Reply. All of these persist for your session.
-- **Remote images**: blocked by default in HTML messages, with a "Show
-  images" link per message if you want to load them anyway (Settings >
-  Privacy & Security controls the default).
-- **Attachments**: shown per message with name and size. Downloading isn't
-  available yet -- see the overview for why.
-- **Light/dark content toggle**: per-message, for mail that's unreadable in
-  Helix's dark theme.
-- **Unified inbox**: Settings > General > "Unified inbox" merges every
-  account's Inbox into one list, tagging each row with its account.
+Below that, the classic three panes: **sidebar** (accounts and folders),
+**message list**, and **reader pane**, with draggable dividers. On narrow
+windows the sidebar becomes an overlay and the list/reader stack into one
+view with a back button.
 
-### Rules & auto-sorting
+## The sidebar
 
-Settings > Rules:
+- Click an account to switch to it; click again to collapse its folder
+  tree. Right-click an account to rename it or change its color -- that
+  color follows the account everywhere (tabs, highlights, badges).
+- Folders show live unread counts. Right-click a folder to rename, empty,
+  or delete it. "+ New folder" creates a real folder on the server (Helix
+  handles servers that require an `INBOX.` prefix automatically).
+- The footer buttons open the **Calendar** tab, the **Address Book** tab,
+  and **Settings**.
 
-1. Press "+ New rule."
-2. Give it a name.
-3. Add one or more conditions: a field (From, Subject, or To) contains some
-   text. All conditions on a rule must match.
-4. Add one or more actions: move to a folder, mark as read, or star.
-5. Save. Toggle a rule off without deleting it via the switch next to its
-   name.
+## Reading mail
 
-Rules run when you open a folder or switch accounts, and when you press the
-message list's refresh button -- see "How rules run" in the overview for
-why there's no fully automatic background version yet.
+- Click a message to open it. Opening marks it read on the server;
+  "mark unread" is in the action row.
+- **Action row**: star, archive, spam, delete, snooze, mark unread, print,
+  view source, mute thread. Moves and deletes show up in the destination
+  folder immediately.
+- **Remote images** are blocked by default (they're how senders track
+  you). Per message you can load them once, or allow a sender's domain
+  permanently; the default lives in Settings > Privacy & Security.
+- **Attachments** are listed with name and size -- click to download.
+  Calendar invites (.ics) render as a card with Accept / Tentative /
+  Decline buttons that reply to the organizer.
+- **Conversation view** (Settings > General) groups a folder into
+  threads: one row per conversation, expandable to its replies.
+- **Snooze** hides a message until a time you pick; it comes back to the
+  list when due.
+- **Spam**: "Move to spam" also trains the local Bayesian filter; the
+  spam folder's banner has "Not spam" which moves the message back and
+  untrains it. Suspected spam is flagged in the list.
+- **Read receipts**: when a sender requests one, Helix asks you -- it
+  never confirms you read something on its own.
 
-### Templates / Quick Parts
+## Writing mail
 
-In Compose, the Templates button (next to Attach) opens a list of your
-saved templates -- click one to insert it. If your draft already has text,
-the template is appended rather than replacing it. To save a new one, type
-your draft, open the Templates list, and use "Save current draft as
-template." Manage (and delete) saved templates from Settings > Templates.
+Compose (the sidebar button or `C`) opens a docked window in the corner,
+so you can keep reading while you write.
 
-## Composing
+- **Recipients**: type an address and press Enter or comma; autocomplete
+  draws from your real address book. Cc/Bcc expand from the To row.
+- **From**: with more than one account, pick which one sends; an account
+  with send-as aliases (Settings > Accounts) gets an address picker too.
+- **Formatting**: compose is rich text by default -- bold, italic,
+  underline, bulleted and numbered lists, and links (select text, press
+  the link button, type the URL) all work directly. The "RT" button
+  switches to plain text and back; PGP-encrypted mail always sends as
+  plain text.
+- **Attachments**: the paperclip stages files as chips showing name and
+  size. Attaching a file with the same name again *replaces* it and marks
+  the chip "v2" -- updating a document never silently duplicates it.
+  Large images get a **Shrink** button that resizes and re-encodes them
+  (a phone photo drops from ~8 MB to well under 1 MB) before sending.
+- **Templates**: insert a saved snippet or save the current draft as one.
+- **Drafts** auto-save every few seconds -- locally and to the server's
+  Drafts folder, so other clients see them too. Closing compose discards
+  the draft deliberately; the saved copy is removed.
+- **Send later**: pick a date and time; the message waits in the outbox.
+- **Undo send**: after Send, a toast gives you a few seconds to change
+  your mind before the message actually leaves. When it does, your Sent
+  folder updates on its own.
+- **Encrypt** (PGP): requires the recipient's public key -- Helix looks
+  one up automatically (WKD) and tells you per recipient whether it found
+  one. S/MIME signing/encryption is under the same options once a
+  certificate is imported in Settings.
 
-- **To/Cc/Bcc**: type an address and press comma or Enter to commit it as a
-  chip; Backspace on an empty field removes the last chip. Suggestions
-  appear as you type (drawn from sample senders today, not a real address
-  book yet).
-- **Attach**: picks real files from your filesystem and shows them as
-  chips -- they aren't sent anywhere yet, since Send itself isn't wired up.
-- **Formatting toolbar**: visual only for now: it doesn't yet format the
-  message body.
-- **Encrypt toggle**: flips local state only -- see the overview for why
-  this isn't real encryption yet, even though the key management behind it
-  is.
-- **Signature**: set one in Settings > General; it pre-fills a blank new
-  draft (never overwrites one already in progress).
+## Calendar
 
-## Keyboard shortcuts
+The sidebar's Calendar button opens the calendar tab; the sidebar then
+lists your connected calendars.
+
+- Calendars come from CalDAV -- added during account setup or later via
+  "Add calendar" (username + password is usually enough; Helix finds the
+  server itself).
+- Create events by clicking a day; edit or delete by clicking an event.
+  Events support location, description, recurrence, and a reminder.
+- **Reminders**: Helix checks upcoming events and fires a desktop
+  notification shortly before each one starts. Configure the lead time
+  (or turn reminders off) in Settings > Notifications.
+
+## Address book
+
+The sidebar's Address Book button opens the contacts tab. The sidebar
+then lists your address books: everything, the locally collected
+contacts, and each synced CardDAV book -- click one to filter.
+
+- Contacts accumulate automatically from mail you read and send; CardDAV
+  books sync on demand (Sync button) and during account setup.
+- Add a contact manually, rename one (Edit), or remove one. Removing a
+  locally-collected contact only forgets it locally -- it returns if you
+  correspond with that address again.
+- Compose autocomplete reads from this same address book.
+
+## App lock
+
+Settings > Privacy & Security > App lock. Both methods are optional:
+
+- **Password**: set one and Helix shows a lock screen once per start;
+  the password itself is never stored, only a hash.
+- **Security key (passkey)**: enroll a FIDO2 key (YubiKey or similar);
+  unlocking means plugging it in and touching it. If the key has a PIN,
+  Helix asks for it. Security-key support is a compile-time option: a
+  default build shows "Not available in this build" here, and the fix is
+  a build with the `passkey` feature (on Linux, install `libudev-dev`
+  first) -- see [the installation guide](installation.md) for the exact
+  commands. The password lock works in every build.
+
+With both set, either unlocks. With neither, Helix opens straight to
+your mail. Unlocking lasts until you close the app.
+
+## Settings
+
+Settings stage your changes: nothing applies until you press **Save**
+(applies, stays open) or **Done** (applies and closes). Closing any other
+way discards the changes.
+
+- **General**: compact list, unified inbox, conversation view, separate
+  unread/read sections, signature.
+- **Accounts**: connected accounts, add/edit/remove, send-as aliases.
+- **Appearance**: text size (Small / Default / Large / Larger), accent
+  color per account, typography. Dark is the only theme, by design.
+- **Notifications**: OS permission, new-mail notifications, calendar
+  reminders and their lead time.
+- **Privacy & Security**: remote-image blocking, read receipts, encrypt
+  by default, the app lock, PGP keys, S/MIME certificates.
+- **Contacts / Calendar**: CardDAV and CalDAV sources.
+- **Data & Storage**: cache size and clearing, sync depth (headers only
+  vs. pre-fetching bodies for offline reading).
+- **Rules**: if-this-then-that auto-sorting (conditions on From/Subject/
+  To; actions: move, mark read, star). Rules run when a folder loads and
+  on refresh.
+- **Templates**: manage saved compose templates.
+- **Shortcuts**: every shortcut, each rebindable -- click a combo and
+  press the new keys.
+- **About**: project info, source link, and a way to support development.
+
+## Keyboard shortcuts (defaults)
 
 | Key | Action |
 |---|---|
-| `C` | Compose a new message |
-| `/` | Focus the search box |
-| `R` | Reply to the open message |
-| `A` | Reply all |
-| `F` | Forward |
-| `E` | Archive the open message |
-| `Backspace` / `Delete` | Trash the open message |
-| `Cmd/Ctrl + ,` | Open Settings |
-| `Esc` | Close the open dialog |
+| `C` | Compose |
+| `/` | Focus search |
+| `R` / `A` / `F` | Reply / Reply all / Forward |
+| `E` | Archive |
+| `Backspace` | Trash |
+| `S` | Star / unstar |
+| `Shift+U` | Mark unread |
+| `Shift+I` | Mark all read |
+| `J` / `K` | Next / previous message |
+| `Shift+R` | Refresh |
+| `Ctrl+Tab` / `Ctrl+Shift+Tab` | Next / previous tab |
+| `Ctrl/Cmd+,` | Settings |
+| `Esc` | Close dialog |
 
-These are inactive while you're typing in a text field, or while a dialog
-is open, so they won't fire by accident. Fixed for now -- not yet
-rebindable. The same list is always available in Settings > Shortcuts.
+All except the tab switcher are rebindable in Settings > Shortcuts, and
+are inactive while typing in a text field.
 
-## Settings tour
+## Privacy notes
 
-- **Accounts**: the sample account list the rest of the app reads from,
-  plus the real "Connected accounts" list described above.
-- **Notifications**: request OS notification permission and send a test
-  notification. "Notify on new mail" is saved but won't fire yet -- there's
-  no new-mail detection in Helix yet for it to react to.
-- **Data & Storage**: real local cache size/message count, and a real
-  "Clear cache" (this only clears cached mail, never your accounts,
-  contacts, or PGP keys).
-- **Shortcuts**: reference list, see above.
-- **Templates**: manage saved Compose templates.
-- **Rules**: manage auto-sorting rules.
-- **Appearance**: pick the active account's accent color (click a swatch);
-  typography preview. Dark mode is the only mode -- Helix is OLED-first by
-  design.
-- **Privacy & Security**: block remote images, read receipts (off, and
-  not implemented either way), default Encrypt state for new drafts, and
-  PGP key management (generate/import a keypair for the active account,
-  export your public key, import a contact's public key).
-- **General**: compact message list density, unified inbox, signature.
-- **About**: project info and links.
-
-## Privacy and security notes
-
-- Account passwords go straight to your OS's credential store (Secret
-  Service on Linux, Keychain on macOS, Credential Manager on Windows) --
-  never into Helix's own storage, and never read back into the app except
-  at the moment you connect an account.
-- The local cache (used for stats/clearing today, and for future offline
-  reading) is SQLCipher-encrypted at rest, with its own key in your OS
+- Passwords go only to your OS credential store (Secret Service on
+  Linux, Keychain on macOS, Credential Manager on Windows), never into
+  Helix's own storage.
+- Cached mail, contacts, calendar events, and PGP/S-MIME key material
+  live in a SQLCipher-encrypted database whose key is itself in the OS
   keychain.
-- PGP keys you generate or import are stored in that same encrypted cache.
-  There's no separate passphrase on the secret key beyond that -- it relies
-  on your OS account's own security, the same as every other app that uses
-  your keychain.
+- Helix never phones home. There is no telemetry, no crash reporting
+  service, no update pings -- the only servers it talks to are yours.
+- Helix will not add read receipts on outgoing mail, tracking pixels, or
+  link tracking. Knowing whether your recipient opened your mail requires
+  spying on them; Helix blocks that when others do it and won't do it
+  for you.

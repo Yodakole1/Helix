@@ -1,6 +1,6 @@
 import { calendarDayDiff, type SampleMessage } from "../data/messages";
 
-export type SortKey = "newest" | "oldest" | "sender" | "unread";
+export type SortKey = "newest" | "oldest";
 export type DateRange = "any" | "today" | "7days" | "30days" | "custom";
 
 function currentYearMonth(): string {
@@ -16,6 +16,10 @@ export interface MessageFilters {
   // "YYYY-MM" -- only meaningful when dateRange === "custom".
   customFrom: string;
   customTo: string;
+  // Tri-state filters: null = don't filter, true = only matching, false = only non-matching.
+  isUnread: boolean | null;
+  isFlagged: boolean | null;
+  hasAttachment: boolean | null;
 }
 
 export const DEFAULT_FILTERS: MessageFilters = {
@@ -25,13 +29,17 @@ export const DEFAULT_FILTERS: MessageFilters = {
   dateRange: "any",
   customFrom: currentYearMonth(),
   customTo: currentYearMonth(),
+  isUnread: null,
+  isFlagged: null,
+  hasAttachment: null,
 };
 
+// Just the two: date-based ordering is the only sort that earns its place
+// in the menu (sender/unread groupings are covered by filters and the
+// unread-section setting instead).
 export const SORT_OPTIONS: { key: SortKey; label: string }[] = [
   { key: "newest", label: "Newest first" },
   { key: "oldest", label: "Oldest first" },
-  { key: "sender", label: "Sender A-Z" },
-  { key: "unread", label: "Unread first" },
 ];
 
 export const DATE_RANGE_OPTIONS: { key: DateRange; label: string }[] = [
@@ -79,7 +87,15 @@ function withinDateRange(iso: string, filters: MessageFilters): boolean {
 }
 
 export function hasActiveFilters(filters: MessageFilters): boolean {
-  return filters.query.trim() !== "" || filters.from.trim() !== "" || filters.to.trim() !== "" || filters.dateRange !== "any";
+  return (
+    filters.query.trim() !== "" ||
+    filters.from.trim() !== "" ||
+    filters.to.trim() !== "" ||
+    filters.dateRange !== "any" ||
+    filters.isUnread !== null ||
+    filters.isFlagged !== null ||
+    filters.hasAttachment !== null
+  );
 }
 
 export function filterMessages<T extends SampleMessage>(messages: T[], filters: MessageFilters): T[] {
@@ -95,25 +111,22 @@ export function filterMessages<T extends SampleMessage>(messages: T[], filters: 
     if (from && !`${message.sender} ${message.senderEmail}`.toLowerCase().includes(from)) return false;
     if (to && !message.to.toLowerCase().includes(to)) return false;
     if (!withinDateRange(message.date, filters)) return false;
+    if (filters.isUnread !== null && Boolean(message.unread) !== filters.isUnread) return false;
+    if (filters.isFlagged !== null && Boolean(message.starred) !== filters.isFlagged) return false;
+    if (filters.hasAttachment !== null) {
+      const attached = (message.realAttachments?.length ?? 0) > 0;
+      if (attached !== filters.hasAttachment) return false;
+    }
     return true;
   });
 }
 
 export function sortMessages<T extends SampleMessage>(messages: T[], sortKey: SortKey): T[] {
   const sorted = [...messages];
-  switch (sortKey) {
-    case "newest":
-      sorted.sort((a, b) => new Date(b.date).getTime() - new Date(a.date).getTime());
-      break;
-    case "oldest":
-      sorted.sort((a, b) => new Date(a.date).getTime() - new Date(b.date).getTime());
-      break;
-    case "sender":
-      sorted.sort((a, b) => a.sender.localeCompare(b.sender));
-      break;
-    case "unread":
-      sorted.sort((a, b) => Number(b.unread) - Number(a.unread));
-      break;
+  if (sortKey === "oldest") {
+    sorted.sort((a, b) => new Date(a.date).getTime() - new Date(b.date).getTime());
+  } else {
+    sorted.sort((a, b) => new Date(b.date).getTime() - new Date(a.date).getTime());
   }
   return sorted;
 }

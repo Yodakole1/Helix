@@ -1,32 +1,24 @@
-import { useEffect, useRef, useState } from "react";
-import { Animated, Easing, FlatList, Pressable, StyleSheet, Text, TextInput, View } from "react-native";
+import { useEffect, useState } from "react";
+import { FlatList, Pressable, StyleSheet, Text, View } from "react-native";
 import { resolveAccountColor, resolveAccountLabel, type AccountOverrides, type MailAccount } from "../data/accounts";
 import { folderLabel } from "../data/folders";
 import { formatMessageTime } from "../data/messages";
 import { useAnchorRect } from "../hooks/useAnchorRect";
-import type { MessageWithFolder } from "../hooks/useMessageStore";
+import type { MessageWithFolder, ThreadMeta } from "../hooks/useMessageStore";
 import type { HoverState } from "../lib/pressable";
 import {
-  DATE_RANGE_OPTIONS,
-  DEFAULT_FILTERS,
   filterMessages,
-  hasActiveFilters,
-  MONTH_OPTIONS,
   sortMessages,
   SORT_OPTIONS,
-  yearOptions,
   type MessageFilters,
   type SortKey,
 } from "../lib/messageFilters";
 import { glassPanel } from "../lib/webStyle";
 import type { AccountId } from "../theme";
-import { colorForIndex, colors, fontFamily, fontSize, radii, spacing } from "../theme";
-import { Dropdown } from "./Dropdown";
+import { colorForKey, colors, fontFamily, fontSize, radii, spacing, withAlpha } from "../theme";
 import { FloatingPortal } from "./FloatingPortal";
 import { ListIcon } from "./ListIcon";
 import { Tooltip } from "./Tooltip";
-
-const YEAR_OPTIONS = yearOptions();
 
 interface MessageListProps {
   accountId: AccountId;
@@ -48,10 +40,28 @@ interface MessageListProps {
   onToggleStar: (id: number, accountId: AccountId, folder: string) => void;
   compact: boolean;
   width: number | "100%";
-  focusSearchSignal?: number;
-  onApplyRules?: () => void;
-  // Triggers a real fetch_messages call for the current folder.
-  onRefresh?: () => void;
+  // Search query + structured filters, owned by App and edited from the
+  // title bar's search box / filter panel (they moved there with the
+  // custom-title-bar redesign); this component only applies them.
+  filters: MessageFilters;
+  // Settings' "Separate unread from read": unread messages group into a
+  // labelled section above the read ones.
+  separateUnread?: boolean;
+  // Marks every message in the current folder read (mark_folder_seen).
+  onMarkAllRead?: () => void;
+  // Runs a server-side IMAP search and local FTS for the typed query
+  // (debounced). The client-side filter still does the live narrowing;
+  // this just widens the pool it draws from. The optional structured
+  // filters are forwarded to the local FTS layer (which supports them);
+  // IMAP search always uses just the text query.
+  onSearch?: (query: string, filters?: { fromFilter?: string; isUnread?: boolean | null; isFlagged?: boolean | null; hasAttachment?: boolean | null }) => void;
+  // Batch (multi-select) actions, called with the selected message ids.
+  onBatchMarkRead?: (ids: number[], read: boolean) => void;
+  onBatchStar?: (ids: number[], starred: boolean) => void;
+  onBatchMove?: (ids: number[], dest: "archive" | "trash") => void;
+  // When set (conversation view on), messages are grouped into threads:
+  // only roots show until expanded. Absent/undefined = flat list.
+  threads?: ThreadMeta;
 }
 
 export function MessageList({
@@ -68,94 +78,194 @@ export function MessageList({
   onToggleStar,
   compact,
   width,
-  focusSearchSignal,
-  onApplyRules,
-  onRefresh,
+  filters,
+  separateUnread = false,
+  onMarkAllRead,
+  onSearch,
+  onBatchMarkRead,
+  onBatchStar,
+  onBatchMove,
+  threads,
 }: MessageListProps) {
   const currentFolderLabel = unified ? "Unified Inbox" : folderLabel(folder);
+  const unreadCount = allMessages.filter((message) => message.unread).length;
+  const hasUnread = unreadCount > 0;
 
-  const searchInputRef = useRef<TextInput>(null);
-  useEffect(() => {
-    if (focusSearchSignal !== undefined) searchInputRef.current?.focus();
-  }, [focusSearchSignal]);
+  // Which thread roots are expanded. Collapsed by default -- a folder opens
+  // showing one row per conversation, expandable on demand.
+  const [expandedThreads, setExpandedThreads] = useState<Set<number>>(new Set());
+  function toggleThread(rootId: number) {
+    setExpandedThreads((current) => {
+      const next = new Set(current);
+      if (next.has(rootId)) next.delete(rootId);
+      else next.add(rootId);
+      return next;
+    });
+  }
 
-  const [filters, setFilters] = useState<MessageFilters>(DEFAULT_FILTERS);
-  const [filtersOpen, setFiltersOpen] = useState(false);
+  // Multi-select: ids of checked rows. Cleared when the folder/account
+  // changes (below) so a selection never carries into an unrelated list.
+  const [selectedIds, setSelectedIds] = useState<Set<number>>(new Set());
+  const batchEnabled = Boolean(onBatchMarkRead || onBatchStar || onBatchMove);
+
+  function toggleSelected(id: number) {
+    setSelectedIds((current) => {
+      const next = new Set(current);
+      if (next.has(id)) next.delete(id);
+      else next.add(id);
+      return next;
+    });
+  }
+
+  function clearSelection() {
+    setSelectedIds(new Set());
+  }
+
+  function runBatch(action: () => void) {
+    action();
+    clearSelection();
+  }
+
   const [sortKey, setSortKey] = useState<SortKey>("newest");
   const [sortMenuOpen, setSortMenuOpen] = useState(false);
   const [sortAnchorRef, sortAnchorRect] = useAnchorRect(sortMenuOpen);
-  const [refreshing, setRefreshing] = useState(false);
-  const spinValue = useRef(new Animated.Value(0)).current;
 
-  // A stale "from: x" filter silently emptying an unrelated folder you just
-  // switched into would be confusing -- sort preference is fine to keep,
-  // search/filters are not.
+  // Selection/thread expansion never carry into an unrelated list. (The
+  // search/filter reset on folder change lives in App now, alongside the
+  // filters themselves.)
   useEffect(() => {
-    setFilters(DEFAULT_FILTERS);
-    setFiltersOpen(false);
     setSortMenuOpen(false);
+    setSelectedIds(new Set());
+    setExpandedThreads(new Set());
   }, [accountId, folder]);
 
-  // There's no real fetch behind this yet (see backend-backlog.md --
-  // fetch_messages/fetch_unified_inbox exist server-side but nothing in
-  // the frontend calls them), so this just plays the loading state for a
-  // beat rather than silently doing nothing when pressed.
+  // Debounced server-side search: fire ~400ms after typing stops, for
+  // queries of at least 2 characters, so every keystroke doesn't open an
+  // IMAP connection. The client-side filter below reacts instantly; this
+  // only backfills the pool with server matches. Structured filters are
+  // forwarded to the local FTS layer (they're not sent to IMAP).
   useEffect(() => {
-    if (!refreshing) return;
-    spinValue.setValue(0);
-    const animation = Animated.loop(
-      Animated.timing(spinValue, { toValue: 1, duration: 700, easing: Easing.linear, useNativeDriver: false }),
-    );
-    animation.start();
-    const timeout = setTimeout(() => setRefreshing(false), 900);
-    return () => {
-      animation.stop();
-      clearTimeout(timeout);
-    };
-  }, [refreshing]);
-
-  const spin = spinValue.interpolate({ inputRange: [0, 1], outputRange: ["0deg", "360deg"] });
+    const query = filters.query.trim();
+    if (!onSearch || query.length < 2) return;
+    const timer = setTimeout(() => onSearch(query, {
+      fromFilter: filters.from.trim() || undefined,
+      isUnread: filters.isUnread,
+      isFlagged: filters.isFlagged,
+      hasAttachment: filters.hasAttachment,
+    }), 400);
+    return () => clearTimeout(timer);
+  }, [filters.query, filters.from, filters.isUnread, filters.isFlagged, filters.hasAttachment]);
 
   // Typing in the search box broadens scope to every folder in the
   // account; leaving it empty and only using the From/To/Date filter
   // panel keeps the existing folder-scoped behavior.
   const searchActive = filters.query.trim() !== "";
   const pool = searchActive ? allAccountMessages : allMessages;
-  const visibleMessages = sortMessages(filterMessages(pool, filters), sortKey);
-  const activeFilters = hasActiveFilters(filters);
+
+  // Conversation view: group into threads, showing only roots until
+  // expanded. Bypassed while searching (a search wants flat matches) and in
+  // the unified inbox (rows there span accounts, which the per-folder thread
+  // grouping doesn't model).
+  const threaded = Boolean(threads) && !unified && !searchActive;
+  function buildThreadedList(meta: ThreadMeta): MessageWithFolder[] {
+    const byId = new Map(allMessages.map((message) => [message.id, message]));
+    const roots = meta.rootIds
+      .map((id) => byId.get(id))
+      .filter((message): message is MessageWithFolder => Boolean(message));
+    const sortedRoots = sortMessages(filterMessages(roots, filters), sortKey);
+    const out: MessageWithFolder[] = [];
+    for (const root of sortedRoots) {
+      const count = meta.countByRoot[root.id] ?? 1;
+      const expanded = expandedThreads.has(root.id);
+      out.push({ ...root, threadRoot: true, threadReplyCount: count - 1, threadExpanded: expanded, threadDepth: 0 });
+      if (expanded) {
+        for (const childId of meta.childrenByRoot[root.id] ?? []) {
+          const child = byId.get(childId);
+          if (child) out.push({ ...child, threadDepth: meta.depthById[childId] ?? 1 });
+        }
+      }
+    }
+    return out;
+  }
+
+  const sortedMessages =
+    threaded && threads ? buildThreadedList(threads) : sortMessages(filterMessages(pool, filters), sortKey);
+  // "Separate unread from read": unread first (each half keeps the sort
+  // order), with section labels rendered when both halves exist. Skipped in
+  // conversation view, where a thread mixes read and unread messages.
+  const sectioned = separateUnread && !threaded;
+  const visibleMessages = sectioned
+    ? [...sortedMessages.filter((m) => m.unread), ...sortedMessages.filter((m) => !m.unread)]
+    : sortedMessages;
+  const showSectionLabels =
+    sectioned && visibleMessages.some((m) => m.unread) && visibleMessages.some((m) => !m.unread);
   const currentSortLabel = SORT_OPTIONS.find((option) => option.key === sortKey)?.label ?? "";
 
   function renderItem({ item, index }: { item: MessageWithFolder; index: number }) {
-    const selected = item.id === selectedId;
-    const avatarColor = colorForIndex(index);
-    // Row preview only ever shows the first attachment's name -- a
-    // paperclip + "N attachments" count would be more accurate for a
-    // multi-attachment message, but that's a bigger row-layout change than
-    // this list view needs right now.
+    // The id alone isn't unique in the unified inbox -- IMAP UIDs are
+    // per-folder, so two accounts (or two folders in search results) can
+    // both hold a message with the same uid.
+    const selected = item.id === selectedId && item.accountId === accountId && item.folder === folder;
+    const checked = selectedIds.has(item.id);
+    const avatarColor = colorForKey(item.senderEmail || item.sender);
     const attachment = item.realAttachments?.[0];
+    const extraAttachments = (item.realAttachments?.length ?? 0) - 1;
     const otherFolderLabel = searchActive && item.folder !== folder ? folderLabel(item.folder) : undefined;
     const accountIndex = unified ? accounts.findIndex((candidate) => candidate.id === item.accountId) : -1;
     const accountInfo = accountIndex === -1 ? undefined : accounts[accountIndex];
     const accountColor = accountInfo ? resolveAccountColor(accountOverrides, accountInfo.id, accountIndex) : undefined;
+    // Section label above the first row of each unread/read group.
+    const sectionLabel =
+      showSectionLabels && (index === 0 || visibleMessages[index - 1].unread !== item.unread)
+        ? item.unread
+          ? "Unread"
+          : "Read"
+        : null;
     return (
+      <>
+        {/* Outside rowWrapper: its absolutely-positioned children (star,
+            checkbox) measure against the row itself, not the label. */}
+        {sectionLabel && (
+          <Text style={[styles.sectionLabel, sectionLabel === "Unread" && { color: accentColor }]}>
+            {sectionLabel}
+          </Text>
+        )}
       <View style={styles.rowWrapper}>
+        {batchEnabled && (
+          // Sibling of the row's Pressable (not a child) so toggling the
+          // checkbox never also triggers the row's open handler -- same
+          // reason the star button below is a sibling.
+          <Pressable onPress={() => toggleSelected(item.id)} style={styles.checkboxButton}>
+            <View
+              style={[
+                styles.checkbox,
+                checked && { backgroundColor: accentColor, borderColor: accentColor },
+              ]}
+            >
+              {checked && <ListIcon name="check" color={colors.background.base} size={11} />}
+            </View>
+          </Pressable>
+        )}
         <Pressable
           onPress={() => onSelect(item.id, item.folder, item.accountId)}
           style={({ hovered }: HoverState) => [
             styles.row,
             compact && styles.rowCompact,
+            batchEnabled && styles.rowCheckable,
+            item.threadDepth ? { marginLeft: item.threadDepth * 16 } : null,
             selected && { backgroundColor: colors.background.panel, borderLeftColor: accentColor },
-            !selected && hovered && { backgroundColor: colors.background.panel },
+            checked && { backgroundColor: colors.background.surface },
+            !selected && !checked && hovered && { backgroundColor: colors.background.panel },
           ]}
         >
           <View style={[styles.avatar, compact && styles.avatarCompact, { backgroundColor: avatarColor }]}>
-            <Text style={styles.avatarText}>{item.sender.charAt(0).toUpperCase()}</Text>
+            <Text style={styles.avatarText}>{(item.sender || "?").charAt(0).toUpperCase()}</Text>
           </View>
           <View style={styles.rowContent}>
             <View style={styles.rowTop}>
               <View style={styles.senderGroup}>
                 {item.unread && <View style={[styles.unreadDot, { backgroundColor: accentColor }]} />}
-                <Text style={[styles.sender, item.unread && styles.senderUnread]}>{item.sender}</Text>
+                <Text numberOfLines={1} style={[styles.sender, item.unread && styles.senderUnread]}>{item.sender}</Text>
                 {accountInfo && (
                   <View style={[styles.folderBadge, { borderColor: accountColor }]}>
                     <Text style={[styles.folderBadgeText, { color: accountColor }]}>
@@ -171,12 +281,13 @@ export function MessageList({
               </View>
               <Text style={styles.time}>{formatMessageTime(item.date)}</Text>
             </View>
-            <Text style={[styles.subject, item.unread && styles.subjectUnread]}>{item.subject}</Text>
+            <Text numberOfLines={1} style={[styles.subject, item.unread && styles.subjectUnread]}>{item.subject}</Text>
             {attachment && (
               <View style={styles.attachmentRow}>
                 <ListIcon name="attachment" color={colors.text.muted} size={11} />
                 <Text style={styles.attachmentName} numberOfLines={1}>
                   {attachment.name}
+                  {extraAttachments > 0 ? `  +${extraAttachments}` : ""}
                 </Text>
               </View>
             )}
@@ -192,7 +303,17 @@ export function MessageList({
         <Pressable onPress={() => onToggleStar(item.id, item.accountId, item.folder)} style={styles.starButton}>
           <ListIcon name="star" filled={item.starred} color={item.starred ? colors.accent.amber : colors.text.muted} size={14} />
         </Pressable>
+        {item.threadRoot && (item.threadReplyCount ?? 0) > 0 && (
+          // Thread expand/collapse -- a sibling for the same propagation
+          // reason as the star button. Tapping it toggles the conversation;
+          // tapping the row still opens the root message.
+          <Pressable onPress={() => toggleThread(item.id)} style={styles.threadToggle}>
+            <Text style={styles.threadCount}>{item.threadReplyCount}</Text>
+            <ListIcon name={item.threadExpanded ? "chevron-up" : "chevron-down"} color={colors.text.muted} size={10} />
+          </Pressable>
+        )}
       </View>
+      </>
     );
   }
 
@@ -200,24 +321,26 @@ export function MessageList({
     <View style={[styles.pane, { width }]}>
       <View style={styles.header}>
         <View style={styles.headerTop}>
-          <Text style={styles.title}>{currentFolderLabel}</Text>
+          <View style={styles.titleGroup}>
+            <Text style={styles.title}>{currentFolderLabel}</Text>
+            {unreadCount > 0 && (
+              <Text style={[styles.titleCount, { color: accentColor }]}>{unreadCount}</Text>
+            )}
+          </View>
           <View style={styles.headerTopActions}>
-            <Tooltip label="Refresh (also re-applies rules)">
-              <Pressable
-                onPress={() => {
-                  if (refreshing) return;
-                  setRefreshing(true);
-                  onApplyRules?.();
-                  onRefresh?.();
-                }}
-                disabled={refreshing}
-                style={styles.refreshButton}
-              >
-                <Animated.View style={{ transform: [{ rotate: refreshing ? spin : "0deg" }] }}>
-                  <ListIcon name="refresh" color={colors.text.secondary} size={13} />
-                </Animated.View>
-              </Pressable>
-            </Tooltip>
+            {!unified && hasUnread && onMarkAllRead && (
+              <Tooltip label="Mark all as read">
+                <Pressable
+                  onPress={onMarkAllRead}
+                  style={({ hovered }: HoverState) => [
+                    styles.refreshButton,
+                    hovered && { borderColor: accentColor, backgroundColor: withAlpha(accentColor, 0.1) },
+                  ]}
+                >
+                  <ListIcon name="check" color={colors.text.secondary} size={14} />
+                </Pressable>
+              </Tooltip>
+            )}
 
             <View style={styles.sortWrapper}>
               <Pressable
@@ -230,11 +353,9 @@ export function MessageList({
                 <ListIcon name="chevron-down" color={colors.text.muted} size={10} />
               </Pressable>
               {/* Portaled (see FloatingPortal) rather than a plain absolute
-                  child -- it otherwise has to out-rank searchRowWrapper,
-                  a later sibling several levels up, and every
-                  react-native-web View is its own CSS stacking context
-                  (implicit zIndex:0) so a local zIndex can never win that
-                  fight no matter how high it's set. */}
+                  child -- every react-native-web View is its own CSS
+                  stacking context (implicit zIndex:0), so a local zIndex
+                  can never out-rank unrelated elements higher in the tree. */}
               {sortMenuOpen && sortAnchorRect && (
                 <FloatingPortal
                   top={sortAnchorRect.bottom + 4}
@@ -270,160 +391,64 @@ export function MessageList({
           </View>
         </View>
 
-        <View style={styles.searchRowWrapper}>
-          <View style={styles.searchRow}>
-            <View style={styles.searchInputWrapper}>
-              <ListIcon name="search" color={colors.text.muted} size={13} />
-              <TextInput
-                ref={searchInputRef}
-                style={styles.searchInput}
-                value={filters.query}
-                onChangeText={(text) => setFilters((current) => ({ ...current, query: text }))}
-                placeholder="Search mail"
-                placeholderTextColor={colors.text.muted}
-              />
-              {filters.query.length > 0 && (
-                <Pressable onPress={() => setFilters((current) => ({ ...current, query: "" }))}>
-                  <ListIcon name="close" color={colors.text.muted} size={11} />
-                </Pressable>
-              )}
-            </View>
-            <Pressable
-              onPress={() => setFiltersOpen((value) => !value)}
-              style={[styles.filterToggle, (filtersOpen || activeFilters) && { borderColor: accentColor }]}
-            >
-              <ListIcon name="filter" color={filtersOpen || activeFilters ? accentColor : colors.text.muted} size={13} />
-            </Pressable>
-          </View>
-        </View>
-
-        {filtersOpen && (
-        // Anchored to the header itself (zIndex above sortWrapper) rather
-        // than to searchRowWrapper -- it pops up from the top of the pane
-        // and overlaps the search bar it sits below, instead of dropping
-        // down and hiding the first rows of the message list.
-        <View style={styles.filterPanel}>
-          <View style={styles.filterPanelHeader}>
-            <Text style={styles.filterPanelTitle}>Filters</Text>
-            {/* The toggle button that opened this is now buried underneath
-                it, so this is the only reachable way to close it besides
-                clicking outside via dismissOverlay. */}
-            <Pressable onPress={() => setFiltersOpen(false)}>
-              <ListIcon name="close" color={colors.text.muted} size={13} />
-            </Pressable>
-          </View>
-          <View style={styles.filterField}>
-            <Text style={styles.filterLabel}>From</Text>
-            <TextInput
-              style={styles.filterInput}
-              value={filters.from}
-              onChangeText={(text) => setFilters((current) => ({ ...current, from: text }))}
-              placeholder="Name or email"
-              placeholderTextColor={colors.text.muted}
-              autoCapitalize="none"
-            />
-          </View>
-          <View style={styles.filterField}>
-            <Text style={styles.filterLabel}>To</Text>
-            <TextInput
-              style={styles.filterInput}
-              value={filters.to}
-              onChangeText={(text) => setFilters((current) => ({ ...current, to: text }))}
-              placeholder="Name or email"
-              placeholderTextColor={colors.text.muted}
-              autoCapitalize="none"
-            />
-          </View>
-          <View style={styles.filterField}>
-            <Text style={styles.filterLabel}>Date</Text>
-            <View style={styles.dateRangeRow}>
-              {DATE_RANGE_OPTIONS.map((option) => {
-                const active = filters.dateRange === option.key;
-                return (
-                  <Pressable
-                    key={option.key}
-                    onPress={() => setFilters((current) => ({ ...current, dateRange: option.key }))}
-                    style={[styles.dateRangePill, active && { backgroundColor: accentColor, borderColor: accentColor }]}
-                  >
-                    <Text style={[styles.dateRangePillText, active && { color: colors.background.base }]}>
-                      {option.label}
-                    </Text>
-                  </Pressable>
-                );
-              })}
-            </View>
-
-            {filters.dateRange === "custom" && (
-              <View style={styles.customDateRange}>
-                <View style={styles.customDateField}>
-                  <Text style={styles.customDateLabel}>From</Text>
-                  <View style={styles.customDateDropdownGap}>
-                    <Dropdown
-                      value={filters.customFrom.split("-")[1]}
-                      options={MONTH_OPTIONS}
-                      accentColor={accentColor}
-                      width={62}
-                      onChange={(month) =>
-                        setFilters((current) => ({ ...current, customFrom: `${current.customFrom.split("-")[0]}-${month}` }))
-                      }
-                    />
-                  </View>
-                  <Dropdown
-                    value={filters.customFrom.split("-")[0]}
-                    options={YEAR_OPTIONS}
-                    accentColor={accentColor}
-                    width={70}
-                    onChange={(year) =>
-                      setFilters((current) => ({ ...current, customFrom: `${year}-${current.customFrom.split("-")[1]}` }))
-                    }
-                  />
-                </View>
-                <View style={styles.customDateField}>
-                  <Text style={styles.customDateLabel}>To</Text>
-                  <View style={styles.customDateDropdownGap}>
-                    <Dropdown
-                      value={filters.customTo.split("-")[1]}
-                      options={MONTH_OPTIONS}
-                      accentColor={accentColor}
-                      width={62}
-                      onChange={(month) =>
-                        setFilters((current) => ({ ...current, customTo: `${current.customTo.split("-")[0]}-${month}` }))
-                      }
-                    />
-                  </View>
-                  <Dropdown
-                    value={filters.customTo.split("-")[0]}
-                    options={YEAR_OPTIONS}
-                    accentColor={accentColor}
-                    width={70}
-                    onChange={(year) =>
-                      setFilters((current) => ({ ...current, customTo: `${year}-${current.customTo.split("-")[1]}` }))
-                    }
-                  />
-                </View>
-              </View>
-            )}
-          </View>
-          {activeFilters && (
-            <Pressable onPress={() => setFilters(DEFAULT_FILTERS)}>
-              <Text style={[styles.clearFilters, { color: accentColor }]}>Clear filters</Text>
-            </Pressable>
-          )}
-        </View>
-        )}
       </View>
 
-      {/* Only filtersOpen needs this -- the sort menu is portaled and
-          dismisses itself via FloatingPortal's own full-viewport backdrop. */}
-      {filtersOpen && <Pressable style={styles.dismissOverlay} onPress={() => setFiltersOpen(false)} />}
+      {batchEnabled && selectedIds.size > 0 && (
+        <View style={[styles.selectionBar, { borderColor: accentColor }]}>
+          <Text style={styles.selectionCount}>{selectedIds.size} selected</Text>
+          <View style={styles.selectionActions}>
+            {onBatchMarkRead && (
+              <>
+                <Pressable onPress={() => runBatch(() => onBatchMarkRead([...selectedIds], true))} style={styles.selectionAction}>
+                  <Text style={styles.selectionActionText}>Read</Text>
+                </Pressable>
+                <Pressable onPress={() => runBatch(() => onBatchMarkRead([...selectedIds], false))} style={styles.selectionAction}>
+                  <Text style={styles.selectionActionText}>Unread</Text>
+                </Pressable>
+              </>
+            )}
+            {onBatchStar && (
+              <Pressable onPress={() => runBatch(() => onBatchStar([...selectedIds], true))} style={styles.selectionAction}>
+                <Text style={styles.selectionActionText}>Star</Text>
+              </Pressable>
+            )}
+            {onBatchMove && (
+              <>
+                <Pressable onPress={() => runBatch(() => onBatchMove([...selectedIds], "archive"))} style={styles.selectionAction}>
+                  <Text style={styles.selectionActionText}>Archive</Text>
+                </Pressable>
+                <Pressable onPress={() => runBatch(() => onBatchMove([...selectedIds], "trash"))} style={styles.selectionAction}>
+                  <Text style={[styles.selectionActionText, { color: colors.accent.amber }]}>Trash</Text>
+                </Pressable>
+              </>
+            )}
+            <Pressable onPress={clearSelection} style={styles.selectionAction}>
+              <Text style={styles.selectionActionText}>Cancel</Text>
+            </Pressable>
+          </View>
+        </View>
+      )}
 
       <FlatList
         data={visibleMessages}
-        keyExtractor={(item) => String(item.id)}
+        extraData={selectedIds}
+        // The account and folder are part of the key for the same reason
+        // the selected-row check compares them: a bare uid collides across
+        // accounts in the unified inbox and across folders in search hits.
+        keyExtractor={(item) => `${item.accountId}:${item.folder}:${item.id}`}
         renderItem={renderItem}
         style={styles.list}
+        // No scrollbar: it painted exactly over each row's star button, so
+        // hovering the star hit the bar instead. Wheel/touch/keyboard
+        // scrolling all still work; the bar was the only casualty.
+        showsVerticalScrollIndicator={false}
         ListEmptyComponent={
           <View style={styles.emptyState}>
+            <svg width={28} height={28} viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth={1.4} strokeLinecap="round" strokeLinejoin="round" style={{ color: "rgba(255,255,255,0.1)", marginBottom: 8 }}>
+              {allMessages.length === 0
+                ? <><rect x="2" y="5" width="20" height="14" rx="2" /><polyline points="2 5 12 13 22 5" /></>
+                : <><circle cx="11" cy="11" r="8" /><line x1="21" y1="21" x2="16.65" y2="16.65" /></>}
+            </svg>
             <Text style={styles.emptyStateText}>
               {allMessages.length === 0 ? "No messages in this folder" : "No messages match your search"}
             </Text>
@@ -449,11 +474,6 @@ const styles = StyleSheet.create({
     paddingBottom: spacing.md,
     borderBottomWidth: 1,
     borderBottomColor: colors.border.subtle,
-    // Without this, the dismiss overlay (below) paints above this whole
-    // block despite its own zIndex being lower -- header has no explicit
-    // stacking context otherwise, so the filter panel's zIndex only
-    // resolves against its own siblings inside header, not the overlay.
-    zIndex: 15,
   },
   headerTop: {
     flexDirection: "row",
@@ -461,20 +481,33 @@ const styles = StyleSheet.create({
     justifyContent: "space-between",
     marginBottom: spacing.sm,
   },
+  titleGroup: {
+    flexDirection: "row",
+    alignItems: "baseline",
+    gap: spacing.sm,
+  },
   title: {
     fontFamily: fontFamily.display,
     fontSize: fontSize.lg,
     fontWeight: "600",
     color: colors.text.primary,
   },
+  // Unread total beside the folder name -- mono because it's a count, in
+  // the account accent so it reads as live status rather than a label.
+  titleCount: {
+    fontFamily: fontFamily.mono,
+    fontSize: fontSize.sm,
+    fontWeight: "700",
+  },
   headerTopActions: {
     flexDirection: "row",
     alignItems: "center",
     gap: spacing.sm,
   },
+  // Shared square icon-button look (mark-all-read).
   refreshButton: {
-    width: 26,
-    height: 26,
+    width: 28,
+    height: 28,
     alignItems: "center",
     justifyContent: "center",
     borderRadius: radii.sm,
@@ -517,139 +550,6 @@ const styles = StyleSheet.create({
     fontSize: fontSize.xs,
     color: colors.text.secondary,
   },
-  dismissOverlay: {
-    position: "absolute",
-    top: 0,
-    left: 0,
-    right: 0,
-    bottom: 0,
-    zIndex: 10,
-  },
-  searchRowWrapper: {
-    position: "relative",
-    zIndex: 20,
-  },
-  searchRow: {
-    flexDirection: "row",
-    alignItems: "center",
-  },
-  searchInputWrapper: {
-    flex: 1,
-    flexDirection: "row",
-    alignItems: "center",
-    backgroundColor: colors.background.surface,
-    borderWidth: 1,
-    borderColor: colors.border.subtle,
-    borderRadius: radii.sm,
-    paddingHorizontal: spacing.sm,
-    paddingVertical: 6,
-    marginRight: spacing.xs,
-  },
-  searchInput: {
-    flex: 1,
-    fontFamily: fontFamily.ui,
-    fontSize: fontSize.xs,
-    color: colors.text.primary,
-    marginLeft: spacing.xs,
-  },
-  filterToggle: {
-    width: 30,
-    height: 30,
-    alignItems: "center",
-    justifyContent: "center",
-    borderRadius: radii.sm,
-    borderWidth: 1,
-    borderColor: colors.border.subtle,
-  },
-  filterPanel: {
-    position: "absolute",
-    top: 0,
-    left: 0,
-    right: 0,
-    paddingHorizontal: spacing.md,
-    paddingTop: spacing.md,
-    paddingBottom: spacing.md,
-    borderWidth: 1,
-    borderColor: colors.border.subtle,
-    borderRadius: radii.md,
-    backgroundColor: colors.background.panel,
-    // Above headerTop and searchRowWrapper, its only siblings inside
-    // header, so it always wins the header's internal stacking order and
-    // fully covers the search bar beneath it.
-    zIndex: 30,
-  },
-  filterPanelHeader: {
-    flexDirection: "row",
-    alignItems: "center",
-    justifyContent: "space-between",
-    marginBottom: spacing.md,
-  },
-  filterPanelTitle: {
-    fontFamily: fontFamily.display,
-    fontSize: fontSize.sm,
-    fontWeight: "600",
-    color: colors.text.primary,
-  },
-  filterField: {
-    marginBottom: spacing.sm,
-  },
-  filterLabel: {
-    fontFamily: fontFamily.ui,
-    fontSize: fontSize.xs,
-    color: colors.text.muted,
-    marginBottom: 4,
-  },
-  filterInput: {
-    backgroundColor: colors.background.surface,
-    borderWidth: 1,
-    borderColor: colors.border.subtle,
-    borderRadius: radii.sm,
-    paddingHorizontal: spacing.sm,
-    paddingVertical: 6,
-    fontFamily: fontFamily.ui,
-    fontSize: fontSize.xs,
-    color: colors.text.primary,
-  },
-  dateRangeRow: {
-    flexDirection: "row",
-    flexWrap: "wrap",
-  },
-  dateRangePill: {
-    paddingVertical: 4,
-    paddingHorizontal: spacing.sm,
-    borderRadius: radii.pill,
-    borderWidth: 1,
-    borderColor: colors.border.subtle,
-    marginRight: spacing.xs,
-    marginBottom: spacing.xs,
-  },
-  customDateRange: {
-    marginTop: spacing.sm,
-  },
-  customDateField: {
-    flexDirection: "row",
-    alignItems: "center",
-    marginBottom: spacing.sm,
-  },
-  customDateLabel: {
-    width: 32,
-    fontFamily: fontFamily.ui,
-    fontSize: fontSize.xs,
-    color: colors.text.muted,
-  },
-  customDateDropdownGap: {
-    marginRight: spacing.xs,
-  },
-  dateRangePillText: {
-    fontFamily: fontFamily.ui,
-    fontSize: 11,
-    color: colors.text.secondary,
-  },
-  clearFilters: {
-    fontFamily: fontFamily.ui,
-    fontSize: fontSize.xs,
-    fontWeight: "600",
-  },
   list: {
     flex: 1,
   },
@@ -660,12 +560,24 @@ const styles = StyleSheet.create({
   },
   emptyStateText: {
     fontFamily: fontFamily.ui,
-    fontSize: fontSize.xs,
+    fontSize: fontSize.sm,
     color: colors.text.muted,
     textAlign: "center",
   },
   rowWrapper: {
     position: "relative",
+  },
+  // "Unread"/"Read" group labels for the separate-unread setting.
+  sectionLabel: {
+    fontFamily: fontFamily.ui,
+    fontSize: fontSize.xs,
+    fontWeight: "700",
+    textTransform: "uppercase",
+    letterSpacing: 1,
+    color: colors.text.muted,
+    paddingHorizontal: spacing.lg,
+    paddingTop: spacing.md,
+    paddingBottom: spacing.xs,
   },
   row: {
     flexDirection: "row",
@@ -676,6 +588,62 @@ const styles = StyleSheet.create({
     borderLeftWidth: 2,
     borderLeftColor: "transparent",
   },
+  rowCheckable: {
+    paddingLeft: 38,
+  },
+  checkboxButton: {
+    position: "absolute",
+    left: spacing.sm,
+    top: 0,
+    bottom: 0,
+    justifyContent: "center",
+    zIndex: 1,
+  },
+  checkbox: {
+    width: 18,
+    height: 18,
+    borderRadius: radii.sm,
+    borderWidth: 1.5,
+    borderColor: colors.border.strong,
+    alignItems: "center",
+    justifyContent: "center",
+  },
+  selectionBar: {
+    flexDirection: "row",
+    alignItems: "center",
+    justifyContent: "space-between",
+    flexWrap: "wrap",
+    gap: spacing.xs,
+    paddingVertical: spacing.sm,
+    paddingHorizontal: spacing.lg,
+    borderBottomWidth: 1,
+    borderColor: colors.border.subtle,
+    backgroundColor: colors.background.surface,
+  },
+  selectionCount: {
+    fontFamily: fontFamily.ui,
+    fontSize: fontSize.xs,
+    fontWeight: "600",
+    color: colors.text.primary,
+  },
+  selectionActions: {
+    flexDirection: "row",
+    alignItems: "center",
+    flexWrap: "wrap",
+    gap: spacing.xs,
+  },
+  selectionAction: {
+    paddingVertical: 4,
+    paddingHorizontal: spacing.sm,
+    borderRadius: radii.sm,
+    borderWidth: 1,
+    borderColor: colors.border.subtle,
+  },
+  selectionActionText: {
+    fontFamily: fontFamily.ui,
+    fontSize: fontSize.xs,
+    color: colors.text.secondary,
+  },
   rowCompact: {
     paddingVertical: spacing.xs,
   },
@@ -684,6 +652,25 @@ const styles = StyleSheet.create({
     top: spacing.md,
     right: spacing.xs,
     padding: 4,
+  },
+  threadToggle: {
+    position: "absolute",
+    bottom: spacing.sm,
+    right: spacing.sm,
+    flexDirection: "row",
+    alignItems: "center",
+    gap: 2,
+    paddingVertical: 2,
+    paddingHorizontal: 6,
+    borderRadius: radii.pill,
+    borderWidth: 1,
+    borderColor: colors.border.subtle,
+    backgroundColor: colors.background.surface,
+  },
+  threadCount: {
+    fontFamily: fontFamily.mono,
+    fontSize: 10,
+    color: colors.text.secondary,
   },
   avatar: {
     width: 36,
@@ -715,9 +702,14 @@ const styles = StyleSheet.create({
     alignItems: "center",
     marginBottom: 2,
   },
+  // flex:1 + minWidth:0 so a long sender name truncates instead of pushing
+  // the date off the row edge -- the date always stays pinned right.
   senderGroup: {
+    flex: 1,
+    minWidth: 0,
     flexDirection: "row",
     alignItems: "center",
+    marginRight: spacing.sm,
   },
   unreadDot: {
     width: 6,
@@ -726,6 +718,7 @@ const styles = StyleSheet.create({
     marginRight: spacing.xs,
   },
   sender: {
+    flexShrink: 1,
     fontFamily: fontFamily.ui,
     fontSize: fontSize.sm,
     color: colors.text.secondary,
@@ -749,6 +742,7 @@ const styles = StyleSheet.create({
     color: colors.text.muted,
   },
   time: {
+    flexShrink: 0,
     fontFamily: fontFamily.mono,
     fontSize: fontSize.xs,
     color: colors.text.muted,

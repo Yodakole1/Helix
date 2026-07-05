@@ -10,6 +10,28 @@
         margin: 0;
       }
 
+      /* Native widgets (datetime/time pickers, dropdowns) should render in
+         their dark variants everywhere -- individual inputs shouldn't have
+         to remember to set colorScheme themselves. */
+      :root {
+        color-scheme: dark;
+      }
+
+      /* Default selection blue reads as a foreign element against the
+         near-black glass theme; a quiet white wash matches every accent. */
+      ::selection {
+        background: rgba(255, 255, 255, 0.22);
+      }
+
+      /* Keyboard-only focus ring. react-native-web strips native outlines
+         from its focusable elements, which leaves tab navigation invisible;
+         :focus-visible restores it for keyboard users without putting rings
+         on every mouse click. */
+      :where(div, button, a, input, textarea, iframe):focus-visible {
+        outline: 2px solid rgba(255, 255, 255, 0.45) !important;
+        outline-offset: 2px;
+      }
+
       /* Default OS scrollbars are a stark white rectangle against this
          app's near-black/glass theme everywhere it scrolls (Settings'
          category nav, its content pane, the sidebar's folder list,
@@ -33,6 +55,15 @@
       }
       *::-webkit-scrollbar-thumb:hover {
         background-color: rgba(255, 255, 255, 0.32);
+      }
+
+      /* Rich-text editor placeholder -- shown when the editor is empty and
+         not focused. The .rte-empty class is managed by RichTextEditor.tsx. */
+      .rte-body.rte-empty::before {
+        content: attr(data-placeholder);
+        color: rgba(255, 255, 255, 0.28);
+        pointer-events: none;
+        position: absolute;
       }
     </style>
   </head>

@@ -1,6 +1,6 @@
 # IMAP connection core
 
-`src-tauri/src/imap.rs` exposes four Tauri commands:
+`src-tauri/src/imap.rs` exposes these Tauri commands:
 
 - `list_folders(account_id, host, port)` — connects, authenticates, lists
   the account's folders
@@ -14,6 +14,15 @@
   — connects, authenticates, and returns one specific attachment's actual
   content (base64-encoded), by its `index` in `fetch_message_body`'s
   `attachments` list. See "Attachment content" below.
+- `fetch_message_source(account_id, host, port, folder, uid)` — returns
+  the raw RFC 822 bytes base64-encoded (EXAMINE path, no `\Seen` side
+  effect), for displaying the raw message source in-app.
+- `export_message_eml(account_id, host, port, folder, uid, path)` — same
+  raw RFC 822 bytes written to a caller-supplied absolute file path via
+  `std::fs::write`. The caller is responsible for determining the path
+  (e.g., from a native save-file dialog). EML format is literally the raw
+  RFC 822 bytes with no extra framing, so both commands share
+  `fetch_raw_message_by_uid`.
 
 These are the first slices of real protocol work — proof that we can
 actually talk to a mail server, before building anything more elaborate
@@ -116,6 +125,30 @@ password from the OS keychain (see below) before calling it. No
 connection pooling or persistent session yet — each call opens and closes
 its own connection. That's deliberately out of scope until there's a real
 need for a long-lived session (e.g. IDLE-based live updates).
+
+### Implicit TLS vs. STARTTLS
+
+`connect_and_login` takes a `use_starttls` flag, mirroring `smtp.rs`:
+
+- **`false` — implicit TLS (IMAPS, port 993):** TLS from the first byte,
+  the original behavior.
+- **`true` — STARTTLS (port 143):** connect in plaintext, issue
+  `STARTTLS` (`async-imap`'s `Client::run_command_and_check_ok` then
+  `into_inner()` to recover the raw socket), upgrade *that same socket* to
+  TLS via the same `tokio-native-tls` connector, then build a fresh client
+  over the TLS stream and log in. The upgrade is mandatory — a server that
+  won't `STARTTLS` is an error, never a plaintext fallback, the same
+  no-downgradable-path posture as SMTP/POP3 here. Relevant because
+  custom-domain/hosting mail servers commonly run STARTTLS on 143 rather
+  than implicit TLS on 993.
+
+The flag is a per-account property (`AccountRecord.imap_use_starttls`, see
+`multi-account.md`), not a per-command argument. The data commands resolve
+it from the cached account via `login_for_account`, so their signatures
+are unchanged; only onboarding/verification passes it explicitly (via
+`verify_and_list_folders`), because the account isn't persisted yet at
+verify time. Either path yields the same `Session<TlsStream<TcpStream>>`,
+so the rest of the module is oblivious to which transport got it there.
 
 ## fetch_messages details
 

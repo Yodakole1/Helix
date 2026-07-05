@@ -31,14 +31,3 @@ export function resolveAccountLabel(overrides: AccountOverrides, account: MailAc
   return overrides[account.id]?.label ?? account.label;
 }
 
-// Sample accounts used only when the app is running in browser dev mode
-// without Tauri (npm run dev), so the UI has something to render. In the
-// real app (npm run tauri dev) useAccounts() loads the actual persisted
-// accounts from the backend and these are never shown.
-export const SAMPLE_ACCOUNTS: MailAccount[] = [
-  { id: "alex@helixmail.dev", label: "Work", email: "alex@helixmail.dev" },
-  { id: "alex@protonmail.com", label: "Personal", email: "alex@protonmail.com" },
-  { id: "alex.r@outlook.com", label: "Freelance", email: "alex.r@outlook.com" },
-  { id: "alex@fastmail.com", label: "Newsletter", email: "alex@fastmail.com" },
-  { id: "a.rivera@icloud.com", label: "Family", email: "a.rivera@icloud.com" },
-];

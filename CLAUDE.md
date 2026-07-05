@@ -4,26 +4,38 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 
 ## What this is
 
-Helix is a privacy-focused, cross-platform email client (desktop now, mobile
-planned) built on a single codebase: direct IMAP/POP3/SMTP connections to
-mail providers (no middleman sync servers), local encryption, and a
-dark-mode-first, customizable UI. It is intended to be published as an
-open-source project.
+Helix is a lightweight, privacy-focused, cross-platform email client
+(desktop -- Windows, macOS, Linux -- now, mobile -- iOS/Android -- planned)
+built on a single codebase: direct
+IMAP/POP3/SMTP connections to mail providers (no middleman sync servers),
+local encryption, and a dark-mode-first, customizable UI. It is intended
+to be published as an open-source project.
 
-The project is in early development. The Rust backend is still ahead of the
-frontend overall, but the gap is narrower than it used to be: account
-onboarding (`add_account`/`list_accounts`/`remove_account`), PGP key
-management, local-cache stats/clearing, and desktop notification permissions
-are now real, frontend-wired features, not just backend commands sitting
-unused. What's still sample-data-only is the core mailbox experience itself
--- there is no real `account_id` flowing through the sidebar/message list/
-reader pane yet, so folder listing, message fetch, mailbox mutations
-(read/flag/move), sending, and the unified inbox all still operate on
-`src/data/`'s sample data rather than the real IMAP/SMTP/POP3 backend.
-`docs/technical/backend-backlog.md` tracks backend work in detail;
-`docs/technical/frontend-roadmap.md` is the frontend-side equivalent --
-check both before assuming something is or isn't wired. Each backend module
-has its own doc in `docs/technical/` once it lands.
+"Lightweight" describes the Tauri shell (native OS webview, no bundled
+Chromium/Node the way Electron ships), not the UI layer itself -- the
+frontend is an ordinary React Native Web app running inside that webview.
+See `docs/technical/architecture.md`'s "Why Tauri instead of Electron?"
+section for the full rationale before assuming "lightweight" means
+something it doesn't (e.g. a from-scratch native toolkit). "Secure" is
+backed by concrete properties (TLS/STARTTLS enforced everywhere with no
+plaintext fallback, OS-keychain-only credential storage, an encrypted
+local cache, PGP/S-MIME support) tracked with their review/fix history in
+`docs/technical/security.md` -- update that doc, not just this paragraph,
+when a security review lands new findings or fixes.
+
+The project is in early development but functionally complete for everyday
+mail: the whole mailbox experience (folder listing, message fetch/read,
+mutations, sending, drafts, search, unified inbox, POP3) runs against the
+real IMAP/SMTP/POP3 backend -- there is no sample data left in the app.
+Calendar (CalDAV + reminders), contacts (CardDAV + a full address-book
+tab), PGP/S-MIME, a Bayesian spam filter, rules, snooze,
+scheduled/undo send, an optional app lock (password/FIDO2 passkey), and a
+custom title bar with browser-style tabs are all wired end to end. The old
+`backend-backlog.md`/`frontend-roadmap.md` checklists were fully closed and
+have been deleted; the per-feature docs in `docs/technical/` are the source
+of truth for what exists and how it works, and `docs/user/guide.md` is the
+user-facing manual. When adding a feature, update (or add) its technical
+doc and the user guide in the same change.
 
 ## Commands
 
@@ -45,6 +57,9 @@ cargo test <test_name>              # run a single test by (partial) name match
 cargo test -- --ignored             # run the ignored tests (needs either network access to a real
                                      # IMAP server, or a local GreenMail container -- see
                                      # docs/technical/imap-core.md for the exact docker invocation)
+cargo build --features passkey      # include FIDO2 security-key app-lock support (needs libudev-dev
+                                     # on Linux; default builds ship the lock's password path only
+                                     # and stub the passkey commands with a clear error)
 ```
 
 Linux dev machines need a running Secret Service provider (gnome-keyring or
@@ -95,11 +110,27 @@ three panels (`App.tsx` threads `accent` state down to `Sidebar`,
 
 ### Frontend layout
 
-Three-pane shell in `App.tsx`: `Sidebar` (accounts + folders) |
-`MessageList` (message rows for the active folder) | `ReaderPane` (selected
-message body). `App.tsx` owns the cross-pane state -- `accent`,
-`selectedFolder` (per account), pane widths, and breakpoint/view-stack state
--- and threads it down, rather than panes tracking their own slice of it.
+The window chrome is custom: native decorations are off
+(`tauri.conf.json`) and `src/components/TitleBar.tsx` draws the title bar
+-- the browser-style tab strip (each tab an independent mailbox/calendar/
+address-book view, shrinking evenly as more open), the mail search box and
+filter panel, a refresh button, a `data-tauri-drag-region` filler, and the
+min/max/close window controls (window permissions live in
+`src-tauri/capabilities/default.json`). Search/filter state lives in
+`App.tsx` (the title bar edits it, `MessageList` applies it); Ctrl+Tab
+cycles tabs via a raw keydown listener in `App.tsx`.
+
+Below that, the three-pane shell in `App.tsx`: `Sidebar` (accounts +
+folders) | `MessageList` (message rows for the active folder) |
+`ReaderPane` (selected message body). `App.tsx` owns the cross-pane state
+-- `accent`, `selectedFolder` (per account), pane widths, tabs, and
+breakpoint/view-stack state -- and threads it down, rather than panes
+tracking their own slice of it. Non-mail tabs swap the right side of the
+shell: `CalendarView`, `AddressBookView`, or `AddAccountView` (account
+onboarding is a full-page tab, not a modal; it probes CalDAV/CardDAV with
+the mail credentials after the login verifies). An optional lock screen
+(`LockScreen.tsx`, backed by `lock.rs`) covers everything until unlocked
+when a lock method is enrolled.
 
 The shell is responsive via `useBreakpoint()` (`src/hooks/useBreakpoint.ts`,
 wrapping `useWindowDimensions`): desktop (>=1080px) shows all three panes
@@ -112,21 +143,25 @@ usePersistedState.ts`, a thin localStorage-backed hook scoped to numeric
 layout values). `MessageList` renders rows through `FlatList` rather than a
 plain `.map()`, so only visible rows mount.
 
-Sample message data lives in `src/data/messages.ts`, keyed by
-`"<account>:<folder>"` (`getMessagesFor`/`findMessage`) -- illustrative only,
-there is no account sync wired into the UI yet, but folder/account switching
-in the sidebar now actually changes what the list and reader pane show
-rather than always rendering the same fixed rows. Folder metadata
-(id/label/glyph) lives in `src/data/folders.ts`, shared between `Sidebar`
-and `MessageList`'s header label. Accounts are no longer pinned to a fixed
-two-color enum -- `AccountId` (an alias for the account's email) is the
-identity, and color comes from `colorForIndex()` keyed by position in
-`ACCOUNTS` (`src/data/accounts.ts`), overridable per-account via the
+Message state lives in `useMessageStore` (`src/hooks/useMessageStore.ts`),
+keyed by `"<account>:<folder>"` with real IMAP folder names as keys --
+which is why optimistic moves resolve the destination to the account's
+real folder name (`resolveDestFolder` in `App.tsx`) before the store move,
+so a message archived to "archive" lands under the key the Archive
+folder's list actually reads. `src/data/messages.ts` holds the
+`SampleMessage` shape (historical name; it's the real message model) and
+`summaryToMessage`. Folder metadata (label/glyph normalization for raw
+IMAP names like `INBOX.Sent`) lives in `src/data/folders.ts`. `AccountId`
+(an alias for the account's email) is the identity, and color comes from
+`colorForIndex()` keyed by position, overridable per-account via the
 sidebar's right-click context menu. Settings' "Unified inbox" toggle
 switches `MessageList` from the active account/folder to
-`useMessageStore.getUnifiedInbox()` (every account's INBOX merged). See
-`docs/technical/frontend-layout.md` for the breakpoint/splitter/persistence
-details and the rest of this layer's non-obvious decisions.
+`useMessageStore.getUnifiedInbox()` (every account's INBOX merged).
+Settings changes are staged in `SettingsModal` and only apply on
+Save/Done (`SettingsValues`/`onApply`); the applied values persist via
+`usePersistedJSON`. See `docs/technical/frontend-layout.md` for the
+breakpoint/splitter/persistence details and the rest of this layer's
+non-obvious decisions.
 
 One cross-cutting gotcha worth knowing before touching any dropdown/menu/
 suggestion-list component: every `react-native-web` `View` is an implicit
@@ -217,20 +252,44 @@ story:
   verification or the persistence step fails. This is the pattern to follow
   for any future command that coordinates credentials with another step:
   never leave an unverified or unrecorded credential sitting in the
-  keychain. Also exposes `list_accounts`/`remove_account` and
-  `fetch_unified_inbox(limit)`, which fans `imap::fetch_messages` out across
-  every stored account via `join_all`, skips (logs, doesn't fail) any
-  account whose fetch errors, and merges by parsed RFC 3339 date -- never by
-  raw string comparison, since two servers in different UTC offsets sort
-  wrong that way.
+  keychain. Special folders (sent/trash/archive/drafts/spam) are resolved
+  from the verify step's LIST response via `imap::resolve_special_folder`
+  rather than hardcoded defaults -- many providers nest them
+  (`INBOX.Sent`, `[Gmail]/Sent Mail`), and a bare "Sent" would name a
+  folder that doesn't exist. For accounts recorded before that existed (or
+  servers that change), the APPEND/move paths self-heal at runtime:
+  `smtp::append_to_sent`, `drafts::append_draft_to_imap`, and
+  `imap::move_messages_with_heal` all retry a failed operation against
+  `imap::resolve_equivalent_folder`'s match and persist the corrected name
+  via `imap::persist_folder_correction`. `imap::create_folder` likewise
+  retries inside the server's `INBOX.` namespace when a bare CREATE is
+  rejected (`detect_namespace_prefix`). Also exposes
+  `list_accounts`/`update_account`/`remove_account` and
+  `fetch_unified_inbox(limit)`, which fans out across every stored account
+  via `join_all` -- each over its own protocol (`imap::fetch_messages` for
+  IMAP accounts, `pop3::list_messages` for POP3, adapted to the shared
+  `MessageSummary` shape) -- skips (logs, doesn't fail) any account whose
+  fetch errors, and merges by parsed RFC 3339 date -- never by raw string
+  comparison, since two servers in different UTC offsets sort wrong that way.
 - `pop3.rs` -- hand-rolled POP3 (RFC 1939) over `tokio_native_tls`, POP3S
   (port 995, implicit TLS) only, no STARTTLS/plaintext path, matching this
   codebase's no-insecure-connection-anywhere posture. `list_messages`/
   `fetch_message`/`delete_message`; `fetch_message` reuses
-  `imap::parse_message_body`. Not integrated with the local cache or
-  account model -- POP3 has neither folders nor a stable per-session UID
-  model, so forcing it into `cached_messages`' `(account_id, folder, uid)`
-  schema is a separate design problem, not solved yet.
+  `imap::parse_message_body`. Cached in its own `cached_pop3_messages`
+  table keyed by `(account_id, uidl)` -- POP3 has no folders and no
+  IMAP-style integer UID, so it can't share `cached_messages`'
+  `(account_id, folder, uid)` schema; the RFC 1939 UIDL is its stable
+  cross-session key (messages with no UIDL aren't cached). `list_messages`
+  writes summaries through, `fetch_message` resolves the UIDL in-session
+  and writes the body through, and `cache::load_cached_pop3_messages`/
+  `load_cached_pop3_message_body` read them back offline.
+  `account::fetch_unified_inbox` now includes POP3 accounts (listing each
+  over POP3 and adapting `Pop3MessageSummary` to `MessageSummary`, number
+  as `uid`). Downloaded POP3 attachment bytes cache too
+  (`cached_pop3_attachments`, UIDL-keyed, sharing the IMAP attachment
+  cache's total-bytes eviction budget), and POP3 mail is in local FTS
+  search via a parallel `pop3_messages_fts` index -- POP3 is at parity with
+  IMAP across the local cache.
 - `pgp.rs` -- OpenPGP via the `pgp` (rpgp) crate, chosen over
   `sequoia-openpgp` specifically to avoid that crate's LGPL license (every
   other dependency here is permissive). `generate_keypair`/
@@ -250,12 +309,24 @@ lowercased email) happens at `imap::fetch_message_body` and
 sending a message is a real correspondence signal, showing up in a folder
 listing is not.
 
-No connection pooling or persistent IMAP/POP3 session exists anywhere --
-every command call opens and closes its own connection, one DB connection
-per cache call, same reasoning each place. That's intentional until there's
-a real need for a long-lived session (e.g. IMAP IDLE-based push updates,
-the biggest item still open in `backend-backlog.md`); don't add pooling
-speculatively.
+Other modules follow the same one-module-one-concern shape, each with its
+own `docs/technical/` doc: `caldav.rs`/`carddav.rs` (RFC 6764 discovery,
+sync, and -- for CardDAV -- contact upserts tagged with a
+`source` column so the address-book tab can filter per book), `drafts.rs`
+(local + IMAP-APPENDed drafts, the outbox behind undo/scheduled send),
+`bayes.rs` (local spam classifier), `snooze.rs`, `identities.rs`,
+`ics.rs`, `smime.rs`, `idle.rs` (IMAP IDLE push, the one long-lived
+connection), and `lock.rs` (optional app lock: Argon2id-hashed password in
+the keychain under a reserved sentinel, plus FIDO2 passkey enrollment/
+assertion behind the optional `passkey` cargo feature -- default builds
+stub those two commands with a clear error so the frontend can explain).
+
+With the exception of `idle.rs`, no connection pooling or persistent
+IMAP/POP3 session exists anywhere -- every command call opens and closes
+its own connection, one DB connection per cache call, same reasoning each
+place. That's intentional; don't add pooling speculatively. `cache.rs`
+still has no real migration framework, but `add_column_if_missing` handles
+additive column migrations (currently `contacts.source`).
 
 ### Frontend <-> backend boundary
 
@@ -307,8 +378,7 @@ tests that run in the default `cargo test` pass.
   per-feature implementation notes) are living documentation, not a one-time
   setup artifact. When a feature, architecture decision, or setup step
   lands, update or add the relevant doc in the same change rather than
-  leaving it to drift -- `docs/technical/backend-backlog.md` is the running
-  checklist of backend work, and each backlog item gets its own doc once
+  leaving it to drift -- each feature gets its own doc once
   implemented, following the pattern of `credential-storage.md` /
   `imap-core.md` / `account-onboarding.md` / `multi-account.md` /
   `pgp.md` / `pop3.md`.

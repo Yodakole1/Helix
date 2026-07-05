@@ -1,6 +1,6 @@
 import { useEffect, useState } from "react";
 import { Pressable, StyleSheet, Text, TextInput, View } from "react-native";
-import { exportPublicKey, generateKeypair, importContactKey, importOwnKey } from "../lib/pgp";
+import { deleteContactKey, deleteOwnKey, exportPublicKey, generateKeypair, importContactKey, importOwnKey, listContactKeys, type StoredContactKey } from "../lib/pgp";
 import { colors, fontFamily, fontSize, radii, spacing } from "../theme";
 
 interface PgpKeySettingsProps {
@@ -10,11 +10,6 @@ interface PgpKeySettingsProps {
 }
 
 type KeyStatus = "checking" | "none" | "present";
-
-interface ImportedContact {
-  email: string;
-  fingerprint: string;
-}
 
 // Settings > Privacy & Security's key-management section -- the one place
 // in the frontend that actually calls src-tauri/src/pgp.rs. Modeled on
@@ -34,11 +29,12 @@ export function PgpKeySettings({ accountId, accountLabel, accentColor }: PgpKeyS
   const [contactPublicKey, setContactPublicKey] = useState("");
   const [contactBusy, setContactBusy] = useState(false);
   const [contactError, setContactError] = useState("");
-  const [importedContacts, setImportedContacts] = useState<ImportedContact[]>([]);
+  const [contactKeys, setContactKeys] = useState<StoredContactKey[]>([]);
 
   // export_public_key doubles as the "does a key already exist" check --
   // its only realistic failure is "no PGP key on file for this account",
-  // so there's no separate has_key command to call first.
+  // so there's no separate has_key command to call first. Contact keys are
+  // loaded alongside it so the list survives session restarts.
   useEffect(() => {
     let cancelled = false;
     setStatus("checking");
@@ -55,6 +51,9 @@ export function PgpKeySettings({ accountId, accountLabel, accentColor }: PgpKeyS
         if (cancelled) return;
         setStatus("none");
       });
+    listContactKeys()
+      .then((keys) => { if (!cancelled) setContactKeys(keys); })
+      .catch(() => {});
     return () => {
       cancelled = true;
     };
@@ -94,6 +93,21 @@ export function PgpKeySettings({ accountId, accountLabel, accentColor }: PgpKeyS
     }
   }
 
+  async function handleDeleteOwnKey() {
+    setBusy(true);
+    setErrorMessage("");
+    try {
+      await deleteOwnKey(accountId);
+      setFingerprint("");
+      setExportedPublicKey("");
+      setStatus("none");
+    } catch (err) {
+      setErrorMessage(err instanceof Error ? err.message : "Could not remove the key.");
+    } finally {
+      setBusy(false);
+    }
+  }
+
   async function handleCopyPublicKey() {
     await navigator.clipboard.writeText(exportedPublicKey);
     setCopyConfirmed(true);
@@ -105,14 +119,25 @@ export function PgpKeySettings({ accountId, accountLabel, accentColor }: PgpKeyS
     setContactBusy(true);
     setContactError("");
     try {
-      const importedFingerprint = await importContactKey(contactEmail.trim(), contactPublicKey.trim());
-      setImportedContacts((current) => [{ email: contactEmail.trim(), fingerprint: importedFingerprint }, ...current]);
+      await importContactKey(contactEmail.trim(), contactPublicKey.trim());
       setContactEmail("");
       setContactPublicKey("");
+      // Reload the full list so the new entry shows with its real fingerprint
+      // and imported_at, and is sorted consistently with older entries.
+      listContactKeys().then(setContactKeys).catch(() => {});
     } catch (err) {
       setContactError(err instanceof Error ? err.message : "Could not import that key.");
     } finally {
       setContactBusy(false);
+    }
+  }
+
+  async function handleDeleteContactKey(email: string) {
+    try {
+      await deleteContactKey(email);
+      setContactKeys((current) => current.filter((key) => key.email !== email));
+    } catch (err) {
+      setContactError(err instanceof Error ? err.message : "Could not remove that key.");
     }
   }
 
@@ -134,6 +159,11 @@ export function PgpKeySettings({ accountId, accountLabel, accentColor }: PgpKeyS
             </Pressable>
             <Pressable onPress={handleGenerate} disabled={busy} style={styles.secondaryButton}>
               <Text style={styles.secondaryButtonText}>{busy ? "Working..." : "Regenerate"}</Text>
+            </Pressable>
+            <Pressable onPress={handleDeleteOwnKey} disabled={busy} style={styles.secondaryButton}>
+              <Text style={[styles.secondaryButtonText, { color: colors.accent.amber }]}>
+                {busy ? "Working..." : "Remove key"}
+              </Text>
             </Pressable>
           </View>
         </View>
@@ -188,9 +218,25 @@ export function PgpKeySettings({ accountId, accountLabel, accentColor }: PgpKeyS
 
       <Text style={styles.sectionTitle}>Contact keys</Text>
       <Text style={styles.hint}>
-        Import a contact's public key to send them encrypted mail. There's no command yet to list keys imported in a
-        previous session, so only what you import right now shows up below.
+        Import a contact's public key to send them encrypted mail.
       </Text>
+
+      {contactKeys.length > 0 && (
+        <View style={styles.importedList}>
+          {contactKeys.map((key) => (
+            <View key={key.email} style={styles.importedRow}>
+              <View style={styles.importedRowContent}>
+                <Text style={styles.importedEmail} numberOfLines={1}>{key.email}</Text>
+                <Text style={styles.importedFingerprint} numberOfLines={1}>{key.fingerprint}</Text>
+              </View>
+              <Pressable onPress={() => handleDeleteContactKey(key.email)} style={styles.deleteKeyButton}>
+                <Text style={styles.deleteKeyText}>Remove</Text>
+              </Pressable>
+            </View>
+          ))}
+        </View>
+      )}
+
       <Text style={styles.label}>Contact email</Text>
       <TextInput
         style={styles.input}
@@ -218,16 +264,6 @@ export function PgpKeySettings({ accountId, accountLabel, accentColor }: PgpKeyS
       >
         <Text style={styles.primaryButtonText}>{contactBusy ? "Importing..." : "Import contact key"}</Text>
       </Pressable>
-
-      {importedContacts.length > 0 && (
-        <View style={styles.importedList}>
-          {importedContacts.map((contact) => (
-            <Text key={contact.email} style={styles.importedRow} numberOfLines={1}>
-              {contact.email} -- {contact.fingerprint}
-            </Text>
-          ))}
-        </View>
-      )}
     </View>
   );
 }
@@ -330,11 +366,37 @@ const styles = StyleSheet.create({
   },
   importedList: {
     marginTop: spacing.sm,
+    marginBottom: spacing.md,
   },
   importedRow: {
+    flexDirection: "row",
+    alignItems: "center",
+    paddingVertical: spacing.xs,
+    borderBottomWidth: 1,
+    borderBottomColor: colors.border.subtle,
+  },
+  importedRowContent: {
+    flex: 1,
+    marginRight: spacing.sm,
+  },
+  importedEmail: {
+    fontFamily: fontFamily.ui,
+    fontSize: fontSize.sm,
+    color: colors.text.primary,
+    marginBottom: 2,
+  },
+  importedFingerprint: {
     fontFamily: fontFamily.mono,
     fontSize: 11,
-    color: colors.text.secondary,
-    marginBottom: spacing.xs,
+    color: colors.text.muted,
+  },
+  deleteKeyButton: {
+    paddingVertical: 2,
+    paddingHorizontal: spacing.sm,
+  },
+  deleteKeyText: {
+    fontFamily: fontFamily.ui,
+    fontSize: fontSize.xs,
+    color: colors.accent.amber,
   },
 });

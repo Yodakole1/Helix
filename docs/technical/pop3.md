@@ -20,7 +20,7 @@ TCP/TLS layer underneath `async-imap`'s protocol logic.
 
 **POP3S (port 995, implicit TLS) only — no STARTTLS, no plaintext port
 110.** This codebase has no insecure-connection path anywhere else
-(`backend-backlog.md` calls this out explicitly for the rest of the
+(the per-feature docs in `docs/technical/` calls this out explicitly for the rest of the
 stack); adding plaintext POP3 would be the first exception. Implicit TLS
 is also what both the real test mailbox and GreenMail's `pop3s` mode
 offer directly, so there was no need for a STARTTLS branch the way
@@ -86,19 +86,69 @@ This was a pure extraction — `fetch_body_by_uid`'s own behavior and
 existing tests are unchanged, it just delegates to the shared function
 after fetching the raw bytes over IMAP.
 
+## Local cache integration
+
+POP3 mail is now cached, but in its own `cached_pop3_messages` table rather
+than the IMAP `cached_messages` one. The reason is the schema mismatch
+noted before: `cached_messages` is keyed by `(account_id, folder, uid)`,
+and POP3 has no folders and no IMAP-style integer UID. What it *does* have
+is the RFC 1939 `UIDL` — a persistent, cross-session unique identifier
+(optional in the spec, but supported by GreenMail and the real test
+mailbox) — so the POP3 table is keyed by `(account_id, uidl)` instead. The
+last-seen message `number` rides along as a best-effort hint (it's the
+RETR address within a live session, but the server renumbers it after a
+deletion, so it's never the key). Messages a server reports no `UIDL` for
+simply aren't cached — there's no durable key to cache them under.
+
+- `list_messages` writes its summaries through (`cache::upsert_pop3_summaries`),
+  best-effort, the same log-and-continue posture as the IMAP/contact cache
+  writes.
+- `fetch_message` resolves the message's `UIDL` in the same session (a
+  cheap `UIDL n` command) and writes the body through
+  (`cache::upsert_pop3_body`), keyed by that UIDL.
+- `cache::load_cached_pop3_messages(account_id, limit)` and
+  `load_cached_pop3_message_body(account_id, uidl)` read them back offline,
+  the POP3 counterparts to IMAP's `load_cached_messages`/
+  `load_cached_message_body`. Offline, a message is opened by its UIDL
+  (stable), not its number (which may have changed).
+
+Attachment bytes and full-text search both follow the same UIDL-keyed,
+own-table pattern:
+
+- **Attachments.** `pop3_fetch_attachment` resolves the UIDL in-session and
+  writes the downloaded bytes through to a `cached_pop3_attachments` table
+  keyed `(account_id, uidl, idx)` (`cache::upsert_pop3_attachment`), read
+  back offline by `cache::load_cached_pop3_attachment`. It shares one total
+  byte budget with the IMAP `cached_attachments` table -- eviction
+  (`evict_attachments_over_budget`) spans both, dropping oldest-downloaded
+  first regardless of protocol, so the cap is on total bytes, not per
+  table. `get_cached_pop3_body` relists downloaded attachments so they
+  reopen offline.
+- **Full-text search.** A `pop3_messages_fts` FTS5 table (parallel to
+  `messages_fts`, kept in sync by triggers on `cached_pop3_messages`, with
+  the same one-time backfill) makes cached POP3 subject/from/body
+  searchable. `cache::search_cached_messages` merges POP3 hits into the
+  same result list as IMAP: a POP3 hit sets `LocalSearchResult.uidl` (its
+  stable open key), carries `number` in `uid` for a live RETR, and reports
+  `folder = "INBOX"`. The frontend tells a POP3 hit from an IMAP one by
+  `uidl` being present.
+
 ## What this doesn't do
 
-- **No local cache integration.** `cache.rs`'s `cached_messages` table is
-  keyed by `(account_id, folder, uid)`; POP3 has neither folders nor a
-  stable UID model in that sense (message numbers aren't guaranteed
-  stable across sessions on every server, and `UIDL` is optional).
-  Forcing POP3 into that schema is a separate design problem, not solved
-  here — POP3 stays a direct, session-oriented fetch.
-- **No account-model integration.** No `pop3_host`/`pop3_port` fields on
-  `cache::AccountRecord`. `pop3.rs`'s commands take `host`/`port` from
-  the caller directly, like every other protocol command today. Wiring
-  POP3 in as a selectable sync method during onboarding is a frontend-
-  driven follow-up, not part of this pass.
+- **Account-model integration is now fuller, but not total.** A POP3
+  account is onboarded and persisted (`cache::AccountRecord`'s
+  `incoming_protocol` (`"imap"`/`"pop3"`), `pop3_host`, `pop3_port`;
+  `account::add_pop3_account` stores + verifies via `pop3::verify_login`),
+  `update_account` re-verifies over POP3, and `fetch_unified_inbox` now
+  *does* include POP3 accounts — it lists each over POP3 and merges the
+  results into the same date-sorted unified view as IMAP, converting each
+  `Pop3MessageSummary` to the shared `MessageSummary` shape (the POP3
+  `number` carried in `uid` for RETR, no flags). What's still not done: the
+  POP3 mail commands (`list_messages`/`fetch_message`/`delete_message`)
+  still take `host`/`port` from the caller rather than resolving them from
+  the stored account; and the unified fan-out lists a POP3 account's whole
+  inbox (POP3 has no `EXAMINE`-style server-side fetch window), so the
+  overall `limit` is applied in the merge, not at the server.
 - **No APOP/SASL.** Plain `USER`/`PASS` only, matching IMAP's plain
   `LOGIN` and SMTP's plain `Credentials` elsewhere in this codebase —
   POP3S's transport encryption already covers what APOP's challenge-

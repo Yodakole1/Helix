@@ -134,14 +134,37 @@ blank when a live fetch can't reach the server:
 - `load_cached_message_body(account_id, folder, uid)` →
   `Option<MessageBody>`. `None` means only the summary was cached (or the
   UID is unknown) and a live fetch is required.
+- `load_cached_attachment(account_id, folder, uid, attachment_index)` →
+  `Option<AttachmentContent>`. Returns a once-downloaded attachment's bytes
+  (base64, same shape as the live `fetch_attachment`) so it reopens offline
+  and without re-downloading. `None` means it was never downloaded or has
+  since been evicted.
 
-A cached body carries only `text`/`html` and the threading IDs — the
-columns the cache actually stores. Attachment bytes, recipient lists, and
-PGP verification state aren't cached, so those come back at their empty
-defaults: offline reading shows the message text, but downloading an
-attachment or re-running PGP verification still needs a live connection.
-This is a deliberate "show what we have" degradation, not a full offline
-mode.
+A cached body carries `text`/`html`, the threading IDs, and the list of
+any attachments previously downloaded (relisted from the attachment cache,
+so they can be reopened offline). Recipient lists and PGP verification
+state aren't cached, so those come back at their empty defaults, and an
+attachment that was never downloaded won't be listed offline. This is a
+deliberate "show what we have" degradation, not a full offline mode.
+
+### Attachment byte cache
+
+Downloaded attachment bytes live in their own `cached_attachments` table
+(keyed by `account_id/folder/uid/idx`, a BLOB column), not as columns on
+`cached_messages`: a message can have many attachments and most cache
+reads have no use for the bytes. It's written through by `imap.rs`'s
+`fetch_attachment` only — attachments are cached when the user actually
+downloads one, never eagerly on a body fetch. Two bounds keep it from
+growing without limit (both best-effort, like every cache write): a
+per-item cap (`MAX_CACHED_ATTACHMENT_BYTES`, 25 MB — larger attachments
+are simply not cached, the live fetch still serves them) and a total
+budget (`MAX_TOTAL_ATTACHMENT_CACHE_BYTES`, 250 MB — exceeding it evicts
+oldest-downloaded rows until it fits, evicting across **both** the IMAP
+`cached_attachments` table and the POP3 `cached_pop3_attachments` table so
+the budget is on total bytes regardless of protocol). POP3 mail has its own
+UIDL-keyed cache tables -- `cached_pop3_messages` (summaries/bodies) and
+`cached_pop3_attachments` (bytes) -- since POP3 has no folder/integer-uid
+to share the IMAP schema; see `pop3.md`.
 
 ## What this doesn't do yet
 
@@ -158,8 +181,12 @@ This is the storage layer only. Still unbuilt, each its own backlog item:
 - **Contact/address cache.** This one's actually done -- a `contacts`
   table exists and is wired into `fetch_message_body`/`send_message`,
   see `contacts.md`. Left here as a historical note that this list goes
-  stale; check `backend-backlog.md` for the current source of truth.
-- **Full-text search.** No FTS index; `cached_messages` is a plain table.
+  stale; check the per-feature docs in `docs/technical/` for the current source of truth.
+- **Full-text search.** Done -- an FTS5 table (`messages_fts`) now indexes
+  cached subject/from/body and powers `cache::search_local_messages`, the
+  offline/global counterpart to the server-side IMAP search. See
+  `local-search.md`. (Another entry that's gone stale; the per-feature docs in `docs/technical/`
+  is the source of truth.)
 - **Attachment bytes.** `imap::fetch_attachment`/`pop3::pop3_fetch_attachment`
   download a specific attachment's bytes now (base64-encoded over IPC,
   addressed by its index in `fetch_message_body`'s attachment list), but
