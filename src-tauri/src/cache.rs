@@ -521,6 +521,13 @@ pub(crate) fn open_at(path: &Path, key: &str) -> Result<Connection, String> {
         "ALTER TABLE accounts ADD COLUMN sent_folder TEXT NOT NULL DEFAULT 'Sent'",
         [],
     );
+    // OAuth accounts: how the account authenticates and which provider
+    // preset it uses -- see the AccountRecord field docs.
+    let _ = conn.execute(
+        "ALTER TABLE accounts ADD COLUMN auth_method TEXT NOT NULL DEFAULT 'password'",
+        [],
+    );
+    let _ = conn.execute("ALTER TABLE accounts ADD COLUMN oauth_provider TEXT", []);
 
     backfill_fts_if_empty(&conn)?;
     backfill_pop3_fts_if_empty(&conn)?;
@@ -1884,6 +1891,15 @@ pub struct AccountRecord {
     pub drafts_folder: String,
     pub spam_folder: String,
     pub sent_folder: String,
+    /// `"password"` (the default) or `"oauth2"`. Mirrors what kind of
+    /// secret sits in the keychain for this account so the frontend can
+    /// render the right settings UI (an OAuth account has no password to
+    /// rotate); the protocol code itself branches on the keychain
+    /// payload, not this column -- see `oauth.rs`.
+    pub auth_method: String,
+    /// The OAuth provider preset (`"gmail"` / `"microsoft"`) when
+    /// `auth_method` is `"oauth2"`, otherwise `None`.
+    pub oauth_provider: Option<String>,
 }
 
 /// Upserts one account's metadata. `created_at` is only set on the
@@ -1898,8 +1914,8 @@ pub fn upsert_account(conn: &Connection, account: &AccountRecord) -> Result<(), 
             (account_id, display_name, imap_host, imap_port, imap_use_starttls,
              smtp_host, smtp_port, smtp_use_starttls, incoming_protocol,
              pop3_host, pop3_port, archive_folder, trash_folder, drafts_folder,
-             spam_folder, sent_folder, created_at)
-         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16, ?17)
+             spam_folder, sent_folder, auth_method, oauth_provider, created_at)
+         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16, ?17, ?18, ?19)
          ON CONFLICT(account_id) DO UPDATE SET
             display_name = excluded.display_name,
             imap_host = excluded.imap_host,
@@ -1915,7 +1931,9 @@ pub fn upsert_account(conn: &Connection, account: &AccountRecord) -> Result<(), 
             trash_folder = excluded.trash_folder,
             drafts_folder = excluded.drafts_folder,
             spam_folder = excluded.spam_folder,
-            sent_folder = excluded.sent_folder",
+            sent_folder = excluded.sent_folder,
+            auth_method = excluded.auth_method,
+            oauth_provider = excluded.oauth_provider",
         params![
             account.account_id,
             account.display_name,
@@ -1933,6 +1951,8 @@ pub fn upsert_account(conn: &Connection, account: &AccountRecord) -> Result<(), 
             account.drafts_folder,
             account.spam_folder,
             account.sent_folder,
+            account.auth_method,
+            account.oauth_provider,
             created_at,
         ],
     )
@@ -1946,7 +1966,7 @@ pub fn list_accounts(conn: &Connection) -> Result<Vec<AccountRecord>, String> {
             "SELECT account_id, display_name, imap_host, imap_port, imap_use_starttls,
                     smtp_host, smtp_port, smtp_use_starttls, incoming_protocol,
                     pop3_host, pop3_port, archive_folder, trash_folder, drafts_folder,
-                    spam_folder, sent_folder
+                    spam_folder, sent_folder, auth_method, oauth_provider
              FROM accounts ORDER BY created_at ASC",
         )
         .map_err(|e| format!("could not prepare account list query: {e}"))?;
@@ -1969,6 +1989,8 @@ pub fn list_accounts(conn: &Connection) -> Result<Vec<AccountRecord>, String> {
                 drafts_folder: row.get(13)?,
                 spam_folder: row.get(14)?,
                 sent_folder: row.get(15)?,
+                auth_method: row.get(16)?,
+                oauth_provider: row.get(17)?,
             })
         })
         .map_err(|e| format!("could not query accounts: {e}"))?;
@@ -1986,7 +2008,7 @@ pub fn get_account(conn: &Connection, account_id: &str) -> Result<Option<Account
         "SELECT account_id, display_name, imap_host, imap_port, imap_use_starttls,
                 smtp_host, smtp_port, smtp_use_starttls, incoming_protocol,
                 pop3_host, pop3_port, archive_folder, trash_folder, drafts_folder,
-                spam_folder, sent_folder
+                spam_folder, sent_folder, auth_method, oauth_provider
          FROM accounts WHERE account_id = ?1",
         params![account_id],
         |row| {
@@ -2007,6 +2029,8 @@ pub fn get_account(conn: &Connection, account_id: &str) -> Result<Option<Account
                 drafts_folder: row.get(13)?,
                 spam_folder: row.get(14)?,
                 sent_folder: row.get(15)?,
+                auth_method: row.get(16)?,
+                oauth_provider: row.get(17)?,
             })
         },
     )
@@ -3875,6 +3899,8 @@ mod tests {
             drafts_folder: "Drafts".to_string(),
             spam_folder: "Spam".to_string(),
             sent_folder: "Sent".to_string(),
+            auth_method: "password".to_string(),
+            oauth_provider: None,
         }
     }
 

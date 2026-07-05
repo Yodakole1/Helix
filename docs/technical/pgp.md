@@ -12,11 +12,12 @@ and decryption/verification on top of the existing IMAP/POP3/SMTP layers.
 | Real-world use | Delta Chat (an email client) | GnuPG-adjacent tooling   |
 
 Every other dependency in this codebase is permissively licensed.
-`sequoia-openpgp`'s LGPL would be the first copyleft dependency and could
-constrain Helix's not-yet-finalized open-source license choice (the
-README still says "a license will be added before the first public
-release"). `pgp` is also proven specifically for email encryption
-(Delta Chat uses it), not just generic OpenPGP tooling.
+`sequoia-openpgp`'s LGPL would have been the first copyleft dependency at
+a time when Helix's own license wasn't yet chosen. (Helix has since been
+licensed GPL-3.0-only, which LGPL is compatible with -- the choice of
+`pgp` stands on the other grounds regardless.) `pgp` is also proven
+specifically for email encryption (Delta Chat uses it), not just generic
+OpenPGP tooling.
 
 ## Private key protection: no separate passphrase
 

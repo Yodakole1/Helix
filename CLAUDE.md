@@ -8,8 +8,11 @@ Helix is a lightweight, privacy-focused, cross-platform email client
 (desktop -- Windows, macOS, Linux -- now, mobile -- iOS/Android -- planned)
 built on a single codebase: direct
 IMAP/POP3/SMTP connections to mail providers (no middleman sync servers),
-local encryption, and a dark-mode-first, customizable UI. It is intended
-to be published as an open-source project.
+local encryption, and a dark-mode-first, customizable UI. It is open
+source under GPL-3.0-only (`LICENSE` at the repo root; `license` fields in
+`Cargo.toml`/`package.json`/`tauri.conf.json` must stay in sync with it).
+New dependencies must be GPL-compatible -- permissive (MIT/Apache-2.0/BSD)
+is always fine.
 
 "Lightweight" describes the Tauri shell (native OS webview, no bundled
 Chromium/Node the way Electron ships), not the UI layer itself -- the
@@ -316,10 +319,15 @@ sync, and -- for CardDAV -- contact upserts tagged with a
 (local + IMAP-APPENDed drafts, the outbox behind undo/scheduled send),
 `bayes.rs` (local spam classifier), `snooze.rs`, `identities.rs`,
 `ics.rs`, `smime.rs`, `idle.rs` (IMAP IDLE push, the one long-lived
-connection), and `lock.rs` (optional app lock: Argon2id-hashed password in
+connection), `lock.rs` (optional app lock: Argon2id-hashed password in
 the keychain under a reserved sentinel, plus FIDO2 passkey enrollment/
 assertion behind the optional `passkey` cargo feature -- default builds
-stub those two commands with a clear error so the frontend can explain).
+stub those two commands with a clear error so the frontend can explain),
+and `oauth.rs` (Gmail/Microsoft 365 OAuth2: RFC 8252 browser+loopback
+flow, refresh token stored as a marked JSON blob in the same keychain
+entry a password would use -- IMAP/SMTP/POP3 each branch to XOAUTH2 by
+parsing the stored secret, not via a config flag; access tokens live in
+an in-process cache because every command opens its own connection).
 
 With the exception of `idle.rs`, no connection pooling or persistent
 IMAP/POP3 session exists anywhere -- every command call opens and closes

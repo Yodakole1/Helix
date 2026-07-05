@@ -153,7 +153,7 @@ export function TitleBar({
       {searchable && (
         <View style={styles.searchGroup}>
           <View style={styles.searchInputWrapper}>
-            <ListIcon name="search" color={colors.text.muted} size={13} />
+            <ListIcon name="search" color={colors.text.muted} size={15} />
             <TextInput
               ref={searchInputRef}
               style={styles.searchInput}
@@ -472,7 +472,7 @@ const styles = StyleSheet.create({
     flexShrink: 0,
   },
   searchInputWrapper: {
-    width: 240,
+    width: 320,
     flexDirection: "row",
     alignItems: "center",
     backgroundColor: colors.background.surface,
@@ -480,12 +480,12 @@ const styles = StyleSheet.create({
     borderColor: colors.border.subtle,
     borderRadius: radii.sm,
     paddingHorizontal: spacing.sm,
-    paddingVertical: 5,
+    paddingVertical: 6,
   },
   searchInput: {
     flex: 1,
     fontFamily: fontFamily.ui,
-    fontSize: fontSize.xs,
+    fontSize: fontSize.sm,
     color: colors.text.primary,
     marginLeft: spacing.xs,
   },

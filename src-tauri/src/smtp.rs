@@ -1,6 +1,6 @@
 use lettre::message::header::{ContentType, InReplyTo, References};
 use lettre::message::{Attachment, Mailbox, Mailboxes, MultiPart, SinglePart};
-use lettre::transport::smtp::authentication::Credentials;
+use lettre::transport::smtp::authentication::{Credentials, Mechanism};
 use lettre::{AsyncSmtpTransport, AsyncTransport, Message, Tokio1Executor};
 use serde::{Deserialize, Serialize};
 use zeroize::Zeroize;
@@ -8,8 +8,31 @@ use zeroize::Zeroize;
 use crate::cache;
 use crate::credentials;
 use crate::imap;
+use crate::oauth;
 use crate::pgp;
 use crate::smime;
+
+/// Resolves what to hand lettre for this account: for an OAuth account a
+/// fresh access token with the XOAUTH2 mechanism pinned (offering PLAIN
+/// alongside would let the server pick a mechanism the token can't
+/// satisfy), for a password account the password with lettre's default
+/// PLAIN/LOGIN negotiation.
+async fn transport_credentials(account_id: &str) -> Result<(Credentials, Vec<Mechanism>), String> {
+    let mut secret = credentials::get_credential(account_id.to_string())?;
+    let result = match oauth::access_token_for_secret(account_id, &secret).await {
+        Ok(Some(access_token)) => Ok((
+            Credentials::new(account_id.to_string(), access_token),
+            vec![Mechanism::Xoauth2],
+        )),
+        Ok(None) => Ok((
+            Credentials::new(account_id.to_string(), secret.clone()),
+            vec![Mechanism::Plain, Mechanism::Login],
+        )),
+        Err(e) => Err(e),
+    };
+    secret.zeroize();
+    result
+}
 
 /// One outgoing attachment. `content_id`, when set, marks this as an inline
 /// resource referenced from the HTML body via `<img src="cid:<content_id>">`.
@@ -218,7 +241,7 @@ pub async fn send_message(
         }
     }
 
-    let mut password = credentials::get_credential(account_id.clone())?;
+    let (creds, auth_mechanisms) = transport_credentials(&account_id).await?;
 
     let body = if encrypt {
         let to_email = to_list[0].email.to_string();
@@ -280,11 +303,10 @@ pub async fn send_message(
     }
     .map_err(|e| format!("could not configure SMTP relay for {host}: {e}"))?;
 
-    let creds = Credentials::new(account_id.clone(), password.clone());
-    password.zeroize();
     let mailer: AsyncSmtpTransport<Tokio1Executor> = builder
         .port(port)
         .credentials(creds)
+        .authentication(auth_mechanisms)
         .build();
 
     // Capture the raw bytes before moving email into the transport. BCC
@@ -329,7 +351,7 @@ pub async fn send_mdn(
     original_subject: String,
     recipient_display_address: String,
 ) -> Result<(), String> {
-    let mut password = credentials::get_credential(account_id.clone())?;
+    let (creds, auth_mechanisms) = transport_credentials(&account_id).await?;
 
     let from: Mailbox = recipient_display_address
         .parse()
@@ -366,20 +388,19 @@ pub async fn send_mdn(
         .body(mdn_body)
         .map_err(|e| format!("could not build MDN: {e}"))?;
 
-    let creds = Credentials::new(account_id.clone(), password.clone());
-    password.zeroize();
-
     let mailer = if use_starttls {
         AsyncSmtpTransport::<Tokio1Executor>::starttls_relay(&host)
             .map_err(|e| format!("STARTTLS setup failed for {host}: {e}"))?
             .port(port)
             .credentials(creds)
+            .authentication(auth_mechanisms)
             .build()
     } else {
         AsyncSmtpTransport::<Tokio1Executor>::relay(&host)
             .map_err(|e| format!("relay setup failed for {host}: {e}"))?
             .port(port)
             .credentials(creds)
+            .authentication(auth_mechanisms)
             .build()
     };
 

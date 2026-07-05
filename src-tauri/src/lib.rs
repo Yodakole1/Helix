@@ -11,6 +11,7 @@ mod idle;
 mod identities;
 mod imap;
 mod lock;
+mod oauth;
 mod pgp;
 mod pop3;
 mod smime;
@@ -57,6 +58,7 @@ pub fn run() {
       imap::unsubscribe_folder,
       imap::list_subscribed_folders,
       account::add_account,
+      account::add_oauth_account,
       account::add_pop3_account,
       account::update_account,
       account::list_accounts,
@@ -66,6 +68,7 @@ pub fn run() {
       smtp::send_message,
       smtp::send_mdn,
       discovery::discover_server_config,
+      oauth::oauth_provider_info,
       cache::search_contacts,
       cache::list_contacts,
       cache::delete_contact,

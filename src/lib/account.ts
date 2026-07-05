@@ -24,6 +24,11 @@ export interface AccountRecord {
   spam_folder: string;
   drafts_folder: string;
   sent_folder: string;
+  // "password" or "oauth2". An oauth2 account has no password to rotate --
+  // its keychain entry holds a refresh token managed by the backend.
+  auth_method: string;
+  // "gmail" | "microsoft" when auth_method is "oauth2", otherwise null.
+  oauth_provider: string | null;
 }
 
 export interface AddAccountResult {
@@ -55,6 +60,39 @@ export interface AddAccountArgs {
 
 export function addAccount(args: AddAccountArgs): Promise<AddAccountResult> {
   return invoke("add_account", args);
+}
+
+export interface AddOauthAccountArgs {
+  [key: string]: unknown;
+  accountId: string;
+  provider: "gmail" | "microsoft";
+  displayName: string | null;
+  // Only needed when the build ships without a registered OAuth client ID
+  // for the provider (oauthProviderInfo().has_builtin_client_id is false).
+  clientId: string | null;
+  clientSecret: string | null;
+}
+
+// Runs the whole browser sign-in flow on the Rust side -- this resolves
+// only after the user finishes (or abandons) the consent screen, so treat
+// it like a long-running call, not a quick lookup. No secret ever crosses
+// into JS: the refresh token goes keychain-direct in Rust.
+export function addOauthAccount(args: AddOauthAccountArgs): Promise<AddAccountResult> {
+  return invoke("add_oauth_account", args);
+}
+
+export interface OauthProviderInfo {
+  provider: string;
+  has_builtin_client_id: boolean;
+  imap_host: string;
+  imap_port: number;
+  smtp_host: string;
+  smtp_port: number;
+  smtp_use_starttls: boolean;
+}
+
+export function oauthProviderInfo(provider: "gmail" | "microsoft"): Promise<OauthProviderInfo> {
+  return invoke("oauth_provider_info", { provider });
 }
 
 export interface AddPop3AccountArgs {

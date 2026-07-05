@@ -7,6 +7,7 @@ use crate::cache::AccountRecord;
 use crate::credentials;
 use crate::imap;
 use crate::imap::MessageSummary;
+use crate::oauth;
 use crate::pop3;
 
 #[derive(Debug, Serialize)]
@@ -82,10 +83,97 @@ pub async fn add_account(
         drafts_folder: special(drafts_folder, "drafts", "Drafts"),
         spam_folder: special(spam_folder, "spam", "Spam"),
         sent_folder: special(sent_folder, "sent", "Sent"),
+        auth_method: "password".to_string(),
+        oauth_provider: None,
     };
 
     if let Err(e) = cache::open().and_then(|conn| cache::upsert_account(&conn, &record)) {
         credentials::delete_credential(account_id).ok();
+        return Err(e);
+    }
+
+    Ok(AddAccountResult { account_id, folders })
+}
+
+/// Onboards a Gmail / Microsoft 365 account over OAuth2: runs the RFC 8252
+/// browser sign-in (`oauth::run_authorization_flow`), stores the resulting
+/// refresh-token blob in the keychain under the account's entry, verifies
+/// it with a real XOAUTH2 IMAP login, then persists the account with
+/// `auth_method = "oauth2"`. Same store-verify-persist-or-roll-back
+/// discipline as `add_account` -- a refresh token is a durable secret and
+/// must never be left in the keychain unverified or unrecorded.
+///
+/// Hosts and ports come from the provider preset (these two providers'
+/// endpoints are fixed and public), so the frontend only supplies the
+/// email address and, optionally, a self-registered OAuth client ID when
+/// the build ships without one -- see `docs/technical/oauth.md`.
+#[tauri::command]
+pub async fn add_oauth_account(
+    account_id: String,
+    provider: String,
+    display_name: Option<String>,
+    client_id: Option<String>,
+    client_secret: Option<String>,
+) -> Result<AddAccountResult, String> {
+    let config = oauth::provider_config(&provider)?;
+    let (client_id, client_secret) =
+        oauth::resolve_client(&config, &provider, client_id, client_secret)?;
+
+    let tokens =
+        oauth::run_authorization_flow(&config, &client_id, client_secret.as_deref(), &account_id)
+            .await?;
+    oauth::store_authorized(&account_id, &provider, client_id, client_secret, tokens)?;
+
+    let rollback = |account_id: String| {
+        credentials::delete_credential(account_id.clone()).ok();
+        oauth::forget_token(&account_id);
+    };
+
+    // OAuth providers are implicit-TLS IMAPS only, so use_starttls is
+    // always false here. verify_and_list_folders picks the XOAUTH2 path by
+    // itself from the credential blob just stored.
+    let folders = match imap::verify_and_list_folders(
+        config.imap_host,
+        config.imap_port,
+        &account_id,
+        false,
+    )
+    .await
+    {
+        Ok(folders) => folders,
+        Err(e) => {
+            rollback(account_id);
+            return Err(e);
+        }
+    };
+
+    let special = |role: &str, default: &str| {
+        imap::resolve_special_folder(&folders, role).unwrap_or_else(|| default.to_string())
+    };
+
+    let record = AccountRecord {
+        account_id: account_id.clone(),
+        display_name,
+        imap_host: config.imap_host.to_string(),
+        imap_port: config.imap_port,
+        imap_use_starttls: false,
+        smtp_host: config.smtp_host.to_string(),
+        smtp_port: config.smtp_port,
+        smtp_use_starttls: config.smtp_use_starttls,
+        incoming_protocol: "imap".to_string(),
+        pop3_host: None,
+        pop3_port: None,
+        archive_folder: special("archive", "Archive"),
+        trash_folder: special("trash", "Trash"),
+        drafts_folder: special("drafts", "Drafts"),
+        spam_folder: special("spam", "Spam"),
+        sent_folder: special("sent", "Sent"),
+        auth_method: "oauth2".to_string(),
+        oauth_provider: Some(provider),
+    };
+
+    if let Err(e) = cache::open().and_then(|conn| cache::upsert_account(&conn, &record)) {
+        rollback(account_id);
         return Err(e);
     }
 
@@ -139,6 +227,8 @@ pub async fn add_pop3_account(
         drafts_folder: "Drafts".to_string(),
         spam_folder: "Spam".to_string(),
         sent_folder: "Sent".to_string(),
+        auth_method: "password".to_string(),
+        oauth_provider: None,
     };
 
     if let Err(e) = cache::open().and_then(|conn| cache::upsert_account(&conn, &record)) {
@@ -230,6 +320,8 @@ pub async fn update_account(
         drafts_folder: existing.drafts_folder,
         spam_folder: existing.spam_folder,
         sent_folder: existing.sent_folder,
+        auth_method: existing.auth_method,
+        oauth_provider: existing.oauth_provider,
     };
     cache::upsert_account(&conn, &record)
 }
@@ -249,6 +341,7 @@ pub fn list_accounts() -> Result<Vec<AccountRecord>, String> {
 #[tauri::command]
 pub fn remove_account(account_id: String) -> Result<(), String> {
     credentials::delete_credential(account_id.clone())?;
+    oauth::forget_token(&account_id);
 
     let result = cache::open().and_then(|conn| cache::delete_account(&conn, &account_id));
     if let Err(e) = result {

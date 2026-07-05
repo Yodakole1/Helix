@@ -14,6 +14,11 @@ one, Settings > Accounts > "Add account" -- opens the account setup page
 
 1. Enter a display name (optional), your email address, and your password
    (an app-specific password if your provider requires one for IMAP/SMTP).
+   **Gmail or Microsoft 365?** Skip the password: the "Sign in with
+   Google" / "Sign in with Microsoft" buttons open your browser to sign
+   in there (with your existing session and two-factor setup), and Helix
+   picks up automatically when you finish. No app password, and your
+   provider password never touches Helix.
 2. Pick the incoming protocol: IMAP (default, recommended) or POP3.
 3. With "advanced server settings" collapsed, Helix auto-detects your
    IMAP/SMTP host and port from your email address. Expand it to enter

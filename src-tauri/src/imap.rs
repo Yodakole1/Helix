@@ -11,6 +11,7 @@ use zeroize::Zeroize;
 
 use crate::cache;
 use crate::credentials;
+use crate::oauth;
 use crate::pgp;
 use crate::smime;
 
@@ -18,13 +19,11 @@ pub(crate) type ImapSession = Session<TlsStream<TcpStream>>;
 
 // `use_starttls = false` → implicit TLS (IMAPS/993); `true` → STARTTLS upgrade on 143.
 // STARTTLS upgrade is mandatory — bails out if the server won't do it, never continues plaintext.
-async fn connect_and_login(
+async fn connect_tls(
     host: &str,
     port: u16,
-    email: &str,
-    password: &str,
     use_starttls: bool,
-) -> Result<ImapSession, String> {
+) -> Result<async_imap::Client<TlsStream<TcpStream>>, String> {
     let tcp_stream = TcpStream::connect((host, port))
         .await
         .map_err(|e| format!("could not reach {host}:{port}: {e}"))?;
@@ -54,23 +53,89 @@ async fn connect_and_login(
             .map_err(|e| format!("TLS handshake with {host} failed: {e}"))?
     };
 
-    let client = async_imap::Client::new(tls_stream);
+    Ok(async_imap::Client::new(tls_stream))
+}
+
+async fn connect_and_login(
+    host: &str,
+    port: u16,
+    email: &str,
+    password: &str,
+    use_starttls: bool,
+) -> Result<ImapSession, String> {
+    let client = connect_tls(host, port, use_starttls).await?;
     client
         .login(email, password)
         .await
         .map_err(|(e, _client)| format!("login failed: {e}"))
 }
 
-// Password is zeroized immediately after the login attempt, success or failure.
+/// SASL XOAUTH2 (Gmail / Microsoft 365). The authenticator sends the
+/// XOAUTH2 string on the first challenge; on failure the server sends a
+/// second challenge carrying a base64 JSON error and expects an *empty*
+/// response before it issues the final NO -- answering it with the same
+/// string again would hang the exchange, hence the `sent` latch.
+struct XOAuth2Authenticator {
+    user: String,
+    access_token: String,
+    sent: bool,
+}
+
+impl async_imap::Authenticator for XOAuth2Authenticator {
+    type Response = String;
+
+    fn process(&mut self, _challenge: &[u8]) -> Self::Response {
+        if self.sent {
+            return String::new();
+        }
+        self.sent = true;
+        oauth::xoauth2_string(&self.user, &self.access_token)
+    }
+}
+
+async fn connect_and_authenticate_xoauth2(
+    host: &str,
+    port: u16,
+    email: &str,
+    access_token: &str,
+    use_starttls: bool,
+) -> Result<ImapSession, String> {
+    let client = connect_tls(host, port, use_starttls).await?;
+    let authenticator = XOAuth2Authenticator {
+        user: email.to_string(),
+        access_token: access_token.to_string(),
+        sent: false,
+    };
+    client
+        .authenticate("XOAUTH2", authenticator)
+        .await
+        .map_err(|(e, _client)| format!("OAuth login failed: {e}"))
+}
+
+// Secret is zeroized immediately after the login attempt, success or failure.
+// The stored secret decides the mechanism: an OAuth credential blob means
+// XOAUTH2 with a freshly minted access token, anything else is a password
+// for plain LOGIN -- see `oauth.rs` for why the keychain payload is the
+// source of truth rather than a config flag.
 pub(crate) async fn login_with_stored_credential(
     host: &str,
     port: u16,
     account_id: &str,
     use_starttls: bool,
 ) -> Result<ImapSession, String> {
-    let mut password = credentials::get_credential(account_id.to_string())?;
-    let result = connect_and_login(host, port, account_id, &password, use_starttls).await;
-    password.zeroize();
+    let mut secret = credentials::get_credential(account_id.to_string())?;
+    let result = match oauth::access_token_for_secret(account_id, &secret).await {
+        Ok(Some(mut access_token)) => {
+            let session =
+                connect_and_authenticate_xoauth2(host, port, account_id, &access_token, use_starttls)
+                    .await;
+            access_token.zeroize();
+            session
+        }
+        Ok(None) => connect_and_login(host, port, account_id, &secret, use_starttls).await,
+        Err(e) => Err(e),
+    };
+    secret.zeroize();
     result
 }
 

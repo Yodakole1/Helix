@@ -25,7 +25,8 @@ everyday mail:
   always be entered manually. Logins are verified before anything is
   saved. Special folders (Sent, Trash, Archive, Drafts, Spam) are detected
   from the server's real layout -- including hosting providers that nest
-  everything under `INBOX.`.
+  everything under `INBOX.`. Gmail and Microsoft 365 sign in with OAuth2
+  through your browser -- no app password needed.
 - **Mail.** Reading (sanitized HTML with remote images blocked by
   default), sending (rich text, attachments, Cc/Bcc, send-as aliases),
   replies and forwards with proper threading headers, drafts that
@@ -55,9 +56,6 @@ everyday mail:
 
 - Mobile (iOS/Android) builds -- the UI is written to be portable, but
   only desktop is built today.
-- OAuth2 login (Gmail/Outlook app passwords work; native OAuth doesn't) --
-  Helix currently prioritizes standard IMAP/SMTP providers and custom
-  domains.
 - Prebuilt installers and the apt repository -- planned for the first
   public release; today Helix builds from source.
 - Recipient tracking (knowing when someone opened your mail or clicked a

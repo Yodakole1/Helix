@@ -112,8 +112,13 @@ typecheck before sending a PR.
 
 ## License
 
-Not yet finalized. Helix is intended to be published as an open-source
-project; a license will be added before the first public release.
+Helix is free software, licensed under the [GNU General Public License,
+version 3](LICENSE) (GPL-3.0-only). You can use it, study it, modify it,
+and redistribute it -- including forks -- without asking anyone. What the
+license guarantees in return is that every fork and derivative stays free
+software under these same terms, with source code available: nobody can
+take Helix closed-source. The name "Helix" and its logo are not covered
+by the code license.
 
 ## Support Helix
 

@@ -7,6 +7,7 @@ use zeroize::Zeroize;
 use crate::cache;
 use crate::credentials;
 use crate::imap::{self, AttachmentContent, MessageBody};
+use crate::oauth;
 use crate::pgp;
 use crate::smime;
 
@@ -102,12 +103,7 @@ async fn read_multiline_raw(session: &mut Pop3Session) -> Result<Vec<u8>, String
 }
 
 // POP3S only — no STARTTLS path, no plaintext port 110.
-async fn connect_and_login(
-    host: &str,
-    port: u16,
-    account_id: &str,
-    password: &str,
-) -> Result<Pop3Session, String> {
+async fn connect_pop3s(host: &str, port: u16) -> Result<Pop3Session, String> {
     let tcp_stream = TcpStream::connect((host, port))
         .await
         .map_err(|e| format!("could not reach {host}:{port}: {e}"))?;
@@ -130,6 +126,17 @@ async fn connect_and_login(
         .await
         .map_err(|e| format!("greeting failed: {e}"))?;
 
+    Ok(session)
+}
+
+async fn connect_and_login(
+    host: &str,
+    port: u16,
+    account_id: &str,
+    password: &str,
+) -> Result<Pop3Session, String> {
+    let mut session = connect_pop3s(host, port).await?;
+
     send_command(&mut session, &format!("USER {account_id}")).await?;
     read_status_line(&mut session).await.map_err(|e| format!("login failed: {e}"))?;
 
@@ -139,17 +146,65 @@ async fn connect_and_login(
     Ok(session)
 }
 
-/// Looks up the password for `account_id` in the OS keychain and uses it
-/// to log in, zeroizing it immediately after the attempt -- same pattern
-/// as `imap.rs::login_with_stored_credential`.
+/// SASL XOAUTH2 over POP3 (RFC 5034 AUTH with an initial response) --
+/// Gmail's pop.gmail.com and Microsoft 365 both accept it. On failure the
+/// server sends a `+ <base64 JSON>` continuation and expects an empty
+/// line before its final `-ERR`, so that path is drained to surface the
+/// real error instead of a protocol desync.
+async fn connect_and_authenticate_xoauth2(
+    host: &str,
+    port: u16,
+    account_id: &str,
+    access_token: &str,
+) -> Result<Pop3Session, String> {
+    use base64::engine::general_purpose::STANDARD;
+    use base64::Engine;
+
+    let mut session = connect_pop3s(host, port).await?;
+
+    let initial = STANDARD.encode(oauth::xoauth2_string(account_id, access_token));
+    send_command(&mut session, &format!("AUTH XOAUTH2 {initial}")).await?;
+
+    let line = String::from_utf8_lossy(&read_raw_line(&mut session).await?).into_owned();
+    if line.starts_with("+OK") {
+        return Ok(session);
+    }
+    if let Some(challenge) = line.strip_prefix("+ ") {
+        // Error continuation: acknowledge with an empty response, then read
+        // the -ERR that follows.
+        send_command(&mut session, "").await?;
+        let final_line = read_status_line(&mut session).await.err().unwrap_or_default();
+        let detail = STANDARD
+            .decode(challenge.trim())
+            .ok()
+            .map(|bytes| String::from_utf8_lossy(&bytes).into_owned())
+            .unwrap_or_default();
+        return Err(format!("OAuth login failed: {final_line} {detail}"));
+    }
+    Err(format!("OAuth login failed: {line}"))
+}
+
+/// Looks up the stored secret for `account_id` in the OS keychain and uses
+/// it to log in, zeroizing it immediately after the attempt -- same
+/// pattern (and same OAuth-vs-password branch) as
+/// `imap.rs::login_with_stored_credential`.
 async fn login_with_stored_credential(
     host: &str,
     port: u16,
     account_id: &str,
 ) -> Result<Pop3Session, String> {
-    let mut password = credentials::get_credential(account_id.to_string())?;
-    let result = connect_and_login(host, port, account_id, &password).await;
-    password.zeroize();
+    let mut secret = credentials::get_credential(account_id.to_string())?;
+    let result = match oauth::access_token_for_secret(account_id, &secret).await {
+        Ok(Some(mut access_token)) => {
+            let session =
+                connect_and_authenticate_xoauth2(host, port, account_id, &access_token).await;
+            access_token.zeroize();
+            session
+        }
+        Ok(None) => connect_and_login(host, port, account_id, &secret).await,
+        Err(e) => Err(e),
+    };
+    secret.zeroize();
     result
 }
 

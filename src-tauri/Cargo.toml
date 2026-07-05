@@ -1,10 +1,10 @@
 [package]
 name = "app"
 version = "0.1.0"
-description = "A Tauri App"
-authors = ["you"]
-license = ""
-repository = ""
+description = "Helix, a privacy-focused cross-platform email client"
+authors = ["Konstantin Nikolic"]
+license = "GPL-3.0-only"
+repository = "https://github.com/Yodakole1/Helix"
 edition = "2021"
 rust-version = "1.77.2"
 
@@ -45,6 +45,10 @@ sha1 = "0.10"
 openssl = { version = "0.10", features = ["vendored"] }
 openssl-sys = { version = "0.9", features = ["vendored"] }
 quick-xml = "0.37"
+# OAuth2 sign-in opens the provider's consent page in the system browser
+# (RFC 8252 native-app flow) -- an embedded webview would be blocked by
+# Google outright and would bypass the user's password manager.
+open = "5"
 # App-lock password hashing (memory-hard KDF; a plain hash would make the
 # lock password trivially brute-forceable if the cache leaked).
 argon2 = "0.5"

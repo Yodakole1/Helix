@@ -1,7 +1,7 @@
 import { useRef, useState } from "react";
 import { Pressable, ScrollView, StyleSheet, Text, TextInput, View } from "react-native";
 import { isTauri } from "@tauri-apps/api/core";
-import { addAccount, addPop3Account } from "../lib/account";
+import { addAccount, addOauthAccount, addPop3Account, oauthProviderInfo } from "../lib/account";
 import { addCalDavSource, discoverCalDav, type CalDavDiscoveredCalendar } from "../lib/caldav";
 import { addCardDavSource, discoverCardDav, type CardDavDiscoveredBook } from "../lib/carddav";
 import { emitCalendarBus } from "../lib/calendarBus";
@@ -57,6 +57,14 @@ export function AddAccountView({ accentColor, onCancel, onDone }: AddAccountView
   const [smtpUseStarttls, setSmtpUseStarttls] = useState(false);
   const [submitting, setSubmitting] = useState(false);
   const [errorMessage, setErrorMessage] = useState("");
+
+  // OAuth sign-in (Gmail / Microsoft 365): which provider's browser flow is
+  // running, and -- for builds shipped without a registered client ID --
+  // the user-supplied one. See docs/technical/oauth.md.
+  const [oauthSubmitting, setOauthSubmitting] = useState<"gmail" | "microsoft" | null>(null);
+  const [oauthNeedsClient, setOauthNeedsClient] = useState<"gmail" | "microsoft" | null>(null);
+  const [oauthClientId, setOauthClientId] = useState("");
+  const [oauthClientSecret, setOauthClientSecret] = useState("");
 
   const [calendarProbe, setCalendarProbe] = useState<CalendarProbe>({ status: "pending", detail: "", calendars: [] });
   const [contactsProbe, setContactsProbe] = useState<ContactsProbe>({ status: "pending", detail: "", books: [] });
@@ -189,6 +197,46 @@ export function AddAccountView({ accentColor, onCancel, onDone }: AddAccountView
     }
   }
 
+  // OAuth path: the whole browser consent flow, verification, and account
+  // persistence run in one backend call. Gmail/Microsoft don't offer
+  // password-authenticated CalDAV/CardDAV, so the probe step is skipped --
+  // a checklist that always fails would just look broken.
+  async function handleOauth(provider: "gmail" | "microsoft") {
+    if (!isTauri()) {
+      setErrorMessage("Account connections only work inside the desktop app. Run 'npm run tauri dev' to use real accounts.");
+      return;
+    }
+    setErrorMessage("");
+    try {
+      const info = await oauthProviderInfo(provider);
+      if (!info.has_builtin_client_id && oauthClientId.trim() === "") {
+        setOauthNeedsClient(provider);
+        return;
+      }
+    } catch (err) {
+      setErrorMessage(err instanceof Error ? err.message : String(err));
+      return;
+    }
+    setOauthSubmitting(provider);
+    try {
+      await addOauthAccount({
+        accountId: email.trim(),
+        provider,
+        displayName: name.trim() === "" ? null : name.trim(),
+        clientId: oauthClientId.trim() === "" ? null : oauthClientId.trim(),
+        clientSecret: oauthClientSecret.trim() === "" ? null : oauthClientSecret.trim(),
+      });
+      onDone(email.trim());
+    } catch (err) {
+      const msg = typeof err === "string" ? err : err instanceof Error ? err.message : String(err);
+      setErrorMessage(msg);
+    } finally {
+      setOauthSubmitting(null);
+    }
+  }
+
+  const canOauth = email.trim().length > 0 && !submitting && oauthSubmitting === null;
+
   const probing = calendarProbe.status === "pending" || contactsProbe.status === "pending";
   const anyFailed = calendarProbe.status === "failed" || contactsProbe.status === "failed";
 
@@ -313,6 +361,68 @@ export function AddAccountView({ accentColor, onCancel, onDone }: AddAccountView
               placeholderTextColor={colors.text.muted}
               secureTextEntry
             />
+
+            <View style={styles.oauthBlock}>
+              <Text style={styles.oauthLead}>
+                Gmail or Microsoft 365? Sign in through your browser instead -- no app password needed.
+              </Text>
+              <View style={styles.oauthRow}>
+                {(["gmail", "microsoft"] as const).map((provider) => (
+                  <Pressable
+                    key={provider}
+                    onPress={() => handleOauth(provider)}
+                    disabled={!canOauth}
+                    style={[styles.oauthButton, !canOauth && styles.primaryButtonDisabled]}
+                  >
+                    <Text style={styles.oauthButtonText}>
+                      {oauthSubmitting === provider
+                        ? "Waiting for browser..."
+                        : provider === "gmail"
+                          ? "Sign in with Google"
+                          : "Sign in with Microsoft"}
+                    </Text>
+                  </Pressable>
+                ))}
+              </View>
+              {oauthSubmitting !== null && (
+                <Text style={styles.hint}>
+                  Finish signing in to {oauthSubmitting === "gmail" ? "Google" : "Microsoft"} in the browser window
+                  that just opened. Helix picks up automatically when you're done.
+                </Text>
+              )}
+              {oauthNeedsClient !== null && (
+                <View>
+                  <Text style={styles.hint}>
+                    This build ships without a registered {oauthNeedsClient === "gmail" ? "Google" : "Microsoft"} OAuth
+                    client. Paste your own client ID (docs/technical/oauth.md explains how to register one), then try
+                    again.
+                  </Text>
+                  <Text style={styles.label}>OAuth client ID</Text>
+                  <TextInput
+                    style={[styles.input, styles.mono]}
+                    value={oauthClientId}
+                    onChangeText={setOauthClientId}
+                    autoCapitalize="none"
+                    placeholder="xxxxxxxx.apps.googleusercontent.com"
+                    placeholderTextColor={colors.text.muted}
+                  />
+                  {oauthNeedsClient === "gmail" && (
+                    <>
+                      <Text style={styles.label}>OAuth client secret</Text>
+                      <TextInput
+                        style={[styles.input, styles.mono]}
+                        value={oauthClientSecret}
+                        onChangeText={setOauthClientSecret}
+                        autoCapitalize="none"
+                        secureTextEntry
+                        placeholder="Desktop-app clients get one from Google"
+                        placeholderTextColor={colors.text.muted}
+                      />
+                    </>
+                  )}
+                </View>
+              )}
+            </View>
 
             <Text style={styles.label}>Incoming protocol</Text>
             <View style={styles.protocolRow}>
@@ -580,6 +690,40 @@ const styles = StyleSheet.create({
   },
   advanced: {
     marginBottom: spacing.sm,
+  },
+  oauthBlock: {
+    marginTop: spacing.xs,
+    marginBottom: spacing.md,
+    paddingTop: spacing.md,
+    borderTopWidth: 1,
+    borderTopColor: colors.border.subtle,
+  },
+  oauthLead: {
+    fontFamily: fontFamily.ui,
+    fontSize: fontSize.xs,
+    color: colors.text.secondary,
+    marginBottom: spacing.sm,
+    lineHeight: 18,
+  },
+  oauthRow: {
+    flexDirection: "row",
+    marginBottom: spacing.sm,
+  },
+  oauthButton: {
+    flex: 1,
+    paddingVertical: spacing.sm,
+    borderRadius: radii.sm,
+    borderWidth: 1,
+    borderColor: colors.border.subtle,
+    backgroundColor: withAlpha(colors.background.panel, 0.6),
+    alignItems: "center",
+    marginRight: spacing.sm,
+  },
+  oauthButtonText: {
+    fontFamily: fontFamily.ui,
+    fontSize: fontSize.xs,
+    fontWeight: "600",
+    color: colors.text.primary,
   },
   row: {
     flexDirection: "row",

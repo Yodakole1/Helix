@@ -137,9 +137,13 @@ export function ConnectedAccountsSettings({ accentColor, onAddAccount }: Connect
       {status === "loaded" &&
         accounts.map((account) => {
           const isPop3 = account.incoming_protocol === "pop3";
+          const isOauth = account.auth_method === "oauth2";
           const incoming = isPop3
             ? `${account.pop3_host ?? ""}:${account.pop3_port ?? ""} (POP3)`
             : `${account.imap_host}:${account.imap_port} (IMAP${account.imap_use_starttls ? ", STARTTLS" : ""})`;
+          const authLabel = isOauth
+            ? ` -- signed in with ${account.oauth_provider === "microsoft" ? "Microsoft" : "Google"}`
+            : "";
           const editing = editingId === account.account_id;
           return (
             <View key={account.account_id} style={styles.accountCard}>
@@ -149,7 +153,7 @@ export function ConnectedAccountsSettings({ accentColor, onAddAccount }: Connect
                   <Text style={styles.accountEmail}>{account.account_id}</Text>
                   <Text style={styles.accountMeta}>
                     {incoming} -- {account.smtp_host}:{account.smtp_port} (SMTP
-                    {account.smtp_use_starttls ? ", STARTTLS" : ""})
+                    {account.smtp_use_starttls ? ", STARTTLS" : ""}){authLabel}
                   </Text>
                 </View>
                 <View style={styles.rowActions}>
@@ -247,14 +251,22 @@ export function ConnectedAccountsSettings({ accentColor, onAddAccount }: Connect
                     />
                     <Text style={styles.toggleLabel}>SMTP uses STARTTLS</Text>
                   </View>
-                  <TextInput
-                    style={[styles.fieldInput, styles.fieldFull]}
-                    value={editForm.password}
-                    onChangeText={(text) => setEditForm((f) => (f ? { ...f, password: text } : f))}
-                    placeholder="New password (leave blank to keep current)"
-                    placeholderTextColor={colors.text.muted}
-                    secureTextEntry
-                  />
+                  {isOauth ? (
+                    <Text style={styles.hint}>
+                      This account signs in with {account.oauth_provider === "microsoft" ? "Microsoft" : "Google"} --
+                      there's no password to change here. If access stops working, remove the account and sign in
+                      again.
+                    </Text>
+                  ) : (
+                    <TextInput
+                      style={[styles.fieldInput, styles.fieldFull]}
+                      value={editForm.password}
+                      onChangeText={(text) => setEditForm((f) => (f ? { ...f, password: text } : f))}
+                      placeholder="New password (leave blank to keep current)"
+                      placeholderTextColor={colors.text.muted}
+                      secureTextEntry
+                    />
+                  )}
                   <Pressable
                     onPress={() => handleSaveEdit(account)}
                     disabled={savingEdit}
