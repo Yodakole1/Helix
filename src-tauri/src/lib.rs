@@ -11,6 +11,7 @@ mod idle;
 mod identities;
 mod imap;
 mod lock;
+mod mailstore;
 mod oauth;
 mod pgp;
 mod pop3;
@@ -23,6 +24,7 @@ pub fn run() {
   tauri::Builder::default()
     .plugin(tauri_plugin_notification::init())
     .plugin(tauri_plugin_process::init())
+    .plugin(tauri_plugin_dialog::init())
     .manage(idle::IdleRegistry::new())
     .setup(|app| {
       // Desktop-only: the updater has no mobile story (mobile updates go
@@ -75,6 +77,10 @@ pub fn run() {
       smtp::send_mdn,
       discovery::discover_server_config,
       oauth::oauth_provider_info,
+      mailstore::import_mbox,
+      mailstore::import_eml_files,
+      mailstore::export_folder_mbox,
+      mailstore::export_account_mbox,
       cache::search_contacts,
       cache::list_contacts,
       cache::delete_contact,

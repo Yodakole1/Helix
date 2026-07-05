@@ -34,6 +34,10 @@ everyday mail:
   server-side folder management, message search (live IMAP plus offline
   full-text search of everything cached), a unified inbox across accounts,
   and desktop notifications for new mail.
+- **Migration and backup.** Import mail from other clients (mbox archives
+  from Thunderbird or Google Takeout, individual .eml files) straight
+  into a server folder, and export any folder -- or the whole account --
+  back out as mbox files.
 - **Organization.** Conversation (threaded) view, rules/auto-sorting,
   a local Bayesian spam filter trained by your own "spam"/"not spam"
   clicks, folder subscriptions, message templates, per-account colors and

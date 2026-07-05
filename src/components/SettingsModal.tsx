@@ -16,6 +16,7 @@ import { AppLockSettings } from "./AppLockSettings";
 import { ModalOverlay } from "./ModalOverlay";
 import { NotificationSettings } from "./NotificationSettings";
 import { PgpKeySettings } from "./PgpKeySettings";
+import { ImportExportSettings } from "./ImportExportSettings";
 import { RuleSettings } from "./RuleSettings";
 import { UpdateSettings } from "./UpdateSettings";
 import { settingsStyles } from "./settingsStyles";
@@ -220,11 +221,15 @@ export function SettingsModal({
           {category === "notifications" && <NotificationSettings accentColor={accentColor} />}
 
           {category === "storage" && (
-            <DataStorageSettings
-              accentColor={accentColor}
-              syncDepth={draft.syncDepth}
-              onSyncDepthChange={(depth) => patchDraft({ syncDepth: depth })}
-            />
+            <View>
+              <DataStorageSettings
+                accentColor={accentColor}
+                syncDepth={draft.syncDepth}
+                onSyncDepthChange={(depth) => patchDraft({ syncDepth: depth })}
+              />
+              <Text style={settingsStyles.sectionTitle}>Import &amp; export</Text>
+              <ImportExportSettings accentColor={accentColor} />
+            </View>
           )}
 
           {category === "shortcuts" && (

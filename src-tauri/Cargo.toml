@@ -60,6 +60,7 @@ argon2 = "0.5"
 ctap-hid-fido2 = { version = "3", optional = true }
 tauri-plugin-updater = "2.10.1"
 tauri-plugin-process = "2.3.1"
+tauri-plugin-dialog = "2.7.1"
 
 [features]
 default = []

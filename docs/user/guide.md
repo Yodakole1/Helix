@@ -189,7 +189,15 @@ way discards the changes.
   by default, the app lock, PGP keys, S/MIME certificates.
 - **Contacts / Calendar**: CardDAV and CalDAV sources.
 - **Data & Storage**: cache size and clearing, sync depth (headers only
-  vs. pre-fetching bodies for offline reading).
+  vs. pre-fetching bodies for offline reading), and **Import & export**:
+  - *Import* brings mail from another client into a folder on your mail
+    server -- an mbox archive (what Thunderbird stores and Google Takeout
+    exports) or individual .eml files. Because it uploads to the server,
+    imported mail appears on all your devices, not just in Helix.
+  - *Export* writes a folder out as an mbox file, or backs up the whole
+    account as a directory with one .mbox per folder. Exporting never
+    marks anything as read. (Both need an IMAP account; POP3 has no
+    folders to import into or export from.)
 - **Rules**: if-this-then-that auto-sorting (conditions on From/Subject/
   To; actions: move, mark read, star). Rules run when a folder loads and
   on refresh.
