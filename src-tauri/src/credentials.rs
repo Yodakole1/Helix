@@ -26,6 +26,19 @@ pub fn get_credential(account_id: String) -> Result<String, String> {
         .map_err(|e| e.to_string())
 }
 
+/// Like `get_credential`, but reports "no such entry" as `Ok(None)` instead
+/// of an error, so callers can fall back to another credential without also
+/// masking real keychain failures (locked keyring, no Secret Service). Same
+/// distinction `cache::get_or_create_cache_key` relies on, and for the same
+/// reason: a transient keychain error must never be treated as "missing".
+pub(crate) fn get_credential_if_exists(account_id: &str) -> Result<Option<String>, String> {
+    match entry_for(account_id)?.get_password() {
+        Ok(secret) => Ok(Some(secret)),
+        Err(keyring::Error::NoEntry) => Ok(None),
+        Err(e) => Err(e.to_string()),
+    }
+}
+
 #[tauri::command]
 pub fn delete_credential(account_id: String) -> Result<(), String> {
     entry_for(&account_id)?
@@ -39,7 +52,16 @@ mod tests {
 
     #[test]
     fn round_trips_through_the_real_os_keychain() {
-        let account_id = "helix-test-account@example.com";
+        let unique_id = format!(
+            "helix-test-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        );
+        let account_id = format!("{unique_id}@example.com");
+        let account_id = account_id.as_str();
 
         store_credential(account_id.to_string(), "correct-horse-battery-staple".to_string())
             .expect("store should succeed");

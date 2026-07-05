@@ -79,19 +79,31 @@ with one specific `account_id`.
 
 **Unified** (every account, merged) is `account::fetch_unified_inbox(limit)`:
 
-1. `cache::list_accounts()` for every stored account and its IMAP
-   host/port.
-2. Fan out with `futures::future::join_all`, calling the existing
-   `imap::fetch_messages(account_id, imap_host, imap_port, "INBOX",
-   limit)` once per account -- reusing the exact same path a siloed fetch
-   takes (cache write-through included) instead of a separate IMAP code
-   path.
+1. `cache::list_accounts()` for every stored account and its connection
+   details.
+2. Fan out with `futures::future::join_all`, once per account, **over the
+   account's own protocol**: an IMAP account goes through the existing
+   `imap::fetch_messages(account_id, imap_host, imap_port, "INBOX", limit)`,
+   a POP3 account through `pop3::list_messages(account_id, pop3_host,
+   pop3_port)` with each `Pop3MessageSummary` adapted to the shared
+   `MessageSummary` shape (`pop3_summary_to_message_summary` -- the POP3
+   `number` carried in `uid` so the frontend can RETR it, no flags, since
+   POP3 has none). Either path reuses the exact same call a siloed fetch
+   takes (cache write-through included) instead of a separate code path.
+   POP3 has no `EXAMINE`-style server-side fetch window, so its fan-out
+   lists the whole inbox and `limit` is applied in the merge (step 4); for
+   a very large POP3 mailbox that's a real per-message header scan.
 3. An account whose fetch fails (bad password, unreachable server) is
    logged via `log::warn!` and skipped, not allowed to fail the whole
    call -- one dead account shouldn't blank out everyone else's inbox.
 4. Surviving results are tagged with their `account_id`
    (`UnifiedMessageSummary`, `#[serde(flatten)]`-ed so the wire shape
    stays flat), sorted newest-first, and truncated to `limit` overall.
+
+   The frontend tells a POP3 row from an IMAP one by the row's `account_id`
+   (it already knows each account's `incoming_protocol`), which is also how
+   it knows to open that message via `pop3::fetch_message` (by the `uid`,
+   which for POP3 is the message number) rather than `imap::fetch_message_body`.
 
 Sorting parses each `date` with `DateTime::parse_from_rfc3339` instead of
 comparing the raw strings. `MessageSummary.date` preserves each message's
@@ -123,7 +135,7 @@ the one place in the frontend with a real, persisted account list --
 everything else (Sidebar, MessageList, ReaderPane, the active-account
 concept in `App.tsx`) still reads the hardcoded sample `ACCOUNTS` array
 in `src/data/accounts.ts`, so an account added this way doesn't yet show
-up anywhere else in the app. See `docs/technical/frontend-roadmap.md`.
+up anywhere else in the app. See the per-feature docs in `docs/technical/`.
 
 ## What this doesn't do yet
 

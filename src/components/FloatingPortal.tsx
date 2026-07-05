@@ -30,10 +30,13 @@ export function FloatingPortal({ top, left, right, onDismiss, children }: Floati
       {onDismiss && (
         <div
           onClick={onDismiss}
-          style={{ position: "fixed", top: 0, left: 0, right: 0, bottom: 0, zIndex: 999 }}
+          style={{ position: "fixed", top: 0, left: 0, right: 0, bottom: 0, zIndex: 9998 }}
         />
       )}
-      <div style={{ position: "fixed", top, left, right, zIndex: 1000 }}>{children}</div>
+      {/* transform: translateZ(0) forces a GPU compositor layer, ensuring this
+          stays above iframe compositing layers that can otherwise punch through
+          high z-index elements in Chromium and WebKit. */}
+      <div style={{ position: "fixed", top, left, right, zIndex: 9999, transform: "translateZ(0)" }}>{children}</div>
     </>,
     document.body,
   );

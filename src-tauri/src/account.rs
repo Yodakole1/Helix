@@ -1,5 +1,6 @@
 use chrono::{DateTime, FixedOffset};
 use serde::Serialize;
+use zeroize::Zeroize;
 
 use crate::cache;
 use crate::cache::AccountRecord;
@@ -37,6 +38,8 @@ pub async fn add_account(
     archive_folder: Option<String>,
     trash_folder: Option<String>,
     drafts_folder: Option<String>,
+    spam_folder: Option<String>,
+    sent_folder: Option<String>,
 ) -> Result<AddAccountResult, String> {
     credentials::store_credential(account_id.clone(), password)?;
 
@@ -51,6 +54,17 @@ pub async fn add_account(
         }
     };
 
+    // Special folders: an explicit caller override wins, otherwise resolve
+    // the real folder from the LIST response we already have -- providers
+    // that nest mailboxes ("INBOX.Sent", "[Gmail]/Sent Mail") make the bare
+    // defaults name folders that don't exist, which used to silently break
+    // save-to-Sent and archive/trash moves on those servers.
+    let special = |explicit: Option<String>, role: &str, default: &str| {
+        explicit.unwrap_or_else(|| {
+            imap::resolve_special_folder(&folders, role).unwrap_or_else(|| default.to_string())
+        })
+    };
+
     let record = AccountRecord {
         account_id: account_id.clone(),
         display_name,
@@ -63,9 +77,11 @@ pub async fn add_account(
         incoming_protocol: "imap".to_string(),
         pop3_host: None,
         pop3_port: None,
-        archive_folder: archive_folder.unwrap_or_else(|| "Archive".to_string()),
-        trash_folder: trash_folder.unwrap_or_else(|| "Trash".to_string()),
-        drafts_folder: drafts_folder.unwrap_or_else(|| "Drafts".to_string()),
+        archive_folder: special(archive_folder, "archive", "Archive"),
+        trash_folder: special(trash_folder, "trash", "Trash"),
+        drafts_folder: special(drafts_folder, "drafts", "Drafts"),
+        spam_folder: special(spam_folder, "spam", "Spam"),
+        sent_folder: special(sent_folder, "sent", "Sent"),
     };
 
     if let Err(e) = cache::open().and_then(|conn| cache::upsert_account(&conn, &record)) {
@@ -121,6 +137,8 @@ pub async fn add_pop3_account(
         archive_folder: "Archive".to_string(),
         trash_folder: "Trash".to_string(),
         drafts_folder: "Drafts".to_string(),
+        spam_folder: "Spam".to_string(),
+        sent_folder: "Sent".to_string(),
     };
 
     if let Err(e) = cache::open().and_then(|conn| cache::upsert_account(&conn, &record)) {
@@ -158,8 +176,9 @@ pub async fn update_account(
         .ok_or_else(|| format!("no account {account_id} to update"))?;
 
     // If rotating the password, keep the old one so we can restore it if
-    // verification of the new settings fails.
-    let old_password = if password.is_some() {
+    // verification of the new settings fails. Zeroized on every exit path
+    // below, success or failure, same convention as `imap::login_with_stored_credential`.
+    let mut old_password = if password.is_some() {
         Some(credentials::get_credential(account_id.clone())?)
     } else {
         None
@@ -181,10 +200,14 @@ pub async fn update_account(
 
     if let Err(e) = verify {
         // Roll the credential back to what was working before, if we changed it.
-        if let Some(old) = old_password {
-            credentials::store_credential(account_id.clone(), old).ok();
+        if let Some(mut old) = old_password.take() {
+            credentials::store_credential(account_id.clone(), old.clone()).ok();
+            old.zeroize();
         }
         return Err(e);
+    }
+    if let Some(mut old) = old_password.take() {
+        old.zeroize();
     }
 
     // Preserve protocol-specific and folder fields; only the connection
@@ -205,6 +228,8 @@ pub async fn update_account(
         archive_folder: existing.archive_folder,
         trash_folder: existing.trash_folder,
         drafts_folder: existing.drafts_folder,
+        spam_folder: existing.spam_folder,
+        sent_folder: existing.sent_folder,
     };
     cache::upsert_account(&conn, &record)
 }
@@ -233,6 +258,33 @@ pub fn remove_account(account_id: String) -> Result<(), String> {
     Ok(())
 }
 
+/// Moves a message to the account's configured `spam_folder` and tags it
+/// with the IMAP `$Junk` keyword, so a server-side Bayesian filter (if the
+/// server has one) learns from the move. The `$Junk` flag is best-effort:
+/// many servers don't act on it, but it costs nothing to set. If the
+/// `spam_folder` doesn't exist the move fails with a clear error rather than
+/// silently discarding the message.
+#[tauri::command]
+pub async fn report_spam(
+    account_id: String,
+    host: String,
+    port: u16,
+    folder: String,
+    uid: u32,
+) -> Result<(), String> {
+    let conn = cache::open()?;
+    let account = cache::get_account(&conn, &account_id)?
+        .ok_or_else(|| format!("no account {account_id} in local cache"))?;
+
+    // Tag $Junk first (best-effort; not all servers support it).
+    if let Err(e) = imap::set_message_keyword(&account_id, &host, port, &folder, uid, "$Junk", true).await {
+        log::warn!("could not set $Junk on message {uid}: {e}");
+    }
+
+    // Move to spam folder.
+    imap::move_message_to_folder(account_id, host, port, folder, uid, account.spam_folder).await
+}
+
 /// One row of a unified, cross-account inbox view -- a `MessageSummary`
 /// tagged with which account it came from, since the caller has no other
 /// way to tell two same-shaped summaries from different accounts apart.
@@ -247,6 +299,25 @@ pub struct UnifiedMessageSummary {
 
 fn parsed_date(date: &Option<String>) -> Option<DateTime<FixedOffset>> {
     date.as_deref().and_then(|d| DateTime::parse_from_rfc3339(d).ok())
+}
+
+/// Adapts a POP3 summary to the unified view's `MessageSummary` shape. POP3
+/// has no flags/`\Seen` (both default false) and no IMAP UID -- the POP3
+/// message `number` is carried in `uid` so the frontend can RETR it via
+/// `pop3::fetch_message`, disambiguated from a real IMAP UID by the row's
+/// `account_id` (whose `incoming_protocol` the frontend already knows).
+fn pop3_summary_to_message_summary(summary: pop3::Pop3MessageSummary) -> MessageSummary {
+    MessageSummary {
+        uid: Some(summary.number),
+        subject: summary.subject,
+        from: summary.from,
+        date: summary.date,
+        seen: false,
+        flagged: false,
+        message_id: None,
+        in_reply_to: None,
+        is_spam: false,
+    }
 }
 
 /// Merges already-fetched per-account summaries into one newest-first
@@ -290,31 +361,39 @@ fn merge_and_sort_summaries(
 /// nothing new -- they're just `fetch_messages` called directly for one
 /// `account_id`, as today.
 ///
-/// Reuses `imap::fetch_messages` per account rather than a separate IMAP
-/// path, so the unified view goes through the exact same cache
-/// write-through every other fetch does. One account failing (bad
+/// Reuses `imap::fetch_messages`/`pop3::list_messages` per account rather
+/// than a separate path, so the unified view goes through the exact same
+/// cache write-through every other fetch does. One account failing (bad
 /// password, unreachable server) is logged and skipped, not allowed to
 /// blank out every other account's messages.
+///
+/// IMAP and POP3 accounts are both fanned out, each over its own protocol,
+/// and merged by date into one list -- so the unified inbox is genuinely
+/// unified rather than IMAP-only. (POP3 has no `EXAMINE` window, so its fan-
+/// out lists the whole inbox and the overall `limit` is applied in the
+/// merge; for a very large POP3 mailbox that's a real header scan, the cost
+/// of POP3 having no server-side fetch window.)
 #[tauri::command]
 pub async fn fetch_unified_inbox(limit: u32) -> Result<Vec<UnifiedMessageSummary>, String> {
     let accounts = list_accounts()?;
 
-    // POP3 accounts have no IMAP INBOX to fan out to (no folders, no stable
-    // UID model), so they're skipped here rather than fetched with the wrong
-    // protocol. Surfacing POP3 mail in the unified view is a separate design
-    // problem -- see pop3.md. IMAP accounts are the only ones fetched.
-    let fetches = accounts
-        .into_iter()
-        .filter(|account| account.incoming_protocol == "imap")
-        .map(|account| async move {
-        let result = imap::fetch_messages(
-            account.account_id.clone(),
-            account.imap_host,
-            account.imap_port,
-            "INBOX".to_string(),
-            limit,
-        )
-        .await;
+    let fetches = accounts.into_iter().map(|account| async move {
+        let result = if account.incoming_protocol == "pop3" {
+            let host = account.pop3_host.clone().unwrap_or_default();
+            let port = account.pop3_port.unwrap_or(995);
+            pop3::list_messages(account.account_id.clone(), host, port)
+                .await
+                .map(|summaries| summaries.into_iter().map(pop3_summary_to_message_summary).collect())
+        } else {
+            imap::fetch_messages(
+                account.account_id.clone(),
+                account.imap_host,
+                account.imap_port,
+                "INBOX".to_string(),
+                limit,
+            )
+            .await
+        };
         (account.account_id, result)
     });
 
@@ -355,6 +434,8 @@ mod tests {
             None,
             None,
             None,
+            None,
+            None,
         )
         .await;
 
@@ -381,7 +462,27 @@ mod tests {
             flagged: false,
             message_id: None,
             in_reply_to: None,
+            is_spam: false,
         }
+    }
+
+    #[test]
+    fn pop3_summary_converts_with_number_as_uid_and_no_flags() {
+        let summary = pop3::Pop3MessageSummary {
+            number: 7,
+            size: 2048,
+            uidl: Some("abc123".to_string()),
+            subject: Some("Hello".to_string()),
+            from: Some("sender@helix.test".to_string()),
+            date: Some("2026-06-20T08:00:00+00:00".to_string()),
+        };
+
+        let converted = pop3_summary_to_message_summary(summary);
+
+        assert_eq!(converted.uid, Some(7), "the POP3 number is carried in uid for RETR");
+        assert_eq!(converted.subject.as_deref(), Some("Hello"));
+        assert!(!converted.seen, "POP3 has no \\Seen");
+        assert!(!converted.flagged, "POP3 has no flags");
     }
 
     #[test]

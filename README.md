@@ -1,89 +1,125 @@
-<p align="center">
-  <img src="src-tauri/icons/app-icon.png" alt="Helix" width="600">
-</p>
-
 # Helix
 
-Helix is a privacy-focused, cross-platform email client built on a single
-codebase: direct IMAP/POP3/SMTP connections to mail providers (no
-middleman sync servers), local encryption, and a dark-mode-first,
-customizable UI. Desktop first, with mobile (iOS/Android) planned via the
-same React Native component tree.
+Your email lives on your server. Helix is the client that finally treats it
+that way.
 
-## Status
+Helix is a fast, privacy-focused desktop email client for Windows, macOS,
+and Linux (with mobile apps for iOS and Android planned) that connects
+straight to your mail provider over IMAP, POP3, and SMTP. No sync service
+in the middle, no company reading your mail to "improve your experience",
+no account with us at all. Your password goes into your operating system's
+keychain, your cached mail sits in an encrypted database on your own disk,
+and every connection is TLS with no plaintext fallback anywhere in the
+codebase. That's the whole business model: there isn't one.
 
-Early development -- not usable as a daily-driver email client yet. The
-desktop shell has a fully designed three-pane interface (account/folder
-sidebar, message list, reader pane), and the inbox itself is still wired
-to sample data rather than a real account's mail. That said, a real and
-growing slice of the app now talks to the real backend: account
-onboarding (auto-discovery + a verified IMAP login + OS-keychain storage),
-PGP key generation/import, local-cache stats and clearing, desktop
-notification permissions, and a working rules/auto-sorting engine and
-message-template manager (both real, just running against the sample
-inbox for now).
+It's also built for the mail most clients forgot. If your address is
+`you@yourdomain.com` on some hosting provider's server rather than Gmail,
+Helix is aimed at you -- it detects the odd folder layouts those servers
+use (`INBOX.Sent` and friends), speaks CalDAV and CardDAV to the same host
+with the same credentials, and doesn't assume the world ends at OAuth.
 
-The Rust backend is still ahead of the frontend overall: IMAP
-connection/login, folder listing, message fetching (headers, body,
-attachments), the core mailbox actions (read/flag/move, with archive and
-trash built on the same primitive), SMTP sending with STARTTLS, provider
-auto-discovery, OS-keychain credential storage, a SQLCipher-encrypted
-local cache, a persisted multi-account model with a unified-inbox view
-across accounts, a local contact/address cache for autocomplete, and PGP
-encrypt/sign/decrypt/verify. See
-[`docs/technical/backend-backlog.md`](docs/technical/backend-backlog.md)
-for the backend checklist,
-[`docs/technical/frontend-roadmap.md`](docs/technical/frontend-roadmap.md)
-for the frontend-side equivalent, and
-[`docs/user/overview.md`](docs/user/overview.md) /
-[`docs/user/guide.md`](docs/user/guide.md) for a user-facing description
-and walkthrough of the current build.
+## What you get
 
-## Tech stack
+- **A real mail client.** Multiple accounts, unified inbox, browser-style
+  tabs, threaded conversations, full-text search that works offline,
+  server-side folders, drafts that sync, scheduled send, undo send, and
+  snooze.
+- **Privacy by default.** Remote images blocked until you allow them, read
+  receipts never sent without asking, a local Bayesian spam filter that
+  learns from you instead of reporting to a server, and optional PGP and
+  S/MIME end-to-end encryption.
+- **Calendar and contacts included.** CalDAV calendars with desktop
+  reminders, CardDAV address books, and meeting-invite handling (accept or
+  decline from inside the message).
+- **An app lock, if you want one.** Lock Helix behind a password, a FIDO2
+  security key, or both -- asked once per start, then out of your way.
+- **Dark, glassy, and fast.** A dark-first interface on a Tauri shell that
+  uses your OS webview instead of shipping a whole browser, so the
+  installed app and its idle footprint stay small.
 
-- **Frontend:** React Native Web (components written against the RN API,
-  rendered via `react-native-web`; no actual React Native runtime in the
-  desktop build), Vite, TypeScript
-- **Backend/shell:** Tauri 2 (Rust) -- `async-imap`, `lettre` (SMTP),
-  `keyring` (OS-native credential storage), `rusqlite`/SQLCipher (local
-  encrypted cache), `tokio`
+## Install
 
-## Getting started
-
-Prerequisites (Linux): Node.js v22+, the Rust toolchain via
-[rustup](https://rustup.rs), Tauri's native build dependencies, and a
-running Secret Service provider (gnome-keyring or KWallet) for credential
-storage. See [`docs/technical/setup.md`](docs/technical/setup.md) for
-exact package names and macOS/Windows notes.
+Helix runs on Windows, macOS, and Linux. It's in early development;
+prebuilt packages (including an apt repository for Debian/Ubuntu, so
+installing becomes a single `apt install`) are planned for the first
+public release. Until then it builds from source in a few minutes:
 
 ```
-npm install              # install JS dependencies
-npm run tauri dev         # full app: compiles the Rust shell, opens a native window, hot reload
-npm run dev               # Vite dev server only (browser, no native shell)
-npm run build              # production web build
-npm run tauri build        # production desktop build/installer
+git clone https://github.com/Yodakole1/Helix.git
+cd Helix
+npm install
+npm run tauri build
 ```
 
-## Testing
+That produces a real installer for whatever OS you build on -- a `.deb`
+(installable with `sudo apt install ./…`), `.rpm`, and `.AppImage` on
+Linux, an `.msi` on Windows, a `.dmg` on macOS -- under
+`src-tauri/target/release/bundle/`. The full walkthrough, including
+per-OS prerequisites and what the app needs at runtime, is in
+[`docs/user/installation.md`](docs/user/installation.md).
+
+For day-to-day development:
 
 ```
-cd src-tauri
-cargo test                # unit tests only; network/Docker-dependent tests are #[ignore]d
-cargo test -- --ignored    # run the ignored tests (needs a real IMAP server or local GreenMail --
-                           # see docs/technical/imap-core.md for the Docker invocation)
+npm run tauri dev       # full app with hot reload
 ```
 
-There is no frontend test runner or linter/formatter config set up yet.
+Prerequisites: Node.js v22+, the Rust toolchain via
+[rustup](https://rustup.rs), and Tauri's native build packages. Linux also
+needs a running Secret Service provider (GNOME Keyring or KWallet) for
+credential storage -- exact package names are in
+[`docs/technical/setup.md`](docs/technical/setup.md).
 
-## Documentation
+One feature is a compile-time option: unlocking the app lock with a FIDO2
+security key. A default build shows "Security key (passkey) -- Not
+available in this build" in Settings > Privacy & Security; the password
+lock works in every build. To enable the security-key path, build with
+`--features passkey` (on Linux, install `libudev-dev` first) -- see the
+[installation guide](docs/user/installation.md) for details. Planned
+prebuilt packages will ship with it enabled.
 
-- [`docs/user/`](docs/user) -- what Helix is, current status, how to run
-  it, and a walkthrough of how to actually use it (`guide.md`)
-- [`docs/technical/`](docs/technical) -- architecture, stack-choice
-  rationale, setup, and per-feature implementation notes (credential
-  storage, IMAP core, SMTP, provider discovery, account onboarding)
+## First run
+
+Open Helix, click "Add your first account", and type your email address
+and password. Helix discovers the server settings where it can and lets
+you type them where it can't, verifies the login before saving anything,
+then checks whether your provider also offers a calendar and an address
+book with the same credentials -- one checkmark per service, one Continue
+button, and you're in your inbox.
+
+The user manual lives in [`docs/user/`](docs/user) -- what every screen,
+setting, and shortcut does.
+
+## How it's put together
+
+The interface is React Native Web inside a Tauri 2 shell; everything that
+touches the network or a secret is Rust. Each backend concern (IMAP, SMTP,
+POP3, caching, PGP, S/MIME, CalDAV, CardDAV, spam filtering, the app lock)
+is its own module with its own documentation and tests under
+[`docs/technical/`](docs/technical). If you're the kind of person who
+wants to know exactly what a mail client does with your password before
+you give it one, that folder is for you: start with
+[`security.md`](docs/technical/security.md) and
+[`credential-storage.md`](docs/technical/credential-storage.md).
+
+## Contributing
+
+Issues and pull requests are welcome. The technical docs describe the
+architecture and the reasoning behind the stack choices; `CLAUDE.md` in
+the repo root is the working map of the codebase. Run `cargo test` in
+`src-tauri/` for the backend suite and `npx tsc --noEmit` for the frontend
+typecheck before sending a PR.
 
 ## License
 
 Not yet finalized. Helix is intended to be published as an open-source
 project; a license will be added before the first public release.
+
+## Support Helix
+
+Helix is free, open source, and built in spare time. If it saves you from
+a subscription or an ad-funded inbox, you can buy the developer a coffee:
+
+**[buymeacoffee.com/yodakole1](https://buymeacoffee.com/yodakole1)**
+
+![Buy me a coffee QR code](docs/for-readme/bmc_qr.png)

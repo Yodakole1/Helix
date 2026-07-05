@@ -47,20 +47,77 @@ a minimal Linux setup — there's no fallback in place yet.
 that stores, reads, and deletes a real entry against whatever Secret
 Service/Keychain/Credential Manager is available on the machine running
 the test — it talks to the actual OS credential store, not a mock.
+`cache.rs` has an analogous keychain-backed test for the local cache's
+encryption key (see "Also used by the local cache" below).
 
-## Used by the IMAP layer
+Selecting the right `keyring` feature per OS in `Cargo.toml` only proves
+the code *should* work on all three platforms — it doesn't prove it
+*does*, since none of this is exercised locally on anything but whatever
+OS the developer happens to run on (Linux, in this project's day-to-day
+development). `.github/workflows/ci.yml` closes that gap: a 3-OS matrix
+(`ubuntu-latest`, `macos-latest`, `windows-latest`) runs `cargo test` on
+every push/PR, so the real-keychain round-trip test above actually
+executes against real Secret Service, real Keychain Services, and real
+Credential Manager on every change, not just whichever one the person
+who wrote the change happened to have handy. Linux CI runners don't have
+a Secret Service daemon running by default the way a real desktop session
+does, so the workflow starts a throwaway `gnome-keyring`/D-Bus session
+(via `dbus-run-session`) for the duration of the test run; macOS/Windows
+runners already have a working default keychain / Credential Manager with
+no extra setup needed.
 
-`src-tauri/src/imap.rs` is the first real consumer: `list_folders` and
-`fetch_messages` take an `account_id` rather than a password, and resolve
-the password via `get_credential` internally (see
-`login_with_stored_credential` in `imap-core.md`). The retrieved password
-is zeroized immediately after the login attempt, success or failure, so
-it doesn't sit in process memory for longer than that single call needs
-it.
+## Consumers
 
-## Used by account onboarding
+Every module that needs a mail/DAV password goes through these same three
+commands — there is no second, ad hoc credential path anywhere in the
+codebase:
 
-`src-tauri/src/account.rs`'s `add_account` calls `store_credential`, then
-verifies it by connecting through the IMAP layer, rolling the credential
-back via `delete_credential` if verification fails. See
-`account-onboarding.md`.
+- **IMAP/POP3/SMTP** (`imap.rs`, `pop3.rs`, `smtp.rs`): `list_folders`,
+  `fetch_messages`, `send_message`, and friends take an `account_id`
+  rather than a password, resolving it via `get_credential` internally
+  (see `login_with_stored_credential` in `imap-core.md`) and zeroizing it
+  immediately after the connection attempt, success or failure.
+- **Account onboarding and updates** (`account.rs`): `add_account` calls
+  `store_credential`, verifies it by actually connecting, and rolls it
+  back via `delete_credential` if verification fails (see
+  `account-onboarding.md`). `update_account`'s password-rotation path
+  keeps the old password only long enough to restore it on a failed
+  re-verification, zeroizing it on every exit path either way.
+- **CalDAV/CardDAV** (`caldav.rs`, `carddav.rs`): each source's Basic-Auth
+  password is stored under its own keychain key (`caldav__{id}` /
+  `carddav__{id}`), not alongside the source's other metadata in the
+  SQLCipher cache — see `caldav.md`/`carddav.md`.
+
+## Also used by the local cache's encryption key
+
+`cache.rs` uses this exact same `keyring::Entry` mechanism (not a second,
+parallel implementation) to store the random 32-byte key that encrypts the
+whole local SQLCipher mail cache, under the reserved account name
+`__local_cache_key__`. This means the entire local cache's
+encryption-at-rest is transitively protected by whatever secure store this
+doc describes for each OS — there's no separate, weaker storage path for
+that key. `get_or_create_cache_key_for` distinguishes `keyring::Error::NoEntry`
+from every other keychain error before deciding to mint a new key, so a
+transient keychain failure (Secret Service not running, a permissions
+hiccup) can never look like "first run" and silently strand data already
+encrypted under the real key. See `local-cache.md`.
+
+## Known per-OS considerations
+
+- **Windows Credential Manager caps a generic credential's blob at 2560
+  bytes.** Nothing stored today gets close to that (mail/DAV passwords,
+  and the cache key's 64-character hex string), but it's worth checking
+  before ever routing something larger — a PGP secret key or an S/MIME
+  PKCS#12 blob, say — through `store_credential` rather than the
+  SQLCipher cache tables those actually live in today.
+- **macOS Keychain access can prompt per build during development.**
+  Keychain ACLs are tied to the app's code signature; an unsigned or
+  ad-hoc-signed development build can look like a "new app" to the
+  Keychain on each rebuild, triggering a repeated access-confirmation
+  dialog. This is a development-experience wrinkle, not a security gap —
+  a properly signed and notarized release build doesn't have this
+  problem.
+- **Linux requires a running Secret Service provider** (see above) — this
+  is the one platform where credential storage can simply be unavailable
+  on a correctly-installed system, if the desktop environment doesn't ship
+  gnome-keyring or KWallet's Secret Service.

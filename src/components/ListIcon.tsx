@@ -10,7 +10,15 @@ interface ListIconProps {
     | "attachment"
     | "refresh"
     | "image"
-    | "template";
+    | "template"
+    | "print"
+    | "check"
+    | "schedule"
+    | "reply"
+    | "reply-all"
+    | "forward"
+    | "mail"
+    | "ellipsis";
   color: string;
   size?: number;
   // Only meaningful for "star" -- filled (solid) vs. outline.
@@ -102,6 +110,66 @@ export function ListIcon({ name, color, size = 14, filled = false }: ListIconPro
         <svg {...props}>
           <path d="M6 3h9l3 3v15a1 1 0 0 1-1 1H6a1 1 0 0 1-1-1V4a1 1 0 0 1 1-1z" />
           <path d="M8 9h8M8 13h8M8 17h5" />
+        </svg>
+      );
+    case "print":
+      return (
+        <svg {...props}>
+          <polyline points="6 9 6 3 18 3 18 9" />
+          <path d="M6 18H4a2 2 0 0 1-2-2v-4a2 2 0 0 1 2-2h16a2 2 0 0 1 2 2v4a2 2 0 0 1-2 2h-2" />
+          <rect x="6" y="14" width="12" height="7" rx="1" />
+        </svg>
+      );
+    case "check":
+      // Double check ("mark all read"), distinct from a single tick.
+      return (
+        <svg {...props}>
+          <polyline points="2 12 7 17 14 8" />
+          <polyline points="11 14 13 16 22 6" />
+        </svg>
+      );
+    case "schedule":
+      return (
+        <svg {...props}>
+          <circle cx="12" cy="12" r="9" />
+          <polyline points="12 7 12 12 15 15" />
+        </svg>
+      );
+    case "reply":
+      return (
+        <svg {...props}>
+          <polyline points="9 17 4 12 9 7" />
+          <path d="M20 18v-2a4 4 0 0 0-4-4H4" />
+        </svg>
+      );
+    case "reply-all":
+      return (
+        <svg {...props}>
+          <polyline points="7 17 2 12 7 7" />
+          <polyline points="12 17 7 12 12 7" />
+          <path d="M22 18v-2a4 4 0 0 0-4-4H7" />
+        </svg>
+      );
+    case "forward":
+      return (
+        <svg {...props}>
+          <polyline points="15 17 20 12 15 7" />
+          <path d="M4 18v-2a4 4 0 0 1 4-4h12" />
+        </svg>
+      );
+    case "mail":
+      return (
+        <svg {...props}>
+          <rect x="2" y="5" width="20" height="14" rx="2" />
+          <polyline points="2 5 12 13 22 5" />
+        </svg>
+      );
+    case "ellipsis":
+      return (
+        <svg {...props} fill={color} stroke="none">
+          <circle cx="5" cy="12" r="1.6" />
+          <circle cx="12" cy="12" r="1.6" />
+          <circle cx="19" cy="12" r="1.6" />
         </svg>
       );
     default:

@@ -1,13 +1,17 @@
 import { useEffect, useMemo, useRef, useState } from "react";
-import { Pressable, StyleSheet, Text, View } from "react-native";
+import type { InviteInfo } from "../lib/ics";
+import { Pressable, ScrollView, StyleSheet, Text, View } from "react-native";
 import type { SampleMessage } from "../data/messages";
 import { formatMessageTime } from "../data/messages";
 import type { RealAttachment } from "../data/messages";
+import { useAnchorRect } from "../hooks/useAnchorRect";
 import type { HoverState } from "../lib/pressable";
 import { sanitizeHtml } from "../lib/sanitizeHtml";
 import { glassPanel } from "../lib/webStyle";
 import { colorForIndex, colors, fontFamily, fontSize, radii, spacing, withAlpha } from "../theme";
+import { FloatingPortal } from "./FloatingPortal";
 import { FolderIcon } from "./FolderIcon";
+import { InviteCard } from "./InviteCard";
 import { ListIcon } from "./ListIcon";
 import { Tooltip } from "./Tooltip";
 
@@ -18,6 +22,12 @@ interface ReaderPaneProps {
   folder: string;
   avatarIndex: number;
   blockImages: boolean;
+  readReceipts: boolean;
+  allowedImageDomains: string[];
+  onAllowImageDomain: (domain: string) => void;
+  isMuted: boolean;
+  // True when the current folder is Spam/Junk -- shows the "Not spam" banner.
+  isSpamFolder?: boolean;
   // Present only when rendered in the mobile single-pane view-stack.
   onBack?: () => void;
   onReply: (message: SampleMessage) => void;
@@ -28,7 +38,21 @@ interface ReaderPaneProps {
   onMoveToSpam: (id: number) => void;
   onDelete: (id: number) => void;
   onMarkUnread: (id: number) => void;
+  // Moves back to inbox + trains the Bayesian classifier as ham.
+  onNotSpam?: (id: number) => void;
+  // Called with an ISO 8601 snooze-until timestamp chosen by the user.
+  onSnooze?: (id: number, until: string) => void;
   onDownloadAttachment: (uid: number, attachmentIndex: number) => void;
+  onMuteThread?: (messageId: string, muted: boolean) => void;
+  // Returns raw RFC 822 bytes as base64. Undefined for POP3 and sample
+  // messages that have no real IMAP UID -- hides source/EML actions.
+  onFetchSource?: () => Promise<string>;
+  // Fetches and parses a text/calendar attachment into structured invite data.
+  // Undefined when no real UID is available (POP3, sample).
+  onFetchInvite?: (uidOrNumber: number, attachmentIndex: number) => Promise<InviteInfo>;
+  onRespondToInvite?: (invite: InviteInfo, response: "accept" | "decline" | "tentative") => Promise<void>;
+  // Called when the user agrees to send a read receipt for this message.
+  onSendMdn?: (notifyAddress: string, messageId: string, subject: string) => void;
 }
 
 export function ReaderPane({
@@ -38,6 +62,11 @@ export function ReaderPane({
   folder,
   avatarIndex,
   blockImages,
+  readReceipts,
+  allowedImageDomains,
+  onAllowImageDomain,
+  isMuted,
+  isSpamFolder,
   onBack,
   onReply,
   onReplyAll,
@@ -47,36 +76,107 @@ export function ReaderPane({
   onMoveToSpam,
   onDelete,
   onMarkUnread,
+  onNotSpam,
+  onSnooze,
   onDownloadAttachment,
+  onMuteThread,
+  onFetchSource,
+  onFetchInvite,
+  onRespondToInvite,
+  onSendMdn,
 }: ReaderPaneProps) {
-  // A message with poor color/font choices in its own content can be
-  // unreadable in the app's dark theme -- this flips just the content
-  // area, not the app's own chrome. Resets per message rather than
-  // staying sticky, since the problem is per-email, not a reader setting.
-  const [lightMode, setLightMode] = useState(false);
   // Per-message override for this one open message -- showing images once
   // isn't the same as flipping the Settings default, so it resets per
   // message rather than persisting.
   const [showImagesOverride, setShowImagesOverride] = useState(false);
+  // Whether the "Show images" choice picker (Just this time / Always from domain)
+  // is expanded. Reset per message alongside showImagesOverride.
+  const [showImagesPicker, setShowImagesPicker] = useState(false);
+  const [overflowOpen, setOverflowOpen] = useState(false);
+  const [overflowAnchorRef, overflowAnchorRect] = useAnchorRect(overflowOpen);
+  const [senderTooltipOpen, setSenderTooltipOpen] = useState(false);
+  const [senderAnchorRef, senderAnchorRect] = useAnchorRect(senderTooltipOpen);
+  const [snoozeOpen, setSnoozeOpen] = useState(false);
+  const [snoozeAnchorRef, snoozeAnchorRect] = useAnchorRect(snoozeOpen);
+  const [snoozeCustom, setSnoozeCustom] = useState("");
+  // Raw source state -- base64 string from fetch_message_source, cached so
+  // clicking View source twice doesn't re-fetch, reset when the message changes.
+  const [sourceBase64, setSourceBase64] = useState<string | null>(null);
+  const [sourceFetching, setSourceFetching] = useState(false);
+  const [sourceOpen, setSourceOpen] = useState(false);
+  // Tracks whether the user has already sent (or dismissed) the MDN for this message.
+  const [mdnSent, setMdnSent] = useState<"sent" | "dismissed" | null>(null);
+  // Parsed ICS invite data, keyed by attachment index. "loading" while
+  // fetch_message_source is in flight; InviteInfo once parsed; "error" on failure.
+  const [invitesByIndex, setInvitesByIndex] = useState<Record<number, InviteInfo | "loading" | "error">>({});
+  // Prevents double-fetching calendar attachments when the component re-renders.
+  const fetchedInviteIndexes = useRef<Set<number>>(new Set());
+
   useEffect(() => {
-    setLightMode(false);
     setShowImagesOverride(false);
+    setShowImagesPicker(false);
+    setOverflowOpen(false);
+    setSnoozeOpen(false);
+    setSnoozeCustom("");
+    setSourceBase64(null);
+    setSourceFetching(false);
+    setSourceOpen(false);
+    setInvitesByIndex({});
+    fetchedInviteIndexes.current.clear();
+    setMdnSent(null);
   }, [message?.id]);
+
+  // Eagerly fetch and parse any text/calendar attachments when the body
+  // loads. Calendar files are small, so fetching up-front is safe -- the
+  // user doesn't have to click Download first to see the invite card.
+  useEffect(() => {
+    if (!message?.bodyLoaded || !onFetchInvite) return;
+    const calendarAtts = (message.realAttachments ?? []).filter(
+      (att) => att.contentType === "text/calendar",
+    );
+    if (calendarAtts.length === 0) return;
+    const uidOrNumber = message.uid ?? message.pop3Number;
+    if (uidOrNumber === undefined) return;
+    for (const att of calendarAtts) {
+      if (fetchedInviteIndexes.current.has(att.index)) continue;
+      fetchedInviteIndexes.current.add(att.index);
+      setInvitesByIndex((prev) => ({ ...prev, [att.index]: "loading" }));
+      onFetchInvite(uidOrNumber, att.index)
+        .then((info) => setInvitesByIndex((prev) => ({ ...prev, [att.index]: info })))
+        .catch(() => setInvitesByIndex((prev) => ({ ...prev, [att.index]: "error" })));
+    }
+  }, [message?.bodyLoaded, message?.id]);
 
   // Must be computed unconditionally (message can be undefined) so useMemo
   // always runs in the same hook order -- the early "no message" return
   // comes after all hook calls, not before.
   const htmlBody = message?.htmlBody;
-  const imagesBlocked = (message?.hasRemoteImage === true || !!htmlBody) && blockImages && !showImagesOverride;
+  const senderDomain = message?.senderEmail?.split("@")[1]?.toLowerCase() ?? "";
+  const domainAllowed = !!senderDomain && allowedImageDomains.includes(senderDomain);
+  // Whether to run sanitization in image-blocking mode. Checks the per-message
+  // override and the persistent per-domain whitelist before consulting the
+  // global blockImages setting.
+  const imagesBlocked = !!htmlBody && blockImages && !showImagesOverride && !domainAllowed;
   const sanitizedBody = useMemo(
     () => (htmlBody ? sanitizeHtml(htmlBody, { blockRemoteImages: imagesBlocked }) : undefined),
     [htmlBody, imagesBlocked],
   );
+  // Only show the "images blocked" banner when sanitization actually moved
+  // remote image srcs to data-blocked-src. An HTML email with no remote
+  // images should open silently with no banner -- the common case.
+  const hasActualRemoteImages = imagesBlocked && !!sanitizedBody && sanitizedBody.includes('data-blocked-src="');
 
   if (!message) {
     return (
       <View style={[styles.pane, styles.emptyPane]}>
-        <Text style={styles.emptyText}>No email open</Text>
+        <View style={styles.emptyIcon}>
+          <svg width={40} height={40} viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth={1.2} strokeLinecap="round" strokeLinejoin="round" style={{ color: "rgba(255,255,255,0.12)" }}>
+            <rect x="2" y="5" width="20" height="14" rx="2" />
+            <polyline points="2 5 12 13 22 5" />
+          </svg>
+        </View>
+        <Text style={styles.emptyHeadline}>Select a message</Text>
+        <Text style={styles.emptyText}>Choose an email from the list to read it here.</Text>
       </View>
     );
   }
@@ -84,6 +184,91 @@ export function ReaderPane({
   const avatarColor = colorForIndex(avatarIndex);
   const realAtts: RealAttachment[] = message.realAttachments ?? [];
   const textBody = message.textBody;
+
+  // Shows the raw RFC 822 source in the panel below the message body.
+  // Fetches once and caches in sourceBase64 so subsequent opens are instant.
+  async function handleViewSource() {
+    setOverflowOpen(false);
+    setSourceOpen(true);
+    if (sourceBase64 !== null || sourceFetching) return;
+    setSourceFetching(true);
+    try {
+      const b64 = await onFetchSource!();
+      setSourceBase64(b64);
+    } catch (e) {
+      setSourceBase64(""); // empty signals a failed fetch
+      console.warn("fetch_message_source failed:", e);
+    } finally {
+      setSourceFetching(false);
+    }
+  }
+
+  // Downloads the raw RFC 822 bytes as a .eml file (same bytes as View source,
+  // different action). RFC 822 bytes *are* a valid .eml file with no wrapping.
+  async function handleExportEml() {
+    setOverflowOpen(false);
+    try {
+      const b64 = sourceBase64 !== null ? sourceBase64 : await onFetchSource!();
+      if (b64 === "") return;
+      const raw = atob(b64);
+      const bytes = new Uint8Array(raw.length);
+      for (let i = 0; i < raw.length; i++) bytes[i] = raw.charCodeAt(i);
+      const blob = new Blob([bytes], { type: "message/rfc822" });
+      const url = URL.createObjectURL(blob);
+      const a = document.createElement("a");
+      a.href = url;
+      a.download = `${(message!.subject || "message").replace(/[/\\?%*:|"<>]/g, "_")}.eml`;
+      a.click();
+      URL.revokeObjectURL(url);
+    } catch (e) {
+      console.warn("EML export failed:", e);
+    }
+  }
+
+  // Snooze preset times. Computed fresh each render so times stay relative to now.
+  function snoozePresets(): Array<{ label: string; sublabel: string; iso: string }> {
+    const now = new Date();
+    const presets: Array<{ label: string; sublabel: string; iso: string }> = [];
+    const later = new Date(now.getTime() + 3 * 60 * 60 * 1000);
+    if (later.getDate() === now.getDate()) {
+      presets.push({ label: "Later today", sublabel: later.toLocaleTimeString([], { hour: "2-digit", minute: "2-digit" }), iso: later.toISOString() });
+    }
+    const tomorrow = new Date(now); tomorrow.setDate(tomorrow.getDate() + 1); tomorrow.setHours(8, 0, 0, 0);
+    presets.push({ label: "Tomorrow morning", sublabel: `${tomorrow.toLocaleDateString([], { weekday: "short" })} 8:00 AM`, iso: tomorrow.toISOString() });
+    const dayOfWeek = now.getDay();
+    if (dayOfWeek < 6) {
+      const sat = new Date(now); sat.setDate(sat.getDate() + (6 - dayOfWeek)); sat.setHours(8, 0, 0, 0);
+      presets.push({ label: "This weekend", sublabel: "Sat 8:00 AM", iso: sat.toISOString() });
+    }
+    const daysToMon = dayOfWeek === 0 ? 1 : (8 - dayOfWeek) % 7 || 7;
+    const mon = new Date(now); mon.setDate(mon.getDate() + daysToMon); mon.setHours(8, 0, 0, 0);
+    presets.push({ label: "Next week", sublabel: "Mon 8:00 AM", iso: mon.toISOString() });
+    return presets;
+  }
+
+  // Opens the message in a throwaway window and triggers the OS print
+  // dialog -- the standard "Print" every desktop mail client has. Reuses
+  // the already-sanitized HTML body when there is one (safe to inject,
+  // DOMPurify ran over it); otherwise the plain-text body is HTML-escaped
+  // so a message that happens to contain markup can't inject into the
+  // print document.
+  function handlePrint() {
+    const printWindow = window.open("", "_blank", "width=820,height=640");
+    if (!printWindow) return;
+    const bodyHtml = sanitizedBody ?? `<pre style="white-space:pre-wrap;font-family:sans-serif">${escapeHtml(textBody ?? "")}</pre>`;
+    printWindow.document.write(
+      `<!doctype html><html><head><meta charset="utf-8" /><meta http-equiv="Content-Security-Policy" content="default-src 'none'; style-src 'unsafe-inline'; img-src * data: blob:; font-src *;"><title>${escapeHtml(message!.subject)}</title>` +
+        `<style>body{font-family:sans-serif;color:#000;margin:32px;line-height:1.5}` +
+        `h1{font-size:18px;margin:0 0 12px}.meta{font-size:13px;color:#444;margin-bottom:16px}` +
+        `hr{border:none;border-top:1px solid #ccc;margin:16px 0}img{max-width:100%}</style></head><body>` +
+        `<h1>${escapeHtml(message!.subject)}</h1>` +
+        `<div class="meta"><strong>From:</strong> ${escapeHtml(message!.sender)} &lt;${escapeHtml(message!.senderEmail)}&gt;<br />` +
+        `<strong>Date:</strong> ${escapeHtml(formatMessageTime(message!.date))}</div><hr />${bodyHtml}</body></html>`,
+    );
+    printWindow.document.close();
+    printWindow.focus();
+    printWindow.print();
+  }
 
   return (
     <View style={styles.pane}>
@@ -97,123 +282,500 @@ export function ReaderPane({
           <Text style={styles.subject}>{message.subject}</Text>
           {message.encrypted && (
             <View style={[styles.pgpBadge, styles.pgpBadgeEncrypted]}>
-              <Text style={styles.pgpBadgeText}>Encrypted</Text>
+              <Text style={styles.pgpBadgeText}>PGP Encrypted</Text>
             </View>
           )}
           {message.pgpSignedBy && (
             <View style={[styles.pgpBadge, message.pgpSignatureValid ? styles.pgpBadgeValid : styles.pgpBadgeInvalid]}>
               <Text style={styles.pgpBadgeText}>
-                {message.pgpSignatureValid ? `Signed by ${message.pgpSignedBy}` : "Signature could not be verified"}
+                {message.pgpSignatureValid ? `PGP Signed · ${message.pgpSignedBy}` : "PGP Signature Invalid"}
+              </Text>
+            </View>
+          )}
+          {message.smimeEncrypted && (
+            <View style={[styles.pgpBadge, styles.pgpBadgeEncrypted]}>
+              <Text style={styles.pgpBadgeText}>S/MIME Encrypted</Text>
+            </View>
+          )}
+          {message.smimeSigned && (
+            <View style={[styles.pgpBadge, message.smimeVerified ? styles.pgpBadgeValid : styles.pgpBadgeInvalid]}>
+              <Text style={styles.pgpBadgeText}>
+                {message.smimeVerified
+                  ? `S/MIME Signed${message.smimeSignerEmail ? ` · ${message.smimeSignerEmail}` : ""}`
+                  : "S/MIME Signature Invalid"}
               </Text>
             </View>
           )}
         </View>
 
         <View style={styles.actionsRow}>
+          {/* ── Reply group ── */}
           <Pressable
             onPress={() => onReply(message)}
-            style={[styles.replyButton, { backgroundColor: accentColor, shadowColor: accentColor }]}
+            style={[styles.primaryBtn, { backgroundColor: accentColor, shadowColor: accentColor }]}
           >
-            <Text style={styles.replyButtonText}>Reply</Text>
-          </Pressable>
-          <Pressable onPress={() => onReplyAll(message)} style={styles.secondaryReplyButton}>
-            <Text style={styles.secondaryReplyButtonText}>Reply All</Text>
-          </Pressable>
-          <Pressable onPress={() => onForward(message)} style={styles.secondaryReplyButton}>
-            <Text style={styles.secondaryReplyButtonText}>Forward</Text>
-          </Pressable>
-          <Pressable onPress={() => onToggleStar(message.id)} style={styles.actionButton}>
-            <ListIcon
-              name="star"
-              filled={message.starred}
-              color={message.starred ? colors.accent.amber : colors.text.muted}
-              size={15}
-            />
-          </Pressable>
-          <Pressable onPress={() => onArchive(message.id)} style={styles.actionButton}>
-            <FolderIcon id="archive" color={colors.text.muted} size={15} />
-          </Pressable>
-          <Pressable onPress={() => onMoveToSpam(message.id)} style={styles.actionButton}>
-            <FolderIcon id="spam" color={colors.text.muted} size={15} />
-          </Pressable>
-          <Pressable onPress={() => onDelete(message.id)} style={styles.actionButton}>
-            <FolderIcon id="trash" color={colors.text.muted} size={15} />
+            <ListIcon name="reply" size={15} color={colors.background.base} />
+            <Text style={styles.primaryBtnText}>Reply</Text>
           </Pressable>
           <Pressable
-            onPress={() => onMarkUnread(message.id)}
-            style={[styles.markUnreadPill, { borderColor: accentColor }]}
+            onPress={() => onReplyAll(message)}
+            style={({ hovered }: HoverState) => [
+              styles.ghostBtn,
+              hovered && { backgroundColor: withAlpha(accentColor, 0.12), borderColor: accentColor },
+            ]}
           >
-            <Text style={[styles.markUnreadPillText, { color: accentColor }]}>Mark as unread</Text>
-          </Pressable>
-        </View>
-
-        {/* Last in the header on purpose -- the hover tooltip below drops
-            down from here, so nothing else in the header can sit beneath
-            it and get visually collided with. */}
-        <View style={styles.metaRow}>
-          <Pressable style={styles.senderRow}>
             {({ hovered }: HoverState) => (
               <>
-                <View style={[styles.avatar, { backgroundColor: avatarColor }]}>
-                  <Text style={styles.avatarText}>{message.sender.charAt(0).toUpperCase()}</Text>
-                </View>
-                <Text style={styles.sender}>{message.sender}</Text>
-                {hovered && (
-                  <View style={[styles.senderTooltip, { borderColor: accentColor }]}>
-                    <Text style={styles.senderTooltipName}>{message.sender}</Text>
-                    <Text style={styles.senderTooltipDetail}>{message.senderEmail}</Text>
-                    <Text style={styles.senderTooltipDetail}>To: {message.to}</Text>
-                  </View>
-                )}
+                <ListIcon name="reply-all" size={14} color={hovered ? colors.text.primary : colors.text.secondary} />
+                <Text style={[styles.ghostBtnText, hovered && { color: colors.text.primary }]}>Reply All</Text>
               </>
             )}
           </Pressable>
+          <Pressable
+            onPress={() => onForward(message)}
+            style={({ hovered }: HoverState) => [
+              styles.ghostBtn,
+              hovered && { backgroundColor: withAlpha(accentColor, 0.12), borderColor: accentColor },
+            ]}
+          >
+            {({ hovered }: HoverState) => (
+              <>
+                <ListIcon name="forward" size={14} color={hovered ? colors.text.primary : colors.text.secondary} />
+                <Text style={[styles.ghostBtnText, hovered && { color: colors.text.primary }]}>Forward</Text>
+              </>
+            )}
+          </Pressable>
+
+          <View style={styles.actionSep} />
+
+          {/* ── Management group ── */}
+          <Tooltip label={message.starred ? "Unstar" : "Star"}>
+            <Pressable
+              onPress={() => onToggleStar(message.id)}
+              style={({ hovered }: HoverState) => [
+                styles.iconBtn,
+                (hovered || message.starred) && { backgroundColor: withAlpha(colors.accent.amber, 0.15) },
+              ]}
+            >
+              {({ hovered }: HoverState) => (
+                <ListIcon
+                  name="star"
+                  filled={message.starred}
+                  size={18}
+                  color={message.starred || hovered ? colors.accent.amber : colors.text.muted}
+                />
+              )}
+            </Pressable>
+          </Tooltip>
+          <Tooltip label="Archive">
+            <Pressable
+              onPress={() => onArchive(message.id)}
+              style={({ hovered }: HoverState) => [
+                styles.iconBtn,
+                hovered && { backgroundColor: withAlpha(accentColor, 0.12) },
+              ]}
+            >
+              {({ hovered }: HoverState) => (
+                <FolderIcon id="archive" size={18} color={hovered ? accentColor : colors.text.muted} />
+              )}
+            </Pressable>
+          </Tooltip>
+          <Tooltip label="Spam">
+            <Pressable
+              onPress={() => onMoveToSpam(message.id)}
+              style={({ hovered }: HoverState) => [
+                styles.iconBtn,
+                hovered && { backgroundColor: withAlpha(colors.accent.amber, 0.12) },
+              ]}
+            >
+              {({ hovered }: HoverState) => (
+                <FolderIcon id="spam" size={18} color={hovered ? colors.accent.amber : colors.text.muted} />
+              )}
+            </Pressable>
+          </Tooltip>
+          <Tooltip label="Delete">
+            <Pressable
+              onPress={() => onDelete(message.id)}
+              style={({ hovered }: HoverState) => [
+                styles.iconBtn,
+                hovered && { backgroundColor: "rgba(239, 68, 68, 0.12)" },
+              ]}
+            >
+              {({ hovered }: HoverState) => (
+                <FolderIcon id="trash" size={18} color={hovered ? "#EF4444" : colors.text.muted} />
+              )}
+            </Pressable>
+          </Tooltip>
+
+          <View style={styles.actionSep} />
+
+          {/* ── Utility group ── */}
+          {onSnooze && (
+            <Tooltip label="Snooze">
+              <Pressable
+                ref={snoozeAnchorRef}
+                onPress={() => { setSnoozeOpen((v) => !v); setOverflowOpen(false); }}
+                style={({ hovered }: HoverState) => [
+                  styles.iconBtn,
+                  (hovered || snoozeOpen) && { backgroundColor: withAlpha(accentColor, 0.15) },
+                ]}
+              >
+                <ListIcon name="schedule" size={18} color={snoozeOpen ? accentColor : colors.text.muted} />
+              </Pressable>
+            </Tooltip>
+          )}
+          <Tooltip label="Mark as unread">
+            <Pressable
+              onPress={() => onMarkUnread(message.id)}
+              style={({ hovered }: HoverState) => [
+                styles.iconBtn,
+                hovered && { backgroundColor: withAlpha(accentColor, 0.12) },
+              ]}
+            >
+              {({ hovered }: HoverState) => (
+                <ListIcon name="mail" size={18} color={hovered ? accentColor : colors.text.muted} />
+              )}
+            </Pressable>
+          </Tooltip>
+          <Tooltip label="Print">
+            <Pressable
+              onPress={handlePrint}
+              style={({ hovered }: HoverState) => [
+                styles.iconBtn,
+                hovered && { backgroundColor: withAlpha(accentColor, 0.12) },
+              ]}
+            >
+              {({ hovered }: HoverState) => (
+                <ListIcon name="print" size={18} color={hovered ? accentColor : colors.text.muted} />
+              )}
+            </Pressable>
+          </Tooltip>
+          {(onFetchSource || (message?.messageId && onMuteThread)) && (
+            <Tooltip label="More actions">
+              <Pressable
+                ref={overflowAnchorRef}
+                onPress={() => setOverflowOpen((v) => !v)}
+                style={({ hovered }: HoverState) => [
+                  styles.iconBtn,
+                  (hovered || overflowOpen) && { backgroundColor: withAlpha(accentColor, 0.15) },
+                ]}
+              >
+                <ListIcon name="ellipsis" size={18} color={overflowOpen ? accentColor : colors.text.muted} />
+              </Pressable>
+            </Tooltip>
+          )}
+        </View>
+        {overflowOpen && overflowAnchorRect && (
+          <FloatingPortal
+            top={overflowAnchorRect.bottom + 6}
+            left={overflowAnchorRect.right - 160}
+            onDismiss={() => setOverflowOpen(false)}
+          >
+            <View style={styles.overflowMenu}>
+              {onFetchSource && (
+                <Pressable
+                  onPress={handleViewSource}
+                  style={({ hovered }: HoverState) => [styles.overflowItem, hovered && styles.overflowItemHover]}
+                >
+                  <Text style={styles.overflowItemText}>View source</Text>
+                </Pressable>
+              )}
+              {onFetchSource && (
+                <Pressable
+                  onPress={handleExportEml}
+                  style={({ hovered }: HoverState) => [styles.overflowItem, hovered && styles.overflowItemHover]}
+                >
+                  <Text style={styles.overflowItemText}>Export .eml</Text>
+                </Pressable>
+              )}
+              {message?.messageId && onMuteThread && (
+                <Pressable
+                  onPress={() => {
+                    onMuteThread(message.messageId!, !isMuted);
+                    setOverflowOpen(false);
+                  }}
+                  style={({ hovered }: HoverState) => [styles.overflowItem, hovered && styles.overflowItemHover]}
+                >
+                  <Text style={[styles.overflowItemText, isMuted && { color: accentColor }]}>
+                    {isMuted ? "Unmute thread" : "Mute thread"}
+                  </Text>
+                </Pressable>
+              )}
+            </View>
+          </FloatingPortal>
+        )}
+
+        {snoozeOpen && snoozeAnchorRect && (
+          <FloatingPortal
+            top={snoozeAnchorRect.bottom + 6}
+            left={snoozeAnchorRect.left - 10}
+            onDismiss={() => setSnoozeOpen(false)}
+          >
+            <View style={styles.snoozePicker}>
+              <Text style={styles.snoozePickerTitle}>Snooze until...</Text>
+              {snoozePresets().map((preset) => (
+                <Pressable
+                  key={preset.iso}
+                  onPress={() => { onSnooze!(message.id, preset.iso); setSnoozeOpen(false); }}
+                  style={({ hovered }: HoverState) => [styles.snoozeOption, hovered && styles.snoozeOptionHover]}
+                >
+                  <Text style={styles.snoozeOptionLabel}>{preset.label}</Text>
+                  <Text style={styles.snoozeOptionTime}>{preset.sublabel}</Text>
+                </Pressable>
+              ))}
+              <View style={styles.snoozeCustomRow}>
+                <input
+                  type="datetime-local"
+                  value={snoozeCustom}
+                  onChange={(e) => setSnoozeCustom((e.target as HTMLInputElement).value)}
+                  style={{
+                    flex: 1,
+                    background: "transparent",
+                    border: `1px solid ${colors.border.subtle}`,
+                    borderRadius: radii.sm,
+                    color: colors.text.secondary,
+                    fontFamily: fontFamily.ui,
+                    fontSize: 12,
+                    padding: "4px 8px",
+                    colorScheme: "dark",
+                    outline: "none",
+                  }}
+                />
+                <Pressable
+                  onPress={() => {
+                    if (!snoozeCustom) return;
+                    onSnooze!(message.id, new Date(snoozeCustom).toISOString());
+                    setSnoozeOpen(false);
+                    setSnoozeCustom("");
+                  }}
+                  style={[styles.snoozeSetBtn, { backgroundColor: accentColor }]}
+                >
+                  <Text style={styles.snoozeSetBtnText}>Set</Text>
+                </Pressable>
+              </View>
+            </View>
+          </FloatingPortal>
+        )}
+
+        <View style={styles.metaRow}>
+          <Pressable
+            ref={senderAnchorRef}
+            style={styles.senderRow}
+            onHoverIn={() => setSenderTooltipOpen(true)}
+            onHoverOut={() => setSenderTooltipOpen(false)}
+          >
+            <View style={[styles.avatar, { backgroundColor: avatarColor }]}>
+              <Text style={styles.avatarText}>{(message.sender || "?").charAt(0).toUpperCase()}</Text>
+            </View>
+            <Text style={styles.sender}>{message.sender}</Text>
+          </Pressable>
+          {senderTooltipOpen && senderAnchorRect && (
+            // Rendered through FloatingPortal (mounted at document.body) rather
+            // than an in-place `position: absolute` node -- every react-native-web
+            // View is its own CSS stacking context, so a bare zIndex here could
+            // never out-rank the message body ScrollView that follows it in the
+            // DOM, and the tooltip ended up rendering underneath the body instead
+            // of floating over it. Same fix as the overflow menu below.
+            <FloatingPortal top={senderAnchorRect.bottom + 6} left={senderAnchorRect.left}>
+              <View style={[styles.senderTooltip, { borderColor: accentColor }]}>
+                <Text style={styles.senderTooltipName}>{message.sender}</Text>
+                <Text style={styles.senderTooltipDetail}>{message.senderEmail}</Text>
+                {!!message.to && <Text style={styles.senderTooltipDetail}>To: {message.to}</Text>}
+                {!!message.cc && <Text style={styles.senderTooltipDetail}>Cc: {message.cc}</Text>}
+              </View>
+            </FloatingPortal>
+          )}
           <Text style={styles.time}>{formatMessageTime(message.date)}</Text>
         </View>
       </View>
 
-      <View style={[styles.body, lightMode && styles.bodyLight]}>
-        <Pressable
-          onPress={() => setLightMode((value) => !value)}
-          style={[styles.lightModeToggle, { borderColor: accentColor }, lightMode && { backgroundColor: accentColor }]}
-        >
-          <Text style={[styles.lightModeToggleText, lightMode ? { color: colors.background.base } : { color: accentColor }]}>
-            {lightMode ? "Dark mode" : "Light mode"}
-          </Text>
-        </Pressable>
-
-        {imagesBlocked && (
-          <View style={[styles.imageBlocked, lightMode && styles.vaultCardLight]}>
-            <Text style={[styles.imageBlockedText, lightMode && styles.bodyTextLight]}>
-              Remote image blocked -- loading it would tell the sender you opened this email.
-            </Text>
-            <Pressable onPress={() => setShowImagesOverride(true)}>
-              <Text style={[styles.imageBlockedAction, { color: accentColor }]}>Show images</Text>
+      <ScrollView
+        style={[styles.body, styles.bodyLight]}
+        contentContainerStyle={styles.bodyContent}
+      >
+        {isSpamFolder && onNotSpam && (
+          <View style={[styles.notSpamBanner, { borderColor: withAlpha(accentColor, 0.3) }]}>
+            <Text style={styles.notSpamText}>This message is in Spam.</Text>
+            <Pressable
+              onPress={() => onNotSpam(message.id)}
+              style={({ hovered }: HoverState) => [
+                styles.notSpamBtn,
+                { borderColor: accentColor },
+                hovered && { backgroundColor: withAlpha(accentColor, 0.15) },
+              ]}
+            >
+              <Text style={[styles.notSpamBtnText, { color: accentColor }]}>Not spam — move to Inbox</Text>
             </Pressable>
           </View>
         )}
 
-        {sanitizedBody ? (
-          <HtmlMessageBody html={sanitizedBody} lightMode={lightMode} />
-        ) : (
-          <Text style={[styles.bodyText, lightMode && styles.bodyTextLight]}>{textBody}</Text>
+        {readReceipts &&
+          message.dispositionNotificationTo &&
+          message.messageId &&
+          mdnSent === null &&
+          onSendMdn && (
+            <View style={[styles.notSpamBanner, { borderColor: withAlpha(accentColor, 0.3) }]}>
+              <Text style={styles.notSpamText}>
+                The sender requested a read receipt.
+              </Text>
+              <View style={{ flexDirection: "row", gap: 10, flexWrap: "wrap" }}>
+                <Pressable
+                  onPress={() => {
+                    onSendMdn(
+                      message.dispositionNotificationTo!,
+                      message.messageId!,
+                      message.subject,
+                    );
+                    setMdnSent("sent");
+                  }}
+                  style={({ hovered }: HoverState) => [
+                    styles.notSpamBtn,
+                    { borderColor: accentColor },
+                    hovered && { backgroundColor: withAlpha(accentColor, 0.15) },
+                  ]}
+                >
+                  <Text style={[styles.notSpamBtnText, { color: accentColor }]}>Send receipt</Text>
+                </Pressable>
+                <Pressable
+                  onPress={() => setMdnSent("dismissed")}
+                  style={({ hovered }: HoverState) => [
+                    styles.notSpamBtn,
+                    { borderColor: "rgba(255,255,255,0.2)" },
+                    hovered && { backgroundColor: "rgba(255,255,255,0.08)" },
+                  ]}
+                >
+                  <Text style={[styles.notSpamBtnText, { color: "#888" }]}>Dismiss</Text>
+                </Pressable>
+              </View>
+            </View>
+          )}
+
+        {mdnSent === "sent" && (
+          <View style={styles.mutedBanner}>
+            <Text style={styles.mutedBannerText}>Read receipt sent.</Text>
+          </View>
         )}
 
-        {realAtts.map((att) => (
+        {isMuted && (
+          <View style={styles.mutedBanner}>
+            <Text style={styles.mutedBannerText}>
+              Thread muted -- new messages won't trigger notifications.
+            </Text>
+          </View>
+        )}
+
+        {sourceOpen && (
+          <View style={styles.sourcePanel}>
+            <View style={styles.sourcePanelHeader}>
+              <Text style={styles.sourcePanelTitle}>Raw message source</Text>
+              <Pressable onPress={() => setSourceOpen(false)}>
+                <Text style={[styles.sourcePanelClose, { color: accentColor }]}>Close</Text>
+              </Pressable>
+            </View>
+            {sourceFetching ? (
+              <Text style={styles.sourcePanelMeta}>Fetching...</Text>
+            ) : sourceBase64 === "" ? (
+              <Text style={[styles.sourcePanelMeta, { color: colors.accent.amber }]}>
+                Could not fetch message source.
+              </Text>
+            ) : (
+              <ScrollView style={styles.sourcePanelScroll} nestedScrollEnabled>
+                <Text selectable style={styles.sourcePanelText}>
+                  {sourceBase64 !== null
+                    ? new TextDecoder("utf-8", { fatal: false }).decode(
+                        Uint8Array.from(atob(sourceBase64), (c) => c.charCodeAt(0)),
+                      )
+                    : ""}
+                </Text>
+              </ScrollView>
+            )}
+          </View>
+        )}
+
+        {hasActualRemoteImages && (
+          <View style={styles.imageBlocked}>
+            <Text style={styles.imageBlockedText}>
+              Remote images blocked — loading them tells the sender when you opened this email.
+            </Text>
+            {showImagesPicker ? (
+              <View style={styles.imageBlockedPicker}>
+                <Pressable
+                  onPress={() => { setShowImagesOverride(true); setShowImagesPicker(false); }}
+                  style={[styles.imagePickerOption, { borderColor: accentColor }]}
+                >
+                  <Text style={[styles.imagePickerOptionText, { color: accentColor }]}>Just this time</Text>
+                </Pressable>
+                {!!senderDomain && (
+                  <Pressable
+                    onPress={() => { onAllowImageDomain(senderDomain); setShowImagesPicker(false); }}
+                    style={[styles.imagePickerOption, { borderColor: accentColor }]}
+                  >
+                    <Text style={[styles.imagePickerOptionText, { color: accentColor }]}>
+                      Always from {senderDomain}
+                    </Text>
+                  </Pressable>
+                )}
+                <Pressable onPress={() => setShowImagesPicker(false)}>
+                  <Text style={[styles.imageBlockedAction, { color: colors.text.muted }]}>Cancel</Text>
+                </Pressable>
+              </View>
+            ) : (
+              <Pressable onPress={() => setShowImagesPicker(true)}>
+                <Text style={[styles.imageBlockedAction, { color: accentColor }]}>Show images</Text>
+              </Pressable>
+            )}
+          </View>
+        )}
+
+        {sanitizedBody ? (
+          <HtmlMessageBody html={sanitizedBody} blockRemoteImages={imagesBlocked} shielded={overflowOpen} />
+        ) : (
+          <Text style={styles.bodyText}>
+            {textBody?.replace(/\r\n/g, "\n").replace(/\r/g, "\n")}
+          </Text>
+        )}
+
+        {realAtts.map((att) => {
+          // Calendar attachments get an invite card instead of a download chip
+          // when we have a UID to fetch with and a response handler is available.
+          if (att.contentType === "text/calendar" && onRespondToInvite) {
+            const invite = invitesByIndex[att.index];
+            if (invite === "loading") {
+              return (
+                <View key={att.index} style={[styles.vaultCard, { borderColor: accentColor }]}>
+                  <Text style={styles.vaultMeta}>Loading invite...</Text>
+                </View>
+              );
+            }
+            if (typeof invite === "object") {
+              return (
+                <InviteCard
+                  key={att.index}
+                  invite={invite}
+                  accentColor={accentColor}
+                  lightMode={false}
+                  onRespond={(response) => onRespondToInvite(invite, response)}
+                />
+              );
+            }
+            // "error" or undefined -- fall through to the plain download card
+          }
+
+          return (
           <View
             key={att.index}
-            style={[styles.vaultCard, { borderColor: accentColor }, lightMode && styles.vaultCardLight]}
+            style={[styles.vaultCard, { borderColor: accentColor }]}
           >
             <View style={[styles.vaultLock, { backgroundColor: accentColor }]} />
             <View style={styles.vaultText}>
-              <Text style={[styles.vaultName, lightMode && styles.bodyTextLight]}>{att.name}</Text>
-              <Text style={[styles.vaultMeta, lightMode && styles.vaultMetaLight]}>
+              <Text style={styles.vaultName}>{att.name}</Text>
+              <Text style={styles.vaultMeta}>
                 {att.contentType ?? "application/octet-stream"} · {formatBytes(att.size)}
               </Text>
             </View>
-            {message?.uid !== undefined ? (
+            {message?.uid !== undefined || message?.pop3Number !== undefined ? (
               <Pressable
-                onPress={() => onDownloadAttachment(message.uid!, att.index)}
+                onPress={() => onDownloadAttachment((message.uid ?? message.pop3Number)!, att.index)}
                 style={({ hovered }: HoverState) => [
                   styles.downloadButton,
                   { borderColor: accentColor },
@@ -232,15 +794,24 @@ export function ReaderPane({
               </View>
             )}
           </View>
-        ))}
-      </View>
+          );
+        })}
+      </ScrollView>
     </View>
   );
 }
 
 interface HtmlMessageBodyProps {
   html: string;
-  lightMode: boolean;
+  // When true, the iframe CSP restricts img-src to data: and blob: only,
+  // preventing remote tracking pixels from loading.
+  blockRemoteImages?: boolean;
+  // When true, a transparent cover div is placed over the iframe. This
+  // prevents the iframe's compositor layer from visually punching through
+  // fixed-position overlays (overflow menu, tooltips) -- a known Chromium
+  // and WebKit quirk where iframes can render above z-indexed elements
+  // from the parent document.
+  shielded?: boolean;
 }
 
 // Real mail HTML renders in a sandboxed <iframe>, not a plain div with
@@ -253,37 +824,61 @@ interface HtmlMessageBodyProps {
 // this component read the iframe's rendered height to size itself --
 // scripts stay fully disabled either way. `allow-popups` is needed for
 // links (forced to target="_blank" by sanitizeHtml) to actually open.
+function escapeHtml(value: string): string {
+  return value
+    .replace(/&/g, "&amp;")
+    .replace(/</g, "&lt;")
+    .replace(/>/g, "&gt;")
+    .replace(/"/g, "&quot;");
+}
+
 function formatBytes(bytes: number): string {
   if (bytes < 1024) return `${bytes} B`;
   if (bytes < 1024 * 1024) return `${(bytes / 1024).toFixed(1)} KB`;
   return `${(bytes / (1024 * 1024)).toFixed(1)} MB`;
 }
 
-function HtmlMessageBody({ html, lightMode }: HtmlMessageBodyProps) {
+function HtmlMessageBody({ html, blockRemoteImages = false, shielded = false }: HtmlMessageBodyProps) {
   const [height, setHeight] = useState(200);
   const iframeRef = useRef<HTMLIFrameElement>(null);
 
-  const doc = `<!doctype html><html><head><meta charset="utf-8" /><style>
-    body { margin: 0; padding: 0; overflow: hidden; word-wrap: break-word;
-      font-family: ${fontFamily.ui}; font-size: 14px; line-height: 1.5;
-      color: ${lightMode ? "#000000" : colors.text.primary}; background: transparent; }
-    img { max-width: 100%; }
+  const imgSrc = blockRemoteImages ? "data: blob:" : "* data: blob:";
+  const doc = `<!doctype html><html><head><meta charset="utf-8" /><meta http-equiv="Content-Security-Policy" content="default-src 'none'; style-src 'unsafe-inline'; img-src ${imgSrc}; font-src *;"><style>
+    body { margin: 0; padding: 8px 0; overflow: hidden; word-wrap: break-word;
+      font-family: ${fontFamily.ui}; font-size: 14px; line-height: 1.6;
+      color: #111111; background: transparent; }
+    img { max-width: 100%; height: auto; }
+    a { color: #0070c0; }
+    pre, code { font-family: monospace; background: #f4f4f4; padding: 2px 4px; border-radius: 3px; }
+    blockquote { margin: 0 0 0 16px; padding-left: 12px; border-left: 3px solid #ccc; color: #555; }
+    table { border-collapse: collapse; max-width: 100%; }
+    td, th { padding: 4px 8px; }
   </style></head><body>${html}</body></html>`;
 
   function handleLoad() {
     const body = iframeRef.current?.contentDocument?.body;
-    if (body) setHeight(body.scrollHeight);
+    if (body) {
+      // Add a small buffer so content doesn't clip on the bottom edge.
+      setHeight(body.scrollHeight + 16);
+    }
   }
 
   return (
-    <iframe
-      ref={iframeRef}
-      title="Message body"
-      srcDoc={doc}
-      onLoad={handleLoad}
-      sandbox="allow-same-origin allow-popups"
-      style={{ width: "100%", border: "none", height, display: "block" }}
-    />
+    <div style={{ position: "relative", width: "100%" }}>
+      <iframe
+        ref={iframeRef}
+        title="Message body"
+        srcDoc={doc}
+        onLoad={handleLoad}
+        sandbox="allow-same-origin allow-popups"
+        style={{ width: "100%", border: "none", height, display: "block" }}
+      />
+      {/* Transparent shield stops the iframe's GPU compositor layer from
+          visually appearing above fixed-position overlays when a menu is open. */}
+      {shielded && (
+        <div style={{ position: "absolute", inset: 0, background: "transparent" }} />
+      )}
+    </div>
   );
 }
 
@@ -296,11 +891,24 @@ const styles = StyleSheet.create({
   emptyPane: {
     alignItems: "center",
     justifyContent: "center",
+    gap: 8,
+  },
+  emptyIcon: {
+    marginBottom: 4,
+    opacity: 0.7,
+  },
+  emptyHeadline: {
+    fontFamily: fontFamily.display,
+    fontSize: fontSize.lg,
+    fontWeight: "600",
+    color: colors.text.secondary,
   },
   emptyText: {
     fontFamily: fontFamily.ui,
     fontSize: fontSize.sm,
     color: colors.text.muted,
+    textAlign: "center",
+    maxWidth: 220,
   },
   header: {
     paddingHorizontal: spacing.xxl,
@@ -359,19 +967,14 @@ const styles = StyleSheet.create({
   senderRow: {
     flexDirection: "row",
     alignItems: "center",
-    position: "relative",
   },
   senderTooltip: {
-    position: "absolute",
-    top: "100%",
-    left: 0,
-    marginTop: spacing.sm,
     minWidth: 220,
+    maxWidth: 320,
     padding: spacing.md,
     borderRadius: radii.md,
     borderWidth: 1,
     backgroundColor: colors.background.panel,
-    zIndex: 30,
   },
   senderTooltipName: {
     fontFamily: fontFamily.ui,
@@ -387,23 +990,24 @@ const styles = StyleSheet.create({
     marginBottom: 2,
   },
   avatar: {
-    width: 24,
-    height: 24,
-    borderRadius: 12,
+    width: 30,
+    height: 30,
+    borderRadius: 15,
     alignItems: "center",
     justifyContent: "center",
     marginRight: spacing.sm,
   },
   avatarText: {
     fontFamily: fontFamily.display,
-    fontSize: fontSize.xs,
-    fontWeight: "600",
+    fontSize: fontSize.sm,
+    fontWeight: "700",
     color: colors.background.base,
   },
   sender: {
     fontFamily: fontFamily.ui,
     fontSize: fontSize.sm,
-    color: colors.text.secondary,
+    fontWeight: "500",
+    color: colors.text.primary,
   },
   time: {
     fontFamily: fontFamily.mono,
@@ -414,66 +1018,65 @@ const styles = StyleSheet.create({
     flexDirection: "row",
     alignItems: "center",
     marginBottom: spacing.md,
+    flexWrap: "wrap",
+    gap: spacing.xs,
   },
-  actionButton: {
-    padding: spacing.xs,
-    marginRight: spacing.sm,
-  },
-  replyButton: {
-    paddingVertical: 6,
-    paddingHorizontal: spacing.md,
+  primaryBtn: {
+    flexDirection: "row",
+    alignItems: "center",
+    height: 34,
+    paddingHorizontal: spacing.lg,
     borderRadius: radii.pill,
-    marginRight: spacing.md,
-    shadowOpacity: 0.5,
-    shadowRadius: 8,
+    gap: 7,
+    shadowOpacity: 0.45,
+    shadowRadius: 14,
     shadowOffset: { width: 0, height: 0 },
   },
-  replyButtonText: {
+  primaryBtnText: {
     fontFamily: fontFamily.ui,
-    fontSize: fontSize.xs,
+    fontSize: fontSize.sm,
     fontWeight: "700",
     color: colors.background.base,
   },
-  secondaryReplyButton: {
-    paddingVertical: 6,
+  ghostBtn: {
+    flexDirection: "row",
+    alignItems: "center",
+    height: 34,
     paddingHorizontal: spacing.md,
     borderRadius: radii.pill,
     borderWidth: 1,
     borderColor: colors.border.subtle,
-    marginRight: spacing.sm,
+    gap: 6,
   },
-  secondaryReplyButtonText: {
+  ghostBtnText: {
     fontFamily: fontFamily.ui,
-    fontSize: fontSize.xs,
+    fontSize: fontSize.sm,
     fontWeight: "600",
     color: colors.text.secondary,
   },
-  markUnreadPill: {
-    paddingVertical: 4,
-    paddingHorizontal: spacing.sm,
-    borderWidth: 1,
-    borderRadius: radii.pill,
+  iconBtn: {
+    width: 34,
+    height: 34,
+    borderRadius: radii.md,
+    alignItems: "center",
+    justifyContent: "center",
   },
-  markUnreadPillText: {
-    fontFamily: fontFamily.ui,
-    fontSize: 11,
-    fontWeight: "600",
+  actionSep: {
+    width: 1,
+    height: 20,
+    backgroundColor: colors.border.subtle,
+    marginHorizontal: spacing.xs,
   },
   body: {
     flex: 1,
+  },
+  bodyContent: {
     paddingHorizontal: spacing.xxl,
-    paddingVertical: spacing.xl,
+    paddingTop: spacing.xl,
+    paddingBottom: spacing.xxl,
   },
   bodyLight: {
     backgroundColor: "#FFFFFF",
-  },
-  lightModeToggle: {
-    alignSelf: "flex-end",
-    paddingVertical: spacing.xs,
-    paddingHorizontal: spacing.md,
-    borderWidth: 1,
-    borderRadius: radii.pill,
-    marginBottom: spacing.lg,
   },
   lightModeToggleText: {
     fontFamily: fontFamily.ui,
@@ -484,11 +1087,8 @@ const styles = StyleSheet.create({
     fontFamily: fontFamily.ui,
     fontSize: fontSize.md,
     lineHeight: 24,
-    color: colors.text.primary,
+    color: "#111111",
     marginBottom: spacing.xl,
-  },
-  bodyTextLight: {
-    color: "#000000",
   },
   imageBlocked: {
     alignSelf: "flex-start",
@@ -508,6 +1108,24 @@ const styles = StyleSheet.create({
     marginRight: spacing.sm,
   },
   imageBlockedAction: {
+    fontFamily: fontFamily.ui,
+    fontSize: fontSize.xs,
+    fontWeight: "700",
+  },
+  imageBlockedPicker: {
+    flexDirection: "row",
+    alignItems: "center",
+    flexWrap: "wrap",
+    gap: spacing.sm,
+    marginTop: spacing.xs,
+  },
+  imagePickerOption: {
+    paddingVertical: 4,
+    paddingHorizontal: spacing.sm,
+    borderWidth: 1,
+    borderRadius: radii.pill,
+  },
+  imagePickerOptionText: {
     fontFamily: fontFamily.ui,
     fontSize: fontSize.xs,
     fontWeight: "700",
@@ -570,5 +1188,175 @@ const styles = StyleSheet.create({
     fontSize: 11,
     fontWeight: "600",
     color: colors.text.muted,
+  },
+  overflowMenu: {
+    minWidth: 160,
+    borderRadius: radii.md,
+    borderWidth: 1,
+    borderColor: colors.border.subtle,
+    backgroundColor: colors.background.panel,
+    paddingVertical: spacing.xs,
+    overflow: "hidden",
+  },
+  overflowItem: {
+    paddingVertical: spacing.sm,
+    paddingHorizontal: spacing.md,
+  },
+  overflowItemHover: {
+    backgroundColor: colors.background.surface,
+  },
+  overflowItemText: {
+    fontFamily: fontFamily.ui,
+    fontSize: fontSize.sm,
+    color: colors.text.secondary,
+  },
+  notSpamBanner: {
+    flexDirection: "row",
+    alignItems: "center",
+    flexWrap: "wrap",
+    gap: spacing.sm,
+    paddingVertical: spacing.sm,
+    paddingHorizontal: spacing.md,
+    borderRadius: radii.md,
+    borderWidth: 1,
+    backgroundColor: colors.background.surface,
+    marginBottom: spacing.md,
+  },
+  notSpamText: {
+    fontFamily: fontFamily.ui,
+    fontSize: fontSize.sm,
+    color: colors.text.secondary,
+    flex: 1,
+  },
+  notSpamBtn: {
+    paddingVertical: 5,
+    paddingHorizontal: spacing.md,
+    borderRadius: radii.pill,
+    borderWidth: 1,
+  },
+  notSpamBtnText: {
+    fontFamily: fontFamily.ui,
+    fontSize: fontSize.xs,
+    fontWeight: "700",
+  },
+  mutedBanner: {
+    paddingVertical: spacing.sm,
+    paddingHorizontal: spacing.md,
+    borderRadius: radii.sm,
+    backgroundColor: colors.background.surface,
+    marginBottom: spacing.md,
+    alignSelf: "flex-start",
+  },
+  mutedBannerText: {
+    fontFamily: fontFamily.ui,
+    fontSize: fontSize.xs,
+    color: colors.text.muted,
+  },
+  snoozePicker: {
+    minWidth: 230,
+    borderRadius: radii.md,
+    borderWidth: 1,
+    borderColor: colors.border.subtle,
+    backgroundColor: colors.background.panel,
+    paddingVertical: spacing.xs,
+    overflow: "hidden",
+  },
+  snoozePickerTitle: {
+    fontFamily: fontFamily.ui,
+    fontSize: 11,
+    fontWeight: "600",
+    color: colors.text.muted,
+    textTransform: "uppercase",
+    letterSpacing: 0.6,
+    paddingVertical: spacing.xs,
+    paddingHorizontal: spacing.md,
+  },
+  snoozeOption: {
+    flexDirection: "row",
+    alignItems: "center",
+    justifyContent: "space-between",
+    paddingVertical: spacing.sm,
+    paddingHorizontal: spacing.md,
+  },
+  snoozeOptionHover: {
+    backgroundColor: colors.background.surface,
+  },
+  snoozeOptionLabel: {
+    fontFamily: fontFamily.ui,
+    fontSize: fontSize.sm,
+    color: colors.text.primary,
+  },
+  snoozeOptionTime: {
+    fontFamily: fontFamily.mono,
+    fontSize: fontSize.xs,
+    color: colors.text.muted,
+    marginLeft: spacing.lg,
+  },
+  snoozeCustomRow: {
+    flexDirection: "row",
+    alignItems: "center",
+    gap: spacing.sm,
+    paddingVertical: spacing.sm,
+    paddingHorizontal: spacing.md,
+    borderTopWidth: 1,
+    borderTopColor: colors.border.subtle,
+    marginTop: spacing.xs,
+  },
+  snoozeSetBtn: {
+    paddingVertical: 5,
+    paddingHorizontal: spacing.md,
+    borderRadius: radii.pill,
+  },
+  snoozeSetBtnText: {
+    fontFamily: fontFamily.ui,
+    fontSize: fontSize.xs,
+    fontWeight: "700",
+    color: colors.background.base,
+  },
+  sourcePanel: {
+    borderRadius: radii.md,
+    borderWidth: 1,
+    borderColor: colors.border.subtle,
+    backgroundColor: colors.background.surface,
+    marginBottom: spacing.lg,
+    overflow: "hidden",
+  },
+  sourcePanelHeader: {
+    flexDirection: "row",
+    alignItems: "center",
+    justifyContent: "space-between",
+    paddingVertical: spacing.sm,
+    paddingHorizontal: spacing.md,
+    borderBottomWidth: 1,
+    borderBottomColor: colors.border.subtle,
+  },
+  sourcePanelTitle: {
+    fontFamily: fontFamily.ui,
+    fontSize: fontSize.xs,
+    fontWeight: "600",
+    color: colors.text.secondary,
+    textTransform: "uppercase",
+    letterSpacing: 0.5,
+  },
+  sourcePanelClose: {
+    fontFamily: fontFamily.ui,
+    fontSize: fontSize.xs,
+    fontWeight: "600",
+  },
+  sourcePanelMeta: {
+    fontFamily: fontFamily.ui,
+    fontSize: fontSize.xs,
+    color: colors.text.muted,
+    padding: spacing.md,
+  },
+  sourcePanelScroll: {
+    maxHeight: 360,
+  },
+  sourcePanelText: {
+    fontFamily: fontFamily.mono,
+    fontSize: 11,
+    color: colors.text.secondary,
+    lineHeight: 18,
+    padding: spacing.md,
   },
 });

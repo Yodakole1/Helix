@@ -56,12 +56,32 @@ attachment's name/bytes survive (`builds_a_multipart_draft_that_round_trips_thro
   attempts `smtp::send_message`. On success the row is deleted and
   `QueueResult { sent: true }` returned; on failure the row stays (with
   `attempt_count`/`last_error` recorded) and `sent: false` comes back so
-  the caller knows to retry later.
+  the caller knows to retry later. Takes `cc`/`bcc` (comma-separated
+  address lists, same shape as `to`) alongside `to`; they're persisted on
+  the row (`outbox.cc`/`outbox.bcc`, additive-migration TEXT columns
+  defaulting to `''`) and passed through to `send_message`, so a queued
+  message that's retried later keeps its full recipient set rather than
+  silently sending to To only.
 - **`flush_outbox(account_id)`** retries every queued message, resolving
   the account's SMTP settings from the cache so the caller doesn't re-pass
   them. Sent rows are deleted; still-failing rows have their attempt
   counter bumped. Call it on startup or when connectivity returns
   (e.g. on a `helix://imap-new-mail` event).
+
+## Draft HTML round-trip
+
+`build_raw_draft_bytes` now emits the correct MIME structure for every
+combination of text, HTML, and attachments:
+
+- Text only, no attachments → single `text/plain` part (unchanged).
+- Text + HTML, no attachments → `multipart/alternative` (text then html).
+- Text (+ optional HTML) + attachments → `multipart/mixed` wrapping a
+  `text/plain` or `multipart/alternative` body part, followed by the
+  attachment parts.
+
+This matches `smtp::build_multipart_body`'s structure exactly, so a draft
+APPENDed to the server and opened in another client (Thunderbird, Apple Mail,
+Outlook) shows the HTML body rather than falling back to plain text.
 
 ## What this doesn't do yet
 
@@ -69,10 +89,16 @@ attachment's name/bytes survive (`builds_a_multipart_draft_that_round_trips_thro
   isn't called — most servers don't return APPENDUID, so a draft's
   server-side UID is only known if one happens to. Re-saves rely on the
   stored `imap_uid` when present and otherwise just APPEND a fresh copy.
-- **No outbox backoff.** `flush_outbox` retries every queued row on each
-  call with no delay or cap; a persistently-rejecting server is retried
-  every reconnect.
-- **No draft HTML-body MIME.** `body_html` is stored but
-  `build_raw_draft_bytes` only emits the plain-text part (plus
-  attachments); an HTML alternative isn't built into the APPENDed draft
-  yet.
+- **No outbox backoff.** `flush_outbox` retries every eligible queued row
+  on each call with no delay or cap; a persistently-rejecting server is
+  retried every reconnect.
+
+## Drafts-folder self-heal (added later)
+
+`append_draft_to_imap` heals a wrong drafts-folder name the same way
+`smtp::append_to_sent` heals Sent (see `smtp.md`): on APPEND failure it
+resolves the real folder from LIST, retries, and persists the correction.
+The frontend also stopped hardcoding "Drafts" -- `App.tsx` passes the
+account record's `drafts_folder` into the compose draft context, and
+compose auto-saves now include the rich-text HTML body (`bodyHtml`), not
+just the plain text.

@@ -49,3 +49,31 @@ for listing and undoing onboarding — see `multi-account.md` for both.
   then confirmed both the keychain credential and the account row were
   gone. Not part of the committed test suite, for the same reason as the
   IMAP scratch checks — no contributor will have access to that account.
+
+## Special-folder resolution (added later)
+
+`add_account` no longer hardcodes "Sent"/"Trash"/"Archive"/"Drafts"/
+"Spam" as the account's special folders. Those defaults silently broke
+save-to-Sent and archive/trash moves on providers that nest mailboxes --
+the real test host's layout is `INBOX.Sent`/`INBOX.Trash`/..., and an
+APPEND to the literal "Sent" fails outright (verified live). The LIST
+response from the verification login now feeds
+`imap::resolve_special_folder`, which matches each role by the folder's
+leaf name against the synonyms servers actually use ("Sent Mail",
+"Deleted Items", "Junk", "All Mail", ...), preferring the least-nested
+match; explicit caller-supplied folder overrides still win. Accounts
+recorded before this existed are healed at runtime the first time an
+APPEND or move fails -- see `folder-operations.md` and `smtp.md`.
+
+## The onboarding flow is a tab (added later)
+
+`AddAccountModal` was replaced by `src/components/AddAccountView.tsx`, a
+full-page flow that opens as its own tab (or over the welcome screen for
+the first account) instead of a blocking dialog. After the mail login
+verifies, it probes CalDAV and CardDAV with the same credentials
+(`discover_caldav`/`discover_carddav` against the mail domain, then the
+IMAP host) and shows a per-service checkmark; Continue adds every
+discovered calendar/address book (`add_caldav_source`/
+`add_carddav_source`, best-effort) and opens the inbox. A failed probe is
+reported ("do you want to continue with what worked?") and never blocks
+mail -- mail is the gate: if the mail login fails, nothing is added.

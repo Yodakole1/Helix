@@ -20,10 +20,12 @@ are still exactly as inert as when this doc was first written.
   imports an existing one (`import_own_key`), and shows/copies the
   resulting fingerprint and armored public key. A separate, account-
   independent section imports a contact's public key
-  (`import_contact_key`), showing the returned fingerprint -- there's no
-  list/read command for contact keys yet, so previously-imported ones
-  aren't shown after a reload, only what's imported in the current
-  session.
+  (`import_contact_key`), showing the returned fingerprint. The backend
+  now also exposes `list_own_keys`/`list_contact_keys` (and
+  `delete_own_key`/`delete_contact_key`) so the UI can redisplay and
+  prune previously-stored keys after a reload instead of only what was
+  imported in the current session -- see `pgp.md`. Wiring those listings
+  into `PgpKeySettings.tsx` is the remaining frontend step.
 - This works today the same way `AddAccountModal`'s `storeCredential`
   call does: it's a real call against one of the hardcoded `ACCOUNTS`
   identities (see `multi-account.md`), not against a fully onboarded,
@@ -37,7 +39,7 @@ are still exactly as inert as when this doc was first written.
   (`encrypt`); nothing reads that state when a message is actually sent
   (`handleClose`, wired to both Discard and Send, doesn't look at it at
   all). Sending isn't wired to a real backend command yet either — see
-  `backend-backlog.md`.
+  the per-feature docs in `docs/technical/`.
 - `SettingsModal`'s "Encrypt new messages by default" toggle
   (`encryptByDefault` state, lifted to `App.tsx`) only controls the
   *starting* value of compose's Encrypt switch for a fresh draft —
@@ -47,7 +49,7 @@ are still exactly as inert as when this doc was first written.
   `pgpSignatureValid`), set on exactly one sample message, the same way
   `hasRemoteImage` illustrates the image-blocking toggle. It is not real
   decryption output — there's no `fetch_message_body` call from the
-  frontend yet (see `backend-backlog.md`), so there's nothing real to
+  frontend yet (see the per-feature docs in `docs/technical/`), so there's nothing real to
   decrypt against. Don't extend this pattern to more messages or wire it
   to look more finished than it is; wire it to a real fetch instead once
   that exists.

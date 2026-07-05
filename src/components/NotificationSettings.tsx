@@ -1,9 +1,12 @@
 import { isPermissionGranted, requestPermission, sendNotification } from "@tauri-apps/plugin-notification";
 import { useEffect, useState } from "react";
-import { Pressable, Text, View } from "react-native";
-import { usePersistedState } from "../hooks/usePersistedState";
+import { Pressable, StyleSheet, Text, View } from "react-native";
+import { usePersistedJSON, usePersistedState } from "../hooks/usePersistedState";
+import { colors, fontFamily, radii, spacing } from "../theme";
 import { settingsStyles as styles } from "./settingsStyles";
 import { Switch } from "./Switch";
+
+const LEAD_OPTIONS = [5, 10, 15, 30];
 
 interface NotificationSettingsProps {
   accentColor: string;
@@ -11,17 +14,16 @@ interface NotificationSettingsProps {
 
 type PermissionState = "checking" | "granted" | "denied" | "prompt" | "unsupported";
 
-// Real where the OS lets it be real: isPermissionGranted/requestPermission/
-// sendNotification (@tauri-apps/plugin-notification, wired into
-// src-tauri/Cargo.toml + lib.rs + capabilities/default.json this pass) are
-// genuine OS notification calls, not stubs. "Notify on new mail" stays
-// inert -- there's no new-mail-detection loop anywhere in this app yet
-// (no IMAP IDLE, no polling, see backend-backlog.md), so nothing exists
-// to trigger it regardless of permission state. Its value still persists
-// so a future real trigger has something to read.
+// All real OS notification calls (@tauri-apps/plugin-notification), no
+// stubs. "Notify on new mail" fires from the IMAP IDLE new-mail event in
+// App.tsx; "Calendar reminders" from the per-minute reminder check there.
+// Both read their setting from localStorage at trigger time, so toggling
+// here applies immediately without a restart.
 export function NotificationSettings({ accentColor }: NotificationSettingsProps) {
   const [permission, setPermission] = useState<PermissionState>("checking");
   const [notifyNewMail, setNotifyNewMail] = usePersistedState("helix:notifyNewMail", 0);
+  const [calendarReminders, setCalendarReminders] = usePersistedJSON<boolean>("helix:calendarReminders", true);
+  const [leadMinutes, setLeadMinutes] = usePersistedState("helix:reminderLeadMinutes", 10);
   const [testSent, setTestSent] = useState(false);
 
   async function refreshPermission() {
@@ -86,12 +88,64 @@ export function NotificationSettings({ accentColor }: NotificationSettingsProps)
         <View style={styles.settingInfo}>
           <Text style={styles.settingLabel}>Notify on new mail</Text>
           <Text style={styles.settingDescription}>
-            There's no background mail-checking yet (no IMAP IDLE, no polling) -- this won't fire automatically until
-            that exists, but the setting is saved for when it does.
+            Fires when the live IMAP connection (IDLE) reports new messages in a watched inbox.
           </Text>
         </View>
         <Switch value={notifyNewMail === 1} onChange={() => setNotifyNewMail(notifyNewMail === 1 ? 0 : 1)} color={accentColor} />
       </View>
+
+      <View style={styles.settingRow}>
+        <View style={styles.settingInfo}>
+          <Text style={styles.settingLabel}>Calendar event reminders</Text>
+          <Text style={styles.settingDescription}>
+            A desktop notification shortly before each synced calendar event starts.
+          </Text>
+        </View>
+        <Switch value={calendarReminders} onChange={() => setCalendarReminders(!calendarReminders)} color={accentColor} />
+      </View>
+
+      {calendarReminders && (
+        <View style={local.leadRow}>
+          <Text style={styles.settingDescription}>Remind me</Text>
+          {LEAD_OPTIONS.map((minutes) => {
+            const active = leadMinutes === minutes;
+            return (
+              <Pressable
+                key={minutes}
+                onPress={() => setLeadMinutes(minutes)}
+                style={[local.leadPill, active && { backgroundColor: accentColor, borderColor: accentColor }]}
+              >
+                <Text style={[local.leadPillText, active && { color: colors.background.base }]}>
+                  {minutes} min
+                </Text>
+              </Pressable>
+            );
+          })}
+          <Text style={styles.settingDescription}>before</Text>
+        </View>
+      )}
     </View>
   );
 }
+
+const local = StyleSheet.create({
+  leadRow: {
+    flexDirection: "row",
+    alignItems: "center",
+    flexWrap: "wrap",
+    gap: spacing.xs,
+    paddingVertical: spacing.sm,
+  },
+  leadPill: {
+    paddingVertical: 4,
+    paddingHorizontal: spacing.sm,
+    borderRadius: radii.pill,
+    borderWidth: 1,
+    borderColor: colors.border.subtle,
+  },
+  leadPillText: {
+    fontFamily: fontFamily.ui,
+    fontSize: 11,
+    color: colors.text.secondary,
+  },
+});

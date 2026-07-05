@@ -47,7 +47,7 @@ function actionForType(type: string): RuleAction {
 }
 
 // Real and working against the sample message store -- see
-// App.tsx's applyRules wiring and docs/technical/frontend-roadmap.md for
+// App.tsx's applyRules wiring and docs/technical/ for
 // exactly when this runs (folder/account changes, the message list's
 // Refresh button) and why it can't run on "new mail arriving" yet.
 export function RuleSettings({ accentColor, rules, onSaveRule, onDeleteRule }: RuleSettingsProps) {

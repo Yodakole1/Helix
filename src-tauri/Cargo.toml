@@ -40,6 +40,24 @@ rand = "0.8"
 dirs = "5"
 pgp = "0.19"
 base64 = "0.22"
+reqwest = { version = "0.12", default-features = false, features = ["native-tls", "blocking"] }
+sha1 = "0.10"
+openssl = { version = "0.10", features = ["vendored"] }
+openssl-sys = { version = "0.9", features = ["vendored"] }
+quick-xml = "0.37"
+# App-lock password hashing (memory-hard KDF; a plain hash would make the
+# lock password trivially brute-forceable if the cache leaked).
+argon2 = "0.5"
+# App-lock passkey support: raw FIDO2/CTAP2 over USB HID (WebAuthn isn't
+# reliably available inside the system webview). Optional because its
+# hidapi build needs libudev headers on Linux (libudev-dev) -- see
+# docs/technical/setup.md. Without the feature the passkey commands exist
+# but return a clear "not built with passkey support" error.
+ctap-hid-fido2 = { version = "3", optional = true }
+
+[features]
+default = []
+passkey = ["dep:ctap-hid-fido2"]
 
 [target.'cfg(target_os = "linux")'.dependencies]
 keyring = { version = "3", features = ["sync-secret-service"] }

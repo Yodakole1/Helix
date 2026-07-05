@@ -93,6 +93,17 @@ authentication subkey this codebase has no use for. The User ID is
   embedded in the key. Returns the fingerprint, since manually verifying
   a fingerprint out-of-band is the entire point of importing a key with
   no keyserver/WKD lookup behind it.
+- `list_own_keys()` / `list_contact_keys()` -- read-back listings so a
+  key-management UI can redisplay stored keys after a reload, not just
+  what was imported in the current session. `list_own_keys` returns the
+  *public* half only (`cache::StoredOwnKey` has no secret field); the
+  secret key never leaves `cache.rs` except inside the sign/decrypt
+  operations that need it. Both carry the stored timestamp
+  (`created_at`/`imported_at`).
+- `delete_own_key(account_id)` / `delete_contact_key(email)` -- forget a
+  stored key (to revoke or replace it). Deleting an absent key is a no-op
+  success, matching `delete_contact`. `delete_contact_key` lowercases the
+  email to match how `import_contact_key` stored it.
 
 `encrypt_and_sign`/`decrypt_and_verify`/`maybe_decrypt` are internal
 (`pub(crate)`, not commands) -- called from `smtp.rs`/`imap.rs`/`pop3.rs`,
@@ -124,7 +135,9 @@ command in its own right.
 
 - PGP/MIME, either direction (see Scope above).
 - Passphrase protection on the secret key (see above).
-- Keyserver lookup / WKD discovery -- keys are imported manually only.
+- Keyserver lookup -- HKP/SKS/OpenPGP.org are not supported.
+- WKD discovery is now supported via `discover_pgp_key_wkd(email)` (see
+  below); manual import via `import_contact_key` still works alongside it.
 - Trust models (web of trust, TOFU), key revocation, subkey management
   beyond what `generate_keypair`'s fixed shape produces.
 - Compose/fetch wiring -- `send_message`'s `encrypt` flag and
@@ -160,3 +173,42 @@ command in its own right.
   manually that no rows were left behind after a run. Uses the same
   GreenMail container as the existing SMTP/IMAP tests
   (`docs/technical/smtp.md`), no extra setup needed.
+
+## WKD key discovery
+
+`pgp::discover_pgp_key_wkd(email)` auto-fetches a contact's public key
+from their domain's Web Key Directory (WKD) so the user doesn't have to
+import it manually.
+
+**URL format (direct method):**
+
+```
+https://[domain]/.well-known/openpgpkey/hu/[hash]?l=[local]
+```
+
+`[hash]` is the first 10 bytes of the SHA-1 hash of the lowercased
+local-part of the address, z-base-32 encoded (32-character custom alphabet
+`ybndrfg8ejkmcpqxot1uwisza345h769` per the WKD spec). The response is a
+binary Transferable Public Key (not ASCII-armored).
+
+**Execution path:**
+
+1. Split the email on `@` to get `local` and `domain`.
+2. SHA-1 the lowercased local-part; take the first 10 bytes; z-base-32 encode.
+3. Fetch the URL via `reqwest::blocking::get` (synchronous, no Tokio runtime
+   needed in a `#[tauri::command]` fn).
+4. Parse the binary response as a `SignedPublicKey` via the `pgp` crate's
+   `from_bytes`.
+5. Re-armor the key via `to_armored_string` and store it with
+   `cache::upsert_contact_key` — the same path as `import_contact_key`.
+6. Return the fingerprint hex string so the caller can display which key was
+   found.
+
+**What it doesn't do:**
+
+- No advanced method (subdomain `openpgpkey.[domain]`) — most providers
+  use direct only, and adding the fallback is straightforward later.
+- No key validity / expiry check beyond what `from_bytes` enforces.
+- No cross-certification check or trust model beyond fingerprint storage.
+- The compose UI is still responsible for calling this at the right time
+  (e.g. when the user enables encryption for a recipient with no stored key).

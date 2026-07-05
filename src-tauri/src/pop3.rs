@@ -8,19 +8,13 @@ use crate::cache;
 use crate::credentials;
 use crate::imap::{self, AttachmentContent, MessageBody};
 use crate::pgp;
+use crate::smime;
 
 struct Pop3Session {
     stream: BufReader<TlsStream<TcpStream>>,
 }
 
-/// Reads one line off the wire as raw bytes, stripping the trailing
-/// `\r\n`/`\n`. Byte-oriented rather than `String`-based on purpose: a
-/// `RETR`/`TOP` response carries the contents of a real email, and
-/// nothing about POP3 itself guarantees that's valid UTF-8 -- the same
-/// reason `imap.rs`'s `BODY[]` fetch hands `mail_parser` raw bytes rather
-/// than assuming text. `+OK`/`-ERR` status lines and `LIST`/`UIDL` data
-/// are ASCII by protocol, so those callers can decode losslessly with a
-/// lossy UTF-8 conversion afterward.
+// Byte-oriented rather than String-based — RETR responses are email bytes, not guaranteed UTF-8.
 async fn read_raw_line(session: &mut Pop3Session) -> Result<Vec<u8>, String> {
     let mut buf = Vec::new();
     let bytes_read = session
@@ -50,11 +44,6 @@ async fn send_command(session: &mut Pop3Session, command: &str) -> Result<(), St
         .map_err(|e| format!("could not send command: {e}"))
 }
 
-/// Reads one `+OK ...`/`-ERR ...` status line, the response to every
-/// single-line POP3 command (and the first line of every multi-line
-/// one). `+OK` becomes the rest of the line as `Ok`; `-ERR` becomes the
-/// rest of the line as `Err` -- callers branch on the `Result` rather
-/// than inspecting status text themselves.
 async fn read_status_line(session: &mut Pop3Session) -> Result<String, String> {
     let line = String::from_utf8_lossy(&read_raw_line(session).await?).into_owned();
     if let Some(rest) = line.strip_prefix("+OK") {
@@ -66,10 +55,7 @@ async fn read_status_line(session: &mut Pop3Session) -> Result<String, String> {
     }
 }
 
-/// Undoes RFC 1939 §3 byte-stuffing: a data line that genuinely starts
-/// with `.` is sent with one extra leading `.` so it's never confused
-/// with the lone `.` line that terminates a multi-line response. Pure
-/// and synchronous so it has a plain unit test with no socket involved.
+// RFC 1939 §3 byte-stuffing: a real leading dot is doubled, un-double it here.
 fn unstuff_multiline_response(lines: Vec<Vec<u8>>) -> Vec<Vec<u8>> {
     lines
         .into_iter()
@@ -88,9 +74,6 @@ fn join_with_crlf(lines: Vec<Vec<u8>>) -> Vec<u8> {
     result
 }
 
-/// Reads a multi-line response (the body of `LIST`/`UIDL` with no
-/// argument) as text -- safe because those responses are ASCII by
-/// protocol.
 async fn read_multiline_lines(session: &mut Pop3Session) -> Result<Vec<String>, String> {
     let mut raw_lines = Vec::new();
     loop {
@@ -106,8 +89,6 @@ async fn read_multiline_lines(session: &mut Pop3Session) -> Result<Vec<String>, 
         .collect())
 }
 
-/// Reads a multi-line response (`RETR`/`TOP`) as raw bytes -- the actual
-/// content of a real email, handed to `mail_parser` unchanged.
 async fn read_multiline_raw(session: &mut Pop3Session) -> Result<Vec<u8>, String> {
     let mut raw_lines = Vec::new();
     loop {
@@ -120,11 +101,7 @@ async fn read_multiline_raw(session: &mut Pop3Session) -> Result<Vec<u8>, String
     Ok(join_with_crlf(unstuff_multiline_response(raw_lines)))
 }
 
-/// Connects over implicit TLS (POP3S) and logs in with plain `USER`/
-/// `PASS`. POP3S-only, no STARTTLS and no plaintext port-110 path --
-/// this codebase has no insecure-connection path anywhere else either
-/// (see `backend-backlog.md`), and implicit TLS is what both the real
-/// test mailbox and GreenMail's `pop3s` mode offer directly.
+// POP3S only — no STARTTLS path, no plaintext port 110.
 async fn connect_and_login(
     host: &str,
     port: u16,
@@ -148,8 +125,7 @@ async fn connect_and_login(
         stream: BufReader::new(tls_stream),
     };
 
-    // The server sends an unsolicited +OK greeting line as soon as the
-    // connection opens, before any command is sent.
+    // Server sends an unsolicited +OK greeting before any command.
     read_status_line(&mut session)
         .await
         .map_err(|e| format!("greeting failed: {e}"))?;
@@ -283,6 +259,29 @@ async fn list_summaries(session: &mut Pop3Session) -> Result<Vec<Pop3MessageSumm
     Ok(summaries)
 }
 
+/// Best-effort write-through of POP3 summaries to the local cache, so a
+/// POP3 inbox is readable offline like an IMAP one. Same log-and-continue
+/// posture as the IMAP/contact cache writes -- only summaries carrying a
+/// UIDL are stored (the cache's stable key), handled inside
+/// `cache::upsert_pop3_summaries`.
+fn cache_summaries(account_id: &str, summaries: &[Pop3MessageSummary]) {
+    let result = cache::open().and_then(|conn| cache::upsert_pop3_summaries(&conn, account_id, summaries));
+    if let Err(e) = result {
+        log::warn!("could not cache POP3 summaries for {account_id}: {e}");
+    }
+}
+
+/// Asks the server for one message's UIDL (`UIDL n`), the stable key the
+/// cache stores a body under. Optional in RFC 1939, so a `-ERR` or a
+/// malformed reply just yields `None` -- the body is still served, only its
+/// caching (which needs a durable key) is skipped.
+async fn fetch_uidl(session: &mut Pop3Session, number: u32) -> Option<String> {
+    send_command(session, &format!("UIDL {number}")).await.ok()?;
+    let line = read_status_line(session).await.ok()?;
+    // `+OK <number> <uidl>` -- read_status_line already stripped `+OK`.
+    parse_uidl_line(&line).map(|(_, uidl)| uidl)
+}
+
 #[tauri::command]
 pub async fn list_messages(
     account_id: String,
@@ -292,6 +291,10 @@ pub async fn list_messages(
     let mut session = login_with_stored_credential(&host, port, &account_id).await?;
     let result = list_summaries(&mut session).await;
     quit(&mut session).await;
+
+    if let Ok(summaries) = &result {
+        cache_summaries(&account_id, summaries);
+    }
     result
 }
 
@@ -325,15 +328,34 @@ fn cache_contacts(contacts: &[(String, Option<String>)]) {
     }
 }
 
+/// Best-effort write-through of one POP3 body to the local cache, keyed by
+/// its UIDL. Skipped (logged, never failing the fetch) when the server
+/// reports no UIDL -- there's no stable key to cache it under then.
+fn cache_body(account_id: &str, uidl: Option<&str>, body: &MessageBody) {
+    let Some(uidl) = uidl else { return };
+    let result = cache::open().and_then(|conn| cache::upsert_pop3_body(&conn, account_id, uidl, body));
+    if let Err(e) = result {
+        log::warn!("could not cache POP3 body for {account_id}/{uidl}: {e}");
+    }
+}
+
 #[tauri::command]
 pub async fn fetch_message(account_id: String, host: String, port: u16, number: u32) -> Result<MessageBody, String> {
     let mut session = login_with_stored_credential(&host, port, &account_id).await?;
-    let result = retrieve_message(&mut session, number).await;
+    let raw_result = retrieve_raw_message(&mut session, number).await;
+    let uidl = if raw_result.is_ok() {
+        fetch_uidl(&mut session, number).await
+    } else {
+        None
+    };
     quit(&mut session).await;
 
-    let (body, sender_email, contacts) = result?;
+    let raw = raw_result?;
+    let (body, sender_email, contacts) = imap::parse_message_body(&raw)?;
     cache_contacts(&contacts);
+    cache_body(&account_id, uidl.as_deref(), &body);
     let body = pgp::maybe_decrypt(&account_id, sender_email.as_deref(), body);
+    let body = smime::maybe_process_smime(&account_id, body, &raw);
 
     Ok(body)
 }
@@ -350,6 +372,35 @@ pub async fn fetch_message(account_id: String, host: String, port: u16, number: 
 /// `#[tauri::command]` macro registers commands by bare function name in a
 /// single crate-wide namespace, so this can't share a name with
 /// `imap::fetch_attachment` even though the two live in different modules.
+/// Best-effort write-through of one downloaded POP3 attachment to the local
+/// cache, keyed by UIDL. Skipped (logged, never failing the download) when
+/// the server reports no UIDL -- no stable key to cache it under then.
+fn cache_attachment(account_id: &str, uidl: Option<&str>, idx: usize, content: &AttachmentContent) {
+    let Some(uidl) = uidl else { return };
+    use base64::Engine;
+    let bytes = match base64::engine::general_purpose::STANDARD.decode(&content.content_base64) {
+        Ok(bytes) => bytes,
+        Err(e) => {
+            log::warn!("could not decode POP3 attachment for caching ({account_id}/{uidl}#{idx}): {e}");
+            return;
+        }
+    };
+    let result = cache::open().and_then(|conn| {
+        cache::upsert_pop3_attachment(
+            &conn,
+            account_id,
+            uidl,
+            idx,
+            content.filename.as_deref(),
+            content.content_type.as_deref(),
+            &bytes,
+        )
+    });
+    if let Err(e) = result {
+        log::warn!("could not cache POP3 attachment {account_id}/{uidl}#{idx}: {e}");
+    }
+}
+
 #[tauri::command]
 pub async fn pop3_fetch_attachment(
     account_id: String,
@@ -360,9 +411,18 @@ pub async fn pop3_fetch_attachment(
 ) -> Result<AttachmentContent, String> {
     let mut session = login_with_stored_credential(&host, port, &account_id).await?;
     let result = retrieve_raw_message(&mut session, number).await;
+    // Resolve the UIDL in the same session so the bytes can be cached under a
+    // stable key; no UIDL just means no caching, not a failure.
+    let uidl = if result.is_ok() {
+        fetch_uidl(&mut session, number).await
+    } else {
+        None
+    };
     quit(&mut session).await;
 
-    imap::extract_attachment(&result?, attachment_index)
+    let content = imap::extract_attachment(&result?, attachment_index)?;
+    cache_attachment(&account_id, uidl.as_deref(), attachment_index, &content);
+    Ok(content)
 }
 
 /// Deletes a message by number. Drives the session to a clean `QUIT`

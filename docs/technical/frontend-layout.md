@@ -265,7 +265,7 @@ The refresh button next to the sort control plays a loading-spinner
 animation (RN's `Animated`/`Easing`, looped while `refreshing` is true) for
 about a second and then stops -- there is no real fetch behind it.
 `fetch_messages`/`fetch_unified_inbox` already exist as real Tauri
-commands (see `backend-backlog.md`), but nothing in the frontend calls
+commands (see the per-feature docs in `docs/technical/`), but nothing in the frontend calls
 them yet, and wiring that up means first giving the frontend a concept of
 a real `account_id` (today's "active account" is just the `Accent` color
 key), which doesn't exist yet either. Treat this the same as the sample
@@ -318,7 +318,7 @@ Tooltip.tsx`) using each button's existing label.
 A second pass on the reading experience, still entirely against sample
 data (`src/data/messages.ts`) -- no real `fetch_message_body`/
 `send_message` call exists from the frontend yet, see
-`backend-backlog.md`.
+the per-feature docs in `docs/technical/`.
 
 **HTML rendering.** One sample message now has a real HTML body
 (`getHtmlBody`/`HTML_BODY_BY_ID`) instead of plain text. `ReaderPane`
@@ -359,7 +359,7 @@ from Reply); Forward leaves `to` empty and formats the original message
 as a labeled block (`---------- Forwarded message ---------` + headers)
 instead of quoting it with `> `. Neither does real header construction
 (`In-Reply-To`/`References`) or recipient resolution -- see
-`backend-backlog.md`'s Reply/Reply-All/Forward item.
+the per-feature docs in `docs/technical/`'s Reply/Reply-All/Forward item.
 
 **PGP key management.** `SettingsModal`'s Privacy & Security category now
 mounts `src/components/PgpKeySettings.tsx`, which is real: it calls
@@ -434,4 +434,37 @@ this doc as the final state of the frontend:
 - Swipe gestures on list rows
 - Loading skeletons and an offline/sync banner
 - Optimistic UI for archive/delete/move (blocked on backend mutation
-  commands, which don't exist yet -- see `backend-backlog.md`)
+  commands, which don't exist yet -- see the per-feature docs in `docs/technical/`)
+
+## Custom title bar and window chrome (added later)
+
+Native window decorations are off (`"decorations": false` in
+`tauri.conf.json`); `src/components/TitleBar.tsx` is the window chrome.
+One bar carries, left to right: the browser-style tab strip (moved here
+from the old `TabBar.tsx`, now deleted -- tabs use `flexBasis: 200` with
+`flexShrink: 1` and a `minWidth` floor so they shrink evenly like browser
+tabs instead of overflowing), a `data-tauri-drag-region` filler div (drag
+to move, double-click to maximize -- it must be a raw `div`, the
+attribute only applies to the element itself), the mail search box +
+filter-panel button + refresh button (moved out of `MessageList`'s
+header; the `MessageFilters` state lives in `App.tsx` now, edited by the
+title bar and applied by the list), and the min/max/toggle-maximize/close
+window controls (via `getCurrentWindow()`, permissions added in
+`src-tauri/capabilities/default.json`). The bar renders on the welcome
+screen too -- with decorations off it's the only way to move or close the
+window. Ctrl+Tab / Ctrl+Shift+Tab cycle tabs via a raw keydown listener
+(deliberately not `useKeyboardShortcuts`, which is inert while typing).
+The sort menu was reduced to Newest/Oldest, and the message list hides
+its scrollbar (`showsVerticalScrollIndicator={false}`) because the
+overlay bar painted exactly over each row's star button.
+
+## Message-list sections and text size (added later)
+
+Settings > General's "Separate unread from read" groups the list into an
+Unread section above a Read section (labels render only when both groups
+exist; skipped in conversation view where a thread mixes both). Settings
+> Appearance's text size is a whole-UI zoom (`document.body.style.zoom`,
+persisted as `helix:fontScale`) -- react-native-web styles are px-based,
+so rem-scaling can't reach them. Settings themselves are staged: the
+modal edits a local draft of `SettingsValues` and nothing applies until
+Save (stays open) or Done (closes); any other close discards the draft.

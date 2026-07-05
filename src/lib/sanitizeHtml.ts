@@ -43,6 +43,18 @@ export function sanitizeHtml(html: string, { blockRemoteImages }: SanitizeOption
         node.setAttribute("data-blocked-src", src);
       }
     }
+    // CSS can fetch remote content too -- `style="background:url(https://...)"`
+    // is a tracking pixel just as much as an <img src> is, and DOMPurify does
+    // not sanitize CSS inside the style attribute (which is on the allowlist).
+    // So when remote images are blocked, drop any style declaration carrying a
+    // non-data url(), closing that bypass. Element-level, not just IMG.
+    if (blockRemoteImages && node instanceof Element && node.hasAttribute("style")) {
+      const style = node.getAttribute("style") ?? "";
+      if (/url\(\s*['"]?(?!data:)/i.test(style)) {
+        const stripped = style.replace(/url\(\s*['"]?(?!data:)[^)]*\)/gi, "none");
+        node.setAttribute("style", stripped);
+      }
+    }
   });
 
   const clean = DOMPurify.sanitize(html, { ALLOWED_TAGS, ALLOWED_ATTR });

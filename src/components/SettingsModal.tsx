@@ -1,13 +1,18 @@
-import { useState } from "react";
+import { useEffect, useState } from "react";
 import { Pressable, ScrollView, StyleSheet, Text, TextInput, View } from "react-native";
 import { resolveAccountColor, resolveAccountLabel, type AccountOverrides, type MailAccount } from "../data/accounts";
 import type { HoverState } from "../lib/pressable";
 import type { AccountId } from "../theme";
-import { accentCycle, colors, fontFamily, fontSize, radii, spacing } from "../theme";
+import { accentCycle, colors, fontFamily, fontSize, radii, spacing, withAlpha } from "../theme";
 import type { Rule } from "../lib/rules";
+import { comboFromEvent, formatKeyCombo, isCompleteCombo, SHORTCUTS, type ShortcutId } from "../lib/shortcuts";
 import type { MessageTemplate } from "./ComposeModal";
+import CalDavSettings from "./CalDavSettings";
 import { ConnectedAccountsSettings } from "./ConnectedAccountsSettings";
-import { DataStorageSettings } from "./DataStorageSettings";
+import { ContactsSettings } from "./ContactsSettings";
+import { DataStorageSettings, type SyncDepth } from "./DataStorageSettings";
+import { SmimeSettings } from "./SmimeSettings";
+import { AppLockSettings } from "./AppLockSettings";
 import { ModalOverlay } from "./ModalOverlay";
 import { NotificationSettings } from "./NotificationSettings";
 import { PgpKeySettings } from "./PgpKeySettings";
@@ -17,6 +22,8 @@ import { Switch } from "./Switch";
 
 type Category =
   | "accounts"
+  | "contacts"
+  | "calendar"
   | "notifications"
   | "storage"
   | "shortcuts"
@@ -27,33 +34,49 @@ type Category =
   | "general"
   | "about";
 
+// General first, About pinned last, the rest roughly by how often they're
+// reached for.
 const CATEGORIES: { id: Category; label: string }[] = [
-  { id: "accounts", label: "Accounts" },
-  { id: "notifications", label: "Notifications" },
-  { id: "storage", label: "Data & Storage" },
-  { id: "shortcuts", label: "Shortcuts" },
-  { id: "templates", label: "Templates" },
-  { id: "rules", label: "Rules" },
-  { id: "appearance", label: "Appearance" },
-  { id: "privacy", label: "Privacy & Security" },
   { id: "general", label: "General" },
+  { id: "accounts", label: "Accounts" },
+  { id: "appearance", label: "Appearance" },
+  { id: "notifications", label: "Notifications" },
+  { id: "privacy", label: "Privacy & Security" },
+  { id: "contacts", label: "Contacts" },
+  { id: "calendar", label: "Calendar" },
+  { id: "storage", label: "Data & Storage" },
+  { id: "rules", label: "Rules" },
+  { id: "templates", label: "Templates" },
+  { id: "shortcuts", label: "Shortcuts" },
   { id: "about", label: "About" },
 ];
 
-const SHORTCUTS: { keys: string; description: string }[] = [
-  { keys: "C", description: "Compose a new message" },
-  { keys: "/", description: "Focus the search box" },
-  { keys: "R", description: "Reply to the open message" },
-  { keys: "A", description: "Reply all" },
-  { keys: "F", description: "Forward" },
-  { keys: "E", description: "Archive the open message" },
-  { keys: "Backspace / Delete", description: "Trash the open message" },
-  { keys: "Cmd/Ctrl + ,", description: "Open Settings" },
-  { keys: "Esc", description: "Close the open dialog" },
+const GITHUB_URL = "https://github.com/Yodakole1/Helix";
+const SUPPORT_URL = "https://buymeacoffee.com/yodakole1";
+
+// Text-size choices, applied as a whole-UI zoom factor (see App's fontScale).
+const FONT_SCALE_OPTIONS: { value: number; label: string }[] = [
+  { value: 0.9, label: "Small" },
+  { value: 1, label: "Default" },
+  { value: 1.1, label: "Large" },
+  { value: 1.25, label: "Larger" },
 ];
 
-const GITHUB_URL = "https://github.com/Yodakole1/Helix";
-const SPONSORS_URL = "https://github.com/sponsors/Yodakole1";
+// Every staged (Save/Done-applied) setting in one object. The modal edits a
+// local draft of this and nothing touches the app until Save or Done --
+// closing any other way discards the draft.
+export interface SettingsValues {
+  compactList: boolean;
+  unifiedInbox: boolean;
+  conversationView: boolean;
+  separateUnread: boolean;
+  blockImages: boolean;
+  readReceipts: boolean;
+  encryptByDefault: boolean;
+  signature: string;
+  syncDepth: SyncDepth;
+  fontScale: number;
+}
 
 interface SettingsModalProps {
   visible: boolean;
@@ -63,22 +86,18 @@ interface SettingsModalProps {
   accentColor: string;
   accountOverrides: AccountOverrides;
   onUpdateAccountOverride: (accountId: AccountId, patch: { label?: string; color?: string }) => void;
-  compactList: boolean;
-  onToggleCompactList: () => void;
-  signature: string;
-  onSignatureChange: (signature: string) => void;
-  encryptByDefault: boolean;
-  onToggleEncryptByDefault: () => void;
-  blockImages: boolean;
-  onToggleBlockImages: () => void;
-  unifiedInbox: boolean;
-  onToggleUnifiedInbox: () => void;
+  // Current applied settings; the modal stages edits locally until Save/Done.
+  values: SettingsValues;
+  onApply: (values: SettingsValues) => void;
   onAddAccount: () => void;
   templates: MessageTemplate[];
   onDeleteTemplate: (id: string) => void;
   rules: Rule[];
   onSaveRule: (rule: Rule) => void;
   onDeleteRule: (id: string) => void;
+  shortcutBindings: Record<ShortcutId, string>;
+  onRebindShortcut: (id: ShortcutId, combo: string) => void;
+  onResetShortcuts: () => void;
   onClose: () => void;
 }
 
@@ -89,28 +108,57 @@ export function SettingsModal({
   accentColor,
   accountOverrides,
   onUpdateAccountOverride,
-  compactList,
-  onToggleCompactList,
-  signature,
-  onSignatureChange,
-  encryptByDefault,
-  onToggleEncryptByDefault,
-  blockImages,
-  onToggleBlockImages,
-  unifiedInbox,
-  onToggleUnifiedInbox,
+  values,
+  onApply,
   onAddAccount,
   templates,
   onDeleteTemplate,
   rules,
   onSaveRule,
   onDeleteRule,
+  shortcutBindings,
+  onRebindShortcut,
+  onResetShortcuts,
   onClose,
 }: SettingsModalProps) {
-  const [category, setCategory] = useState<Category>("accounts");
-  const [readReceipts, setReadReceipts] = useState(false);
+  const [category, setCategory] = useState<Category>("general");
   const activeAccount = accounts.find((account) => account.id === accountId);
   const activeAccountLabel = activeAccount ? resolveAccountLabel(accountOverrides, activeAccount) : accountId;
+
+  // The staged draft. Re-seeded from the live values every time the modal
+  // opens, so a previously discarded draft never leaks into a new session.
+  const [draft, setDraft] = useState<SettingsValues>(values);
+  useEffect(() => {
+    if (visible) setDraft(values);
+  }, [visible]);
+
+  function patchDraft(patch: Partial<SettingsValues>) {
+    setDraft((current) => ({ ...current, ...patch }));
+  }
+
+  const dirty = JSON.stringify(draft) !== JSON.stringify(values);
+
+  // Shortcut rebinding: null when idle, otherwise the id currently waiting
+  // for the next keypress. Captured at the window level (rather than a
+  // focused input) so any key combo, including ones that aren't normally
+  // typeable, can be recorded directly.
+  const [recordingId, setRecordingId] = useState<ShortcutId | null>(null);
+  useEffect(() => {
+    if (!recordingId) return;
+    const target = recordingId;
+    function handleKeyDown(event: KeyboardEvent) {
+      event.preventDefault();
+      if (event.key === "Escape") {
+        setRecordingId(null);
+        return;
+      }
+      if (!isCompleteCombo(event)) return; // a bare modifier isn't a binding yet
+      onRebindShortcut(target, comboFromEvent(event));
+      setRecordingId(null);
+    }
+    window.addEventListener("keydown", handleKeyDown, true);
+    return () => window.removeEventListener("keydown", handleKeyDown, true);
+  }, [recordingId, onRebindShortcut]);
 
   return (
     <ModalOverlay visible={visible} accentColor={accentColor} title="Settings" fullScreen onClose={onClose}>
@@ -164,22 +212,53 @@ export function SettingsModal({
             </View>
           )}
 
+          {category === "contacts" && <ContactsSettings accentColor={accentColor} />}
+
+          {category === "calendar" && <CalDavSettings accentColor={accentColor} />}
+
           {category === "notifications" && <NotificationSettings accentColor={accentColor} />}
 
-          {category === "storage" && <DataStorageSettings accentColor={accentColor} />}
+          {category === "storage" && (
+            <DataStorageSettings
+              accentColor={accentColor}
+              syncDepth={draft.syncDepth}
+              onSyncDepthChange={(depth) => patchDraft({ syncDepth: depth })}
+            />
+          )}
 
           {category === "shortcuts" && (
             <View>
-              <Text style={settingsStyles.sectionTitle}>Keyboard shortcuts</Text>
+              <View style={styles.shortcutsHeader}>
+                <Text style={settingsStyles.sectionTitle}>Keyboard shortcuts</Text>
+                <Pressable onPress={onResetShortcuts}>
+                  <Text style={[styles.shortcutReset, { color: accentColor }]}>Reset to defaults</Text>
+                </Pressable>
+              </View>
               <Text style={settingsStyles.hint}>
-                Fixed for now, not yet rebindable. Inactive while typing in a text field or while a dialog is open.
+                Click a key combo to rebind it -- press any key (with modifiers if you like), or Esc to cancel.
+                Inactive while typing in a text field or while a dialog is open.
               </Text>
-              {SHORTCUTS.map((shortcut) => (
-                <View key={shortcut.keys} style={styles.shortcutRow}>
-                  <Text style={[styles.shortcutKeys, { borderColor: accentColor }]}>{shortcut.keys}</Text>
-                  <Text style={styles.shortcutDescription}>{shortcut.description}</Text>
-                </View>
-              ))}
+              {SHORTCUTS.map((shortcut) => {
+                const recording = recordingId === shortcut.id;
+                return (
+                  <View key={shortcut.id} style={styles.shortcutRow}>
+                    <Pressable
+                      onPress={() => setRecordingId(shortcut.id)}
+                      style={({ hovered }: HoverState) => [
+                        styles.shortcutKeys,
+                        { borderColor: accentColor },
+                        recording && { backgroundColor: withAlpha(accentColor, 0.14) },
+                        !recording && hovered && { backgroundColor: withAlpha(accentColor, 0.08) },
+                      ]}
+                    >
+                      <Text style={[styles.shortcutKeysText, recording && { color: accentColor }]}>
+                        {recording ? "Press a key…" : formatKeyCombo(shortcutBindings[shortcut.id])}
+                      </Text>
+                    </Pressable>
+                    <Text style={styles.shortcutDescription}>{shortcut.label}</Text>
+                  </View>
+                );
+              })}
             </View>
           )}
 
@@ -213,6 +292,25 @@ export function SettingsModal({
 
           {category === "appearance" && (
             <View>
+              <Text style={styles.sectionTitle}>Text size</Text>
+              <View style={styles.fontScaleRow}>
+                {FONT_SCALE_OPTIONS.map((option) => {
+                  const active = draft.fontScale === option.value;
+                  return (
+                    <Pressable
+                      key={option.value}
+                      onPress={() => patchDraft({ fontScale: option.value })}
+                      style={[styles.fontScalePill, active && { backgroundColor: accentColor, borderColor: accentColor }]}
+                    >
+                      <Text style={[styles.fontScalePillText, active && { color: colors.background.base }]}>
+                        {option.label}
+                      </Text>
+                    </Pressable>
+                  );
+                })}
+              </View>
+              <Text style={styles.hint}>Scales all text and controls. Applies when you hit Save.</Text>
+
               <Text style={styles.sectionTitle}>Typography</Text>
               <Text style={[styles.sample, { fontFamily: fontFamily.display }]}>Space Grotesk -- headers</Text>
               <Text style={[styles.sample, { fontFamily: fontFamily.ui }]}>Inter -- body and UI text</Text>
@@ -242,27 +340,35 @@ export function SettingsModal({
               <SettingRow
                 label="Block remote images"
                 description="Stops senders from using tracking pixels in messages."
-                value={blockImages}
-                onChange={onToggleBlockImages}
+                value={draft.blockImages}
+                onChange={() => patchDraft({ blockImages: !draft.blockImages })}
                 color={accentColor}
               />
               <SettingRow
                 label="Send read receipts"
                 description="Off by default -- Helix never confirms you've read a message without asking."
-                value={readReceipts}
-                onChange={() => setReadReceipts((value) => !value)}
+                value={draft.readReceipts}
+                onChange={() => patchDraft({ readReceipts: !draft.readReceipts })}
                 color={accentColor}
               />
               <SettingRow
                 label="Encrypt new messages by default"
-                description="Sets the starting state of the Encrypt toggle in compose. End-to-end encryption itself isn't implemented yet -- see docs/technical/encryption.md."
-                value={encryptByDefault}
-                onChange={onToggleEncryptByDefault}
+                description="Sets the starting state of the Encrypt toggle in compose. Sending encrypted requires a PGP key for every recipient -- compose checks for one automatically (WKD) and warns when it can't find one."
+                value={draft.encryptByDefault}
+                onChange={() => patchDraft({ encryptByDefault: !draft.encryptByDefault })}
                 color={accentColor}
               />
               <Text style={styles.hint}>Account credentials are stored in your OS keychain, not in app storage.</Text>
 
+              <AppLockSettings accentColor={accentColor} />
+
               <PgpKeySettings
+                accountId={accountId}
+                accountLabel={activeAccountLabel}
+                accentColor={accentColor}
+              />
+
+              <SmimeSettings
                 accountId={accountId}
                 accountLabel={activeAccountLabel}
                 accentColor={accentColor}
@@ -275,23 +381,37 @@ export function SettingsModal({
               <SettingRow
                 label="Compact message list"
                 description="Tighter rows and smaller avatars in the inbox."
-                value={compactList}
-                onChange={onToggleCompactList}
+                value={draft.compactList}
+                onChange={() => patchDraft({ compactList: !draft.compactList })}
                 color={accentColor}
               />
               <SettingRow
                 label="Unified inbox"
                 description="Show every account's mail in one list instead of switching silos."
-                value={unifiedInbox}
-                onChange={onToggleUnifiedInbox}
+                value={draft.unifiedInbox}
+                onChange={() => patchDraft({ unifiedInbox: !draft.unifiedInbox })}
+                color={accentColor}
+              />
+              <SettingRow
+                label="Conversation view"
+                description="Group a folder's messages into threads, showing one row per conversation with its replies expandable. Off in the unified inbox."
+                value={draft.conversationView}
+                onChange={() => patchDraft({ conversationView: !draft.conversationView })}
+                color={accentColor}
+              />
+              <SettingRow
+                label="Separate unread from read"
+                description="Splits the message list into an Unread section on top and a Read section under it."
+                value={draft.separateUnread}
+                onChange={() => patchDraft({ separateUnread: !draft.separateUnread })}
                 color={accentColor}
               />
 
               <Text style={styles.sectionTitle}>Signature</Text>
               <TextInput
                 style={styles.signatureInput}
-                value={signature}
-                onChangeText={onSignatureChange}
+                value={draft.signature}
+                onChangeText={(text) => patchDraft({ signature: text })}
                 placeholder="Sent from Helix"
                 placeholderTextColor={colors.text.muted}
                 multiline
@@ -323,10 +443,10 @@ export function SettingsModal({
               <Text style={styles.sectionTitle}>Support Helix</Text>
               <Text style={styles.aboutText}>
                 Helix is built and maintained as an open-source project. If it's useful to you, consider
-                supporting its development.
+                buying the developer a coffee.
               </Text>
-              <a href={SPONSORS_URL} target="_blank" rel="noopener noreferrer" style={{ textDecoration: "none" }}>
-                <Text style={[styles.sponsorButton, { backgroundColor: accentColor }]}>Sponsor on GitHub</Text>
+              <a href={SUPPORT_URL} target="_blank" rel="noopener noreferrer" style={{ textDecoration: "none" }}>
+                <Text style={[styles.sponsorButton, { backgroundColor: accentColor }]}>Buy me a coffee</Text>
               </a>
             </View>
           )}
@@ -334,8 +454,24 @@ export function SettingsModal({
       </View>
 
       <View style={styles.footer}>
-        <Pressable onPress={onClose} style={[styles.saveButton, { backgroundColor: accentColor, shadowColor: accentColor }]}>
-          <Text style={styles.saveButtonText}>Save</Text>
+        {/* Nothing applies until one of these: Save applies and keeps the
+            dialog open, Done applies and closes. Closing any other way
+            (Esc, the X) discards the draft. */}
+        {dirty && <Text style={styles.unsavedHint}>Unsaved changes</Text>}
+        <Pressable
+          onPress={() => onApply(draft)}
+          style={[styles.saveButton, styles.saveButtonSecondary, dirty && { borderColor: accentColor }]}
+        >
+          <Text style={[styles.saveButtonSecondaryText, dirty && { color: accentColor }]}>Save</Text>
+        </Pressable>
+        <Pressable
+          onPress={() => {
+            onApply(draft);
+            onClose();
+          }}
+          style={[styles.saveButton, { backgroundColor: accentColor, shadowColor: accentColor }]}
+        >
+          <Text style={styles.saveButtonText}>Done</Text>
         </Pressable>
       </View>
     </ModalOverlay>
@@ -368,6 +504,16 @@ const styles = StyleSheet.create({
     flexDirection: "row",
     minHeight: 0,
   },
+  shortcutsHeader: {
+    flexDirection: "row",
+    alignItems: "center",
+    justifyContent: "space-between",
+  },
+  shortcutReset: {
+    fontFamily: fontFamily.ui,
+    fontSize: fontSize.xs,
+    fontWeight: "600",
+  },
   shortcutRow: {
     flexDirection: "row",
     alignItems: "center",
@@ -377,14 +523,18 @@ const styles = StyleSheet.create({
   },
   shortcutKeys: {
     width: 140,
-    fontFamily: fontFamily.mono,
-    fontSize: fontSize.xs,
-    color: colors.text.primary,
+    alignItems: "center",
+    justifyContent: "center",
     borderWidth: 1,
     borderRadius: radii.sm,
     paddingVertical: 4,
     paddingHorizontal: spacing.sm,
     marginRight: spacing.md,
+  },
+  shortcutKeysText: {
+    fontFamily: fontFamily.mono,
+    fontSize: fontSize.xs,
+    color: colors.text.primary,
     textAlign: "center",
   },
   shortcutDescription: {
@@ -425,11 +575,19 @@ const styles = StyleSheet.create({
   },
   footer: {
     flexDirection: "row",
+    alignItems: "center",
     justifyContent: "flex-end",
+    gap: spacing.sm,
     marginTop: spacing.lg,
     paddingTop: spacing.lg,
     borderTopWidth: 1,
     borderTopColor: colors.border.subtle,
+  },
+  unsavedHint: {
+    fontFamily: fontFamily.ui,
+    fontSize: fontSize.xs,
+    color: colors.text.muted,
+    marginRight: spacing.sm,
   },
   saveButton: {
     paddingVertical: spacing.sm,
@@ -439,11 +597,40 @@ const styles = StyleSheet.create({
     shadowRadius: 10,
     shadowOffset: { width: 0, height: 0 },
   },
+  saveButtonSecondary: {
+    borderWidth: 1,
+    borderColor: colors.border.subtle,
+    shadowOpacity: 0,
+  },
+  saveButtonSecondaryText: {
+    fontFamily: fontFamily.ui,
+    fontSize: fontSize.sm,
+    fontWeight: "700",
+    color: colors.text.secondary,
+  },
   saveButtonText: {
     fontFamily: fontFamily.ui,
     fontSize: fontSize.sm,
     fontWeight: "700",
     color: colors.background.base,
+  },
+  fontScaleRow: {
+    flexDirection: "row",
+    flexWrap: "wrap",
+  },
+  fontScalePill: {
+    paddingVertical: 5,
+    paddingHorizontal: spacing.md,
+    borderRadius: radii.pill,
+    borderWidth: 1,
+    borderColor: colors.border.subtle,
+    marginRight: spacing.xs,
+    marginBottom: spacing.xs,
+  },
+  fontScalePillText: {
+    fontFamily: fontFamily.ui,
+    fontSize: fontSize.xs,
+    color: colors.text.secondary,
   },
   nav: {
     width: 160,

@@ -1,6 +1,6 @@
 # IMAP connection core
 
-`src-tauri/src/imap.rs` exposes four Tauri commands:
+`src-tauri/src/imap.rs` exposes these Tauri commands:
 
 - `list_folders(account_id, host, port)` — connects, authenticates, lists
   the account's folders
@@ -14,6 +14,15 @@
   — connects, authenticates, and returns one specific attachment's actual
   content (base64-encoded), by its `index` in `fetch_message_body`'s
   `attachments` list. See "Attachment content" below.
+- `fetch_message_source(account_id, host, port, folder, uid)` — returns
+  the raw RFC 822 bytes base64-encoded (EXAMINE path, no `\Seen` side
+  effect), for displaying the raw message source in-app.
+- `export_message_eml(account_id, host, port, folder, uid, path)` — same
+  raw RFC 822 bytes written to a caller-supplied absolute file path via
+  `std::fs::write`. The caller is responsible for determining the path
+  (e.g., from a native save-file dialog). EML format is literally the raw
+  RFC 822 bytes with no extra framing, so both commands share
+  `fetch_raw_message_by_uid`.
 
 These are the first slices of real protocol work — proof that we can
 actually talk to a mail server, before building anything more elaborate

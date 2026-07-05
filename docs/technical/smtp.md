@@ -1,11 +1,27 @@
 # SMTP sending
 
 `src-tauri/src/smtp.rs` exposes `send_message(account_id, host, port,
-use_starttls, to, subject, body, html, attachments, in_reply_to,
+use_starttls, to, cc, bcc, subject, body, html, attachments, in_reply_to,
 references, encrypt)`. Same conventions as the IMAP layer:
 
 - `account_id` doubles as both the SMTP login username and the message's
   From address
+- `to`/`cc`/`bcc` are each a comma-separated address list (`"a@x, Name
+  <b@y>"`), parsed via `parse_address_list`, which reuses lettre's own
+  `Mailboxes` parser so display names and quoting are handled consistently.
+  An empty/whitespace string means "none" (Cc/Bcc are optional; To must
+  have at least one address). Each parsed mailbox is added with the
+  builder's `.to()`/`.cc()`/`.bcc()`, which *append* (lettre's `mailbox()`
+  joins rather than replaces), so multiple recipients land in one header
+  each rather than the last-write-wins single-mailbox behaviour the old
+  single `to.parse::<Mailbox>()` had. Bcc recipients still receive the
+  message — lettre uses the Bcc header to build the SMTP envelope — but it's
+  stripped from the visible headers by default, which is the privacy point
+  of Bcc. Every recipient across all three fields is harvested into the
+  contact cache (sending to someone is a real correspondence signal). PGP
+  `encrypt` is single-recipient inline-armored only, so combining it with
+  Cc/Bcc or more than one To address is a clean upfront error, the same
+  posture as the html/attachments guard below.
 - Password is resolved from the OS keychain via `credentials::get_credential`,
   never passed in from the frontend
 - `use_starttls` picks between lettre's two TLS strategies: `false` for
@@ -189,3 +205,45 @@ below would be the natural way to cover it.
   finding above) — that attempt correctly failed at the TLS layer due to
   that host's own certificate mismatch, which is itself a useful
   confirmation that certificate validation is actually being enforced.
+
+## Saving sent mail to the Sent folder
+
+After a successful SMTP delivery, `send_message` best-effort APPENDs the
+same RFC 822 bytes it just sent to the account's configured IMAP Sent
+folder. The mechanism:
+
+1. `lettre::Message::formatted(&self) -> Vec<u8>` is called on the built
+   message *before* handing it to the transport. `formatted()` borrows
+   `self`, so the move into `mailer.send()` happens after we already have
+   the raw bytes. BCC recipients are part of the SMTP envelope but RFC 5322
+   requires them stripped from the message headers — lettre does this
+   automatically, so the stored copy is correct and no BCC address leaks
+   into the Sent folder copy.
+2. `append_to_sent(account_id, &raw_bytes)` opens an IMAP session via
+   `imap::login_for_account` (same session pattern as drafts), APPENDs
+   with the `\Seen` flag (so the Sent copy doesn't show as unread), then
+   logs out.
+3. For POP3 accounts (`imap_host` is empty), the APPEND is skipped — there
+   is no IMAP server to save to.
+4. Any error in the APPEND is logged at `warn` level and discarded — a
+   Sent-folder write failure never surfaces to the caller or the user.
+
+`sent_folder` is now a field on `AccountRecord` (default `"Sent"`) and an
+optional `sent_folder` parameter on `add_account`. The additive migration
+`ALTER TABLE accounts ADD COLUMN sent_folder TEXT NOT NULL DEFAULT 'Sent'`
+updates existing databases. `update_account` preserves the existing
+`sent_folder` the same way it already preserved `archive_folder`,
+`trash_folder`, `drafts_folder`, and `spam_folder`.
+
+## Sent-folder self-heal in append_to_sent (added later)
+
+`append_to_sent` used to APPEND to whatever `sent_folder` the account
+record held and log the failure -- which, for records created with the
+old hardcoded "Sent" default on a nested-layout server (`INBOX.Sent`),
+meant every sent message silently never reached the Sent folder. On an
+APPEND failure it now LISTs folders in the same session, resolves the
+real sent folder via `imap::resolve_equivalent_folder`, retries the
+APPEND there, and persists the corrected name to the account record
+(`imap::persist_folder_correction`) so the next send goes straight to the
+right place. Still best-effort overall: a Sent-folder failure never
+blocks the send itself.
