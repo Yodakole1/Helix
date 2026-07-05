@@ -196,7 +196,10 @@ way discards the changes.
 - **Templates**: manage saved compose templates.
 - **Shortcuts**: every shortcut, each rebindable -- click a combo and
   press the new keys.
-- **About**: project info, source link, and a way to support development.
+- **About**: project info, source link, a way to support development, and
+  **Check for updates** -- updates download from the official release feed
+  and are cryptographically verified before installing, and Helix only
+  checks when you press the button (it never phones home on its own).
 
 ## Keyboard shortcuts (defaults)
 

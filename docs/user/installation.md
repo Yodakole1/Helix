@@ -19,6 +19,12 @@ yet. For the first public release the plan is:
 - **Windows**: an `.msi` installer.
 - **macOS**: a `.dmg`.
 
+Once installed, Helix keeps itself current: Settings > About > "Check
+for updates" downloads new versions from the official release feed and
+verifies their signature before installing (on Debian/Ubuntu the apt
+repository handles this through the system instead). Helix only checks
+when you ask -- there's no automatic phone-home.
+
 Everything below works today.
 
 ## Building from source

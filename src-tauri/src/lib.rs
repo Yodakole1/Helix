@@ -22,8 +22,14 @@ mod snooze;
 pub fn run() {
   tauri::Builder::default()
     .plugin(tauri_plugin_notification::init())
+    .plugin(tauri_plugin_process::init())
     .manage(idle::IdleRegistry::new())
     .setup(|app| {
+      // Desktop-only: the updater has no mobile story (mobile updates go
+      // through the app stores), and registering it in setup() keeps the
+      // mobile entry point compiling once that target exists.
+      #[cfg(desktop)]
+      app.handle().plugin(tauri_plugin_updater::Builder::new().build())?;
       if cfg!(debug_assertions) {
         app.handle().plugin(
           tauri_plugin_log::Builder::default()

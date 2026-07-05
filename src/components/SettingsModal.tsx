@@ -17,6 +17,7 @@ import { ModalOverlay } from "./ModalOverlay";
 import { NotificationSettings } from "./NotificationSettings";
 import { PgpKeySettings } from "./PgpKeySettings";
 import { RuleSettings } from "./RuleSettings";
+import { UpdateSettings } from "./UpdateSettings";
 import { settingsStyles } from "./settingsStyles";
 import { Switch } from "./Switch";
 
@@ -448,6 +449,13 @@ export function SettingsModal({
               <a href={SUPPORT_URL} target="_blank" rel="noopener noreferrer" style={{ textDecoration: "none" }}>
                 <Text style={[styles.sponsorButton, { backgroundColor: accentColor }]}>Buy me a coffee</Text>
               </a>
+
+              <Text style={styles.sectionTitle}>Updates</Text>
+              <Text style={styles.aboutText}>
+                Updates are downloaded from the official release feed and cryptographically verified before they
+                install -- a tampered package is rejected. Helix only checks when you ask it to.
+              </Text>
+              <UpdateSettings accentColor={accentColor} />
             </View>
           )}
         </ScrollView>

@@ -59,6 +59,19 @@ names the file that enforces it.
   receipts-by-default, tracking pixels, or link tracking on outgoing
   mail. Feature requests for "know when the recipient opened it" are
   declined as incompatible with the above.
+- **Updates are signed, and checked only on request.** The update channel
+  (`tauri-plugin-updater`, see `updater.md`) verifies every downloaded
+  package against the minisign public key baked into the binary before
+  installing -- the signature, not the TLS connection to GitHub, is the
+  trust anchor, so a compromised release host can't push code. The
+  private key lives outside the repository. Update checks are manual
+  (Settings > About), consistent with the no-phone-home posture.
+- **OAuth sign-in never sees the provider password.** Gmail/Microsoft 365
+  accounts authenticate via OAuth2 in the *system browser* (`oauth.rs`,
+  see `oauth.md`); Helix receives only scoped tokens. The refresh token
+  is keychain-stored like a password would be, the authorization flow
+  uses PKCE + a state check on a loopback listener that accepts exactly
+  one request, and access tokens are held in memory only.
 
 ## Review history
 

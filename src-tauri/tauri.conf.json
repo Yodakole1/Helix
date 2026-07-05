@@ -27,9 +27,18 @@
       "csp": "default-src 'self'; script-src 'self'; style-src 'self' 'unsafe-inline'; img-src 'self' data: blob: asset:; connect-src 'self' ipc: tauri: https://ipc.localhost http://localhost:*; font-src 'self' data:"
     }
   },
+  "plugins": {
+    "updater": {
+      "pubkey": "dW50cnVzdGVkIGNvbW1lbnQ6IG1pbmlzaWduIHB1YmxpYyBrZXk6IDYzMEQ1Mjk5MUFDRkM0MEMKUldRTXhNOGFtVklOWTZZbkpXWTB4cm8vNzFyR1Z1K1FjSVJ0ZkFySkpDMm9QU0RuZk9SZXVUQ3QK",
+      "endpoints": [
+        "https://github.com/Yodakole1/Helix/releases/latest/download/latest.json"
+      ]
+    }
+  },
   "bundle": {
     "active": true,
     "targets": "all",
+    "createUpdaterArtifacts": true,
     "license": "GPL-3.0-only",
     "licenseFile": "../LICENSE",
     "icon": [
