@@ -63,11 +63,20 @@ async fn connect_and_login(
     password: &str,
     use_starttls: bool,
 ) -> Result<ImapSession, String> {
-    let client = connect_tls(host, port, use_starttls).await?;
+    let client = match connect_tls(host, port, use_starttls).await {
+        Ok(client) => client,
+        Err(e) => {
+            crate::debug_log::record("imap", format!("connect to {host}:{port} failed: {e}"));
+            return Err(e);
+        }
+    };
     client
         .login(email, password)
         .await
-        .map_err(|(e, _client)| format!("login failed: {e}"))
+        .map_err(|(e, _client)| {
+            crate::debug_log::record("imap", format!("login to {host}:{port} as {email} failed: {e}"));
+            format!("login failed: {e}")
+        })
 }
 
 /// SASL XOAUTH2 (Gmail / Microsoft 365). The authenticator sends the
@@ -109,7 +118,10 @@ async fn connect_and_authenticate_xoauth2(
     client
         .authenticate("XOAUTH2", authenticator)
         .await
-        .map_err(|(e, _client)| format!("OAuth login failed: {e}"))
+        .map_err(|(e, _client)| {
+            crate::debug_log::record("imap", format!("OAuth login to {host}:{port} as {email} failed: {e}"));
+            format!("OAuth login failed: {e}")
+        })
 }
 
 // Secret is zeroized immediately after the login attempt, success or failure.
@@ -1051,6 +1063,11 @@ pub async fn fetch_message_body(
     let (body, sender_email, contacts) = parse_message_body(&raw)?;
     cache_body(&account_id, &folder, uid, &body);
     cache_contacts(&contacts);
+    // Opportunistic Autocrypt key harvesting first, so a message that both
+    // introduces a sender's key and is encrypted/signed can verify against
+    // the key it just delivered.
+    pgp::harvest_autocrypt(sender_email.as_deref(), &raw);
+    let body = pgp::maybe_decrypt_mime(&account_id, sender_email.as_deref(), body, &raw);
     let body = pgp::maybe_decrypt(&account_id, sender_email.as_deref(), body);
     let body = smime::maybe_process_smime(&account_id, body, &raw);
 
@@ -1070,7 +1087,12 @@ pub async fn fetch_attachment(
     let result = fetch_raw_message_by_uid(&mut session, &folder, uid).await;
     session.logout().await.ok();
 
-    let content = extract_attachment(&result?, attachment_index)?;
+    // For a PGP/MIME message the indexes the frontend holds refer to the
+    // *decrypted* content (that's what fetch_message_body listed), so
+    // resolve them against the same view.
+    let raw = result?;
+    let raw = pgp::maybe_decrypt_raw(&account_id, &raw).unwrap_or(raw);
+    let content = extract_attachment(&raw, attachment_index)?;
     cache_attachment(&account_id, &folder, uid, attachment_index, &content);
     Ok(content)
 }

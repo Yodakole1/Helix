@@ -1,0 +1,56 @@
+# Helix bulk account import -- example file
+#
+# Copy this file, fill in your accounts, then in Helix open
+# "Add account" and press "Import accounts from a file...".
+#
+# One account per block. Blocks are separated by a blank line (or a
+# "---" divider line). Each setting is one "key: value" line; lines
+# starting with # or ; are comments. There is no limit on how many
+# accounts a file can hold.
+#
+# Helix verifies every account against the real server before saving
+# it, stores each password in your OS keychain, and then DELETES this
+# file -- it contains plaintext passwords and must not stay on disk.
+# Keep this blank example around as a template, but never share or
+# commit a filled-in copy.
+#
+# The only required keys are email_address and password. If you set no
+# host keys at all, Helix auto-discovers the servers from the address
+# (this works for Gmail and for providers that publish RFC 6186 SRV
+# records). If you name any server yourself, name both the incoming
+# server (imap_host or pop3_host) and smtp_host.
+#
+# Default ports when you leave them out: IMAP 993 (143 with STARTTLS),
+# POP3 995, SMTP 465 (587 with STARTTLS). All connections use TLS --
+# Helix has no plaintext mode.
+
+# -- An IMAP account with everything spelled out ------------------------
+
+email_address: you@example.com
+password: your-password-or-app-password
+display_name: Work
+imap_host: mail.example.com
+imap_port: 993
+imap_starttls: off
+smtp_host: mail.example.com
+smtp_port: 465
+smtp_starttls: off
+# Also connect the provider's calendar (CalDAV) and address book
+# (CardDAV) using the same credentials:
+caldav_state: on
+carddav_state: on
+
+# -- The minimal form: let Helix discover the servers -------------------
+
+email_address: second@example.org
+password: another-password
+
+# -- A POP3 account ------------------------------------------------------
+
+email_address: third@example.net
+password: third-password
+pop3_host: pop.example.net
+pop3_port: 995
+smtp_host: smtp.example.net
+smtp_port: 587
+smtp_starttls: on

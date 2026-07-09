@@ -1,10 +1,9 @@
 use base64::Engine;
 use lettre::message::header::ContentType;
-use lettre::transport::smtp::authentication::Credentials;
 use lettre::{AsyncSmtpTransport, AsyncTransport, Message, Tokio1Executor};
 use serde::Serialize;
 
-use crate::credentials;
+use crate::smtp;
 
 /// Fields extracted from a `text/calendar` MIME part. Missing fields come
 /// back as `None` — real-world ICS files vary a lot. `method` is from
@@ -89,7 +88,7 @@ fn parse_ics_text(ics: &str) -> InviteInfo {
 /// rendering a meeting-invite card. Best-effort — missing fields come back as
 /// `None`, not errors.
 #[tauri::command]
-pub fn parse_ics_invite(data_base64: String) -> Result<InviteInfo, String> {
+pub async fn parse_ics_invite(data_base64: String) -> Result<InviteInfo, String> {
     let bytes = base64::engine::general_purpose::STANDARD
         .decode(&data_base64)
         .map_err(|e| format!("invalid base64 ICS data: {e}"))?;
@@ -158,7 +157,11 @@ pub async fn respond_to_invite(
     response: String,
 ) -> Result<(), String> {
     let partstat = partstat_str(&response)?;
-    let password = credentials::get_credential(account_id.clone())?;
+    // Resolved through smtp.rs's shared helper so OAuth accounts get a
+    // fresh access token + pinned XOAUTH2 rather than having their stored
+    // credential blob sent as a PLAIN password (which both fails and
+    // transmits the refresh token as if it were a password).
+    let (creds, auth_mechanisms) = smtp::transport_credentials(&account_id).await?;
 
     let ics_body = build_vcalendar_reply(
         &organizer_email,
@@ -207,7 +210,8 @@ pub async fn respond_to_invite(
 
     let mailer: AsyncSmtpTransport<Tokio1Executor> = builder
         .port(smtp_port)
-        .credentials(Credentials::new(account_id, password))
+        .credentials(creds)
+        .authentication(auth_mechanisms)
         .build();
 
     mailer

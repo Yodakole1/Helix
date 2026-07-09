@@ -131,6 +131,32 @@ an account in the sidebar -- see below); `resolveAccountColor`/
 override-vs-default, so `Sidebar`/`SettingsModal`/`MessageList`/`App.tsx`
 can't drift out of sync on what "this account's color" means.
 
+### Sender/contact avatar colors
+
+`colorForLetter(letter)` (`src/theme/colors.ts`) is the separate rotation
+used for the inbox's and address book's letter-circle avatars
+(`MessageList.tsx`, `AddressBookView.tsx`) -- every starting letter A-Z gets
+its own distinct hue, evenly swept around the color wheel
+(`avatarPaletteForStyle`, 26 colors generated via HSL rather than hand-picked
+hex, so no two letters collide), instead of a handful of colors
+hash-repeating across an alphabet's worth of senders like an earlier version
+of this did. Both call sites compute the displayed initial once and pass
+that *same* character into `colorForLetter`, rather than deriving the color
+from some other identifier (an email, a display name) -- otherwise the
+circle's color and its visible letter could disagree.
+
+`accentCycle`'s full-saturation hues are meant to pop as one-off highlights
+(an account, a folder); a whole inbox of neighboring rows all that loud
+reads as glaring, so avatar saturation/lightness are tunable instead of
+fixed at `accentCycle`'s level via `AvatarColorStyle` (`"muted" |
+"balanced" | "vivid"`, default `"balanced"`) -- Settings > Appearance >
+Avatar colors offers all three plus a live preview of the resulting
+alphabet strip. Persisted under the `helix:avatarColorStyle` localStorage
+key and read once at module load into the palette, the same "baked in,
+changing it reloads the window" pattern `theme` itself uses
+(`AVATAR_COLOR_STYLE_STORAGE_KEY` handling in `App.tsx`'s `SettingsModal`
+`onApply`).
+
 ### Sidebar account context menu
 
 Right-clicking an account row (`Sidebar.tsx`) opens a small menu --
@@ -468,3 +494,57 @@ persisted as `helix:fontScale`) -- react-native-web styles are px-based,
 so rem-scaling can't reach them. Settings themselves are staged: the
 modal edits a local draft of `SettingsValues` and nothing applies until
 Save (stays open) or Done (closes); any other close discards the draft.
+
+## Theming: dark and light (added 2026-07-06)
+
+`src/theme/colors.ts` now holds two palettes behind one `Palette` shape.
+The active one is chosen **at module load** from
+`localStorage["helix:theme"]` -- the palette is baked into module-level
+`StyleSheet.create()` calls all over the codebase, so a live swap isn't
+possible; switching theme in Settings > Appearance writes the key and
+reloads the window (all other staged settings are persisted by their own
+setters before the reload fires). An inline script in `index.html` stamps
+`data-theme` on `<html>` from the same key before the bundle loads, which
+drives the CSS-only pieces (native widget `color-scheme`, `::selection`,
+scrollbars, the rich-text placeholder). Components that hard-code a
+dark-only value branch on the exported `isLightTheme` (title bar
+background, the reader's paper surface, native date/time pickers'
+`colorScheme`).
+
+The light palette is deliberately dimmer than a typical light theme --
+muted warm grays (`#D6D9DE` base) rather than bright white, after
+feedback that a first, whiter cut glared. The reading surface in light
+mode is a soft paper tone (`#F0EFEA`) instead of the pure white kept for
+dark mode.
+
+Appearance also gained a real accent picker: `EXTENDED_PALETTE` (30
+swatches spanning the original accents plus deliberately muted rows) and
+a native `<input type="color">` for anything custom. Both set the same
+per-account color override the sidebar's right-click menu sets --
+applied immediately, not staged. Settings text sizes were bumped one
+step across `settingsStyles.ts`/`SettingsModal.tsx` (labels 15px,
+descriptions 12.5px) independent of the whole-UI zoom.
+
+## Status toasts and attachment downloads (added 2026-07-06)
+
+`StatusToast.tsx` is the generic bottom-center confirmation pill (same
+placement/look as the undo-send toast). Its first user: attachment
+downloads. In the desktop app, `handleDownloadAttachment` (App.tsx) now
+hands the fetched bytes to the `save_to_downloads` command
+(`src-tauri/src/files.rs`), which writes them into the OS Downloads
+folder -- filename sanitized against path traversal, browser-style
+" (1)" de-duplication -- and returns the final path shown in the toast.
+The old anchor-click download only remains for browser dev mode, since
+WebKitGTK inside Tauri has no download manager for it to reach.
+
+Related reader-pane changes from the same pass: Print renders the message
+into a hidden same-page iframe and calls its `print()` (Tauri intercepts
+`window.open`, which is why the old window-based print silently did
+nothing in the app); the Archive action flips to Unarchive (move back to
+INBOX) when the open folder *is* the archive; the blocked-remote-images
+notice became a proper banner (icon, title, pill buttons); and the HTML
+body iframe re-measures progressively (ResizeObserver + a bounded poll)
+instead of waiting for the iframe `load` event, which only fires after
+every remote image finishes -- previously "Show images" left the body
+collapsed until the slowest image loaded. The message-list sort menu
+gained "Unread first" alongside newest/oldest.

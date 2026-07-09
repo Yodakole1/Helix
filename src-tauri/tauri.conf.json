@@ -24,7 +24,8 @@
       }
     ],
     "security": {
-      "csp": "default-src 'self'; script-src 'self'; style-src 'self' 'unsafe-inline'; img-src 'self' data: blob: asset:; connect-src 'self' ipc: tauri: https://ipc.localhost http://localhost:*; font-src 'self' data:"
+      "csp": "default-src 'self'; script-src 'self'; style-src 'self' 'unsafe-inline'; img-src 'self' data: blob: asset: https: http:; frame-src 'self' blob: data:; connect-src 'self' ipc: tauri: https://ipc.localhost http://localhost:*; font-src 'self' data:",
+      "dangerousDisableAssetCspModification": ["style-src"]
     }
   },
   "plugins": {
@@ -48,8 +49,17 @@
       "icons/icon.icns",
       "icons/icon.ico"
     ],
+    "resources": ["icons/128x128.png"],
     "android": {
       "debugApplicationIdSuffix": ".debug"
+    },
+    "linux": {
+      "deb": {
+        "desktopTemplate": "./helix.desktop"
+      },
+      "rpm": {
+        "desktopTemplate": "./helix.desktop"
+      }
     }
   }
 }

@@ -1,8 +1,9 @@
-import { isPermissionGranted, requestPermission, sendNotification } from "@tauri-apps/plugin-notification";
+import { isPermissionGranted, requestPermission } from "@tauri-apps/plugin-notification";
 import { useEffect, useState } from "react";
 import { Pressable, StyleSheet, Text, View } from "react-native";
 import { usePersistedJSON, usePersistedState } from "../hooks/usePersistedState";
 import { colors, fontFamily, radii, spacing } from "../theme";
+import { sendTestNotification } from "../lib/notifications";
 import { settingsStyles as styles } from "./settingsStyles";
 import { Switch } from "./Switch";
 
@@ -24,7 +25,13 @@ export function NotificationSettings({ accentColor }: NotificationSettingsProps)
   const [notifyNewMail, setNotifyNewMail] = usePersistedState("helix:notifyNewMail", 0);
   const [calendarReminders, setCalendarReminders] = usePersistedJSON<boolean>("helix:calendarReminders", true);
   const [leadMinutes, setLeadMinutes] = usePersistedState("helix:reminderLeadMinutes", 10);
+  // The test button is a troubleshooting tool, so it only shows in Debug
+  // mode (the toggle in Settings > About). Read once on mount -- Settings
+  // remounts this component whenever the user switches back to this
+  // category, so a toggle in About is picked up on the next visit.
+  const [debugMode] = usePersistedState("helix:debugMode", 0);
   const [testSent, setTestSent] = useState(false);
+  const [testError, setTestError] = useState("");
 
   async function refreshPermission() {
     try {
@@ -48,10 +55,17 @@ export function NotificationSettings({ accentColor }: NotificationSettingsProps)
     }
   }
 
-  function handleSendTest() {
-    sendNotification({ title: "Helix", body: "This is a test notification." });
-    setTestSent(true);
-    window.setTimeout(() => setTestSent(false), 2000);
+  async function handleSendTest() {
+    setTestError("");
+    try {
+      await sendTestNotification();
+      setTestSent(true);
+      window.setTimeout(() => setTestSent(false), 2000);
+    } catch (err) {
+      // The backend command rejects with a real reason (no session bus,
+      // Notify refused) -- show it instead of pretending the click worked.
+      setTestError(err instanceof Error ? err.message : String(err));
+    }
   }
 
   return (
@@ -78,10 +92,13 @@ export function NotificationSettings({ accentColor }: NotificationSettingsProps)
         )}
       </View>
 
-      {permission === "granted" && (
-        <Pressable onPress={handleSendTest} style={[styles.secondaryButton, { borderColor: accentColor, alignSelf: "flex-start" }]}>
-          <Text style={[styles.secondaryButtonText, { color: accentColor }]}>{testSent ? "Sent" : "Send test notification"}</Text>
-        </Pressable>
+      {permission === "granted" && debugMode === 1 && (
+        <>
+          <Pressable onPress={handleSendTest} style={[styles.secondaryButton, { borderColor: accentColor, alignSelf: "flex-start" }]}>
+            <Text style={[styles.secondaryButtonText, { color: accentColor }]}>{testSent ? "Sent" : "Send test notification"}</Text>
+          </Pressable>
+          {testError !== "" && <Text style={local.testError}>{testError}</Text>}
+        </>
       )}
 
       <View style={styles.settingRow}>
@@ -147,5 +164,11 @@ const local = StyleSheet.create({
     fontFamily: fontFamily.ui,
     fontSize: 11,
     color: colors.text.secondary,
+  },
+  testError: {
+    fontFamily: fontFamily.ui,
+    fontSize: 11,
+    color: colors.accent.amber,
+    marginTop: spacing.xs,
   },
 });

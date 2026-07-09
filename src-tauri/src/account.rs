@@ -92,6 +92,7 @@ pub async fn add_account(
         return Err(e);
     }
 
+    crate::debug_log::record("account", format!("added IMAP account {account_id}"));
     Ok(AddAccountResult { account_id, folders })
 }
 
@@ -124,7 +125,14 @@ pub async fn add_oauth_account(
             .await?;
     oauth::store_authorized(&account_id, &provider, client_id, client_secret, tokens)?;
 
-    let rollback = |account_id: String| {
+    // The browser flow just minted a grant at the provider; if the account
+    // can't be kept, revoke that grant too (best-effort) -- otherwise a
+    // live refresh token is left behind that no local record points at.
+    let rollback = |account_id: String| async move {
+        if let Ok(mut secret) = credentials::get_credential(account_id.clone()) {
+            oauth::revoke_grant_best_effort(&account_id, &secret).await;
+            secret.zeroize();
+        }
         credentials::delete_credential(account_id.clone()).ok();
         oauth::forget_token(&account_id);
     };
@@ -142,7 +150,7 @@ pub async fn add_oauth_account(
     {
         Ok(folders) => folders,
         Err(e) => {
-            rollback(account_id);
+            rollback(account_id).await;
             return Err(e);
         }
     };
@@ -173,10 +181,11 @@ pub async fn add_oauth_account(
     };
 
     if let Err(e) = cache::open().and_then(|conn| cache::upsert_account(&conn, &record)) {
-        rollback(account_id);
+        rollback(account_id).await;
         return Err(e);
     }
 
+    crate::debug_log::record("account", format!("added OAuth account {account_id}"));
     Ok(AddAccountResult { account_id, folders })
 }
 
@@ -236,7 +245,80 @@ pub async fn add_pop3_account(
         return Err(e);
     }
 
+    crate::debug_log::record("account", format!("added POP3 account {account_id}"));
     Ok(AddAccountResult { account_id, folders: vec!["INBOX".to_string()] })
+}
+
+/// Re-runs the browser sign-in for an existing OAuth account -- the
+/// recovery path for a dead refresh token (revoked in the provider's
+/// security settings, expired after Microsoft's inactivity window, or
+/// invalidated by a password change). Without this, the only fix was
+/// removing and re-adding the account, which threw away its cached mail,
+/// aliases, and settings.
+///
+/// Follows `update_account`'s rotate-verify-or-restore discipline: the
+/// old credential blob is held aside, the fresh token set is stored and
+/// verified with a real XOAUTH2 IMAP login, and on verification failure
+/// the old blob goes back so the account is exactly as it was. The
+/// client ID/secret are reused from the stored blob (they're what worked
+/// at onboarding); if the blob is unreadable, the build's compiled-in
+/// client is the fallback.
+#[tauri::command]
+pub async fn reauthorize_oauth_account(account_id: String) -> Result<(), String> {
+    let conn = cache::open()?;
+    let existing = cache::get_account(&conn, &account_id)?
+        .ok_or_else(|| format!("no account {account_id} to re-authorize"))?;
+    if existing.auth_method != "oauth2" {
+        return Err(format!(
+            "{account_id} is a password account -- rotate its password under Settings > Accounts instead"
+        ));
+    }
+    let provider = existing
+        .oauth_provider
+        .clone()
+        .ok_or_else(|| format!("{account_id} has no OAuth provider recorded"))?;
+    let config = oauth::provider_config(&provider)?;
+
+    // Zeroized on every exit path, same convention as update_account.
+    let mut old_secret = credentials::get_credential(account_id.clone())?;
+    let (client_id, client_secret) = match oauth::parse_stored(&old_secret) {
+        Some(stored) => (stored.client_id, stored.client_secret),
+        None => oauth::resolve_client(&config, &provider, None, None)?,
+    };
+
+    let flow = async {
+        let tokens = oauth::run_authorization_flow(
+            &config,
+            &client_id,
+            client_secret.as_deref(),
+            &account_id,
+        )
+        .await?;
+        oauth::store_authorized(&account_id, &provider, client_id.clone(), client_secret.clone(), tokens)?;
+        imap::verify_and_list_folders(&existing.imap_host, existing.imap_port, &account_id, false)
+            .await
+            .map(|_| ())
+    };
+
+    match flow.await {
+        Ok(()) => {
+            old_secret.zeroize();
+            Ok(())
+        }
+        Err(e) => {
+            // Put the previous credential back (it may still be the only
+            // working one if this failure was network, not the token) and
+            // drop the freshly cached access token that goes with the
+            // discarded new blob. The discarded new refresh token is
+            // deliberately NOT revoked here: Google's revocation endpoint
+            // kills the whole app grant, which would take the restored old
+            // token down with it.
+            credentials::store_credential(account_id.clone(), old_secret.clone()).ok();
+            old_secret.zeroize();
+            oauth::forget_token(&account_id);
+            Err(e)
+        }
+    }
 }
 
 /// Updates an existing account's settings -- the counterpart that lets a
@@ -264,6 +346,17 @@ pub async fn update_account(
     let conn = cache::open()?;
     let existing = cache::get_account(&conn, &account_id)?
         .ok_or_else(|| format!("no account {account_id} to update"))?;
+
+    // An OAuth account has no password to rotate -- its keychain entry is
+    // a refresh-token blob, and "rotating" it to a plain password would
+    // leave an account that claims oauth2 but can't authenticate. The
+    // frontend hides the password field for these; this guard is for any
+    // other caller.
+    if existing.auth_method == "oauth2" && password.is_some() {
+        return Err(format!(
+            "{account_id} signs in with OAuth and has no password to change -- use \"Sign in again\" under Settings > Accounts instead"
+        ));
+    }
 
     // If rotating the password, keep the old one so we can restore it if
     // verification of the new settings fails. Zeroized on every exit path
@@ -327,7 +420,7 @@ pub async fn update_account(
 }
 
 #[tauri::command]
-pub fn list_accounts() -> Result<Vec<AccountRecord>, String> {
+pub async fn list_accounts() -> Result<Vec<AccountRecord>, String> {
     let conn = cache::open()?;
     cache::list_accounts(&conn)
 }
@@ -338,8 +431,17 @@ pub fn list_accounts() -> Result<Vec<AccountRecord>, String> {
 /// propagated; cache cleanup failing is logged and not treated as a
 /// command failure, the same log-and-continue posture used for cache
 /// writes in `imap.rs`.
+///
+/// For an OAuth account the provider-side grant is revoked first
+/// (best-effort -- see `oauth::revoke_grant_best_effort`): once the
+/// keychain blob is gone, the refresh token it held would stay valid at
+/// the provider with nothing left locally that could ever revoke it.
 #[tauri::command]
-pub fn remove_account(account_id: String) -> Result<(), String> {
+pub async fn remove_account(account_id: String) -> Result<(), String> {
+    if let Ok(mut secret) = credentials::get_credential(account_id.clone()) {
+        oauth::revoke_grant_best_effort(&account_id, &secret).await;
+        secret.zeroize();
+    }
     credentials::delete_credential(account_id.clone())?;
     oauth::forget_token(&account_id);
 
@@ -348,6 +450,7 @@ pub fn remove_account(account_id: String) -> Result<(), String> {
         log::warn!("could not remove cached data for {account_id}: {e}");
     }
 
+    crate::debug_log::record("account", format!("removed account {account_id}"));
     Ok(())
 }
 
@@ -468,7 +571,7 @@ fn merge_and_sort_summaries(
 /// of POP3 having no server-side fetch window.)
 #[tauri::command]
 pub async fn fetch_unified_inbox(limit: u32) -> Result<Vec<UnifiedMessageSummary>, String> {
-    let accounts = list_accounts()?;
+    let accounts = list_accounts().await?;
 
     let fetches = accounts.into_iter().map(|account| async move {
         let result = if account.incoming_protocol == "pop3" {

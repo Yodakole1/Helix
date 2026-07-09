@@ -137,10 +137,16 @@ fn propfind(
         .header("Content-Type", "application/xml; charset=\"utf-8\"")
         .body(body.to_string())
         .send()
-        .map_err(|e| format!("PROPFIND {url} failed: {e}"))?;
+        .map_err(|e| {
+            let msg = format!("PROPFIND {url} failed: {e}");
+            crate::debug_log::record("carddav", &msg);
+            msg
+        })?;
 
-    if !resp.status().is_success() && resp.status().as_u16() != 207 {
-        return Err(format!("PROPFIND {url} returned HTTP {}", resp.status()));
+    let status = resp.status();
+    crate::debug_log::record("carddav", format!("PROPFIND {url} -> HTTP {status}"));
+    if !status.is_success() && status.as_u16() != 207 {
+        return Err(format!("PROPFIND {url} returned HTTP {status}"));
     }
     resp.text().map_err(|e| format!("could not read PROPFIND response: {e}"))
 }
@@ -238,13 +244,20 @@ fn do_sync(
             .basic_auth(username, Some(password))
             .send()
         {
-            Ok(r) if r.status().is_success() => r,
+            Ok(r) if r.status().is_success() => {
+                crate::debug_log::record("carddav", format!("GET {resource_url} -> HTTP {}", r.status()));
+                r
+            }
             Ok(r) => {
-                log::warn!("CardDAV GET {resource_url} returned {}", r.status());
+                let msg = format!("CardDAV GET {resource_url} returned {}", r.status());
+                log::warn!("{msg}");
+                crate::debug_log::record("carddav", &msg);
                 continue;
             }
             Err(e) => {
-                log::warn!("CardDAV GET {resource_url} failed: {e}");
+                let msg = format!("CardDAV GET {resource_url} failed: {e}");
+                log::warn!("{msg}");
+                crate::debug_log::record("carddav", &msg);
                 continue;
             }
         };
@@ -290,7 +303,20 @@ fn do_sync(
 /// insert fails; rolls back both if the first sync fails (same pattern as
 /// `add_account` in account.rs — never leave a dangling credential).
 #[tauri::command]
-pub fn add_carddav_source(
+pub async fn add_carddav_source(
+    account_id: String,
+    url: String,
+    username: String,
+    password: String,
+    display_name: Option<String>,
+) -> Result<CardDavSource, String> {
+    crate::run_blocking(move || {
+        add_carddav_source_blocking(account_id, url, username, password, display_name)
+    })
+    .await
+}
+
+pub(crate) fn add_carddav_source_blocking(
     account_id: String,
     url: String,
     username: String,
@@ -342,7 +368,7 @@ pub fn add_carddav_source(
 }
 
 #[tauri::command]
-pub fn list_carddav_sources() -> Result<Vec<CardDavSource>, String> {
+pub async fn list_carddav_sources() -> Result<Vec<CardDavSource>, String> {
     let conn = cache::open()?;
     Ok(cache::list_carddav_sources_db(&conn)?
         .into_iter()
@@ -361,7 +387,7 @@ pub fn list_carddav_sources() -> Result<Vec<CardDavSource>, String> {
 /// contacts that were synced from this source — there is no origin tracking,
 /// so contacts are shared with the rest of the address book.
 #[tauri::command]
-pub fn delete_carddav_source(id: i64) -> Result<(), String> {
+pub async fn delete_carddav_source(id: i64) -> Result<(), String> {
     let key = format!("carddav__{id}");
     // Best-effort keychain deletion (may already be gone).
     credentials::delete_credential(key).ok();
@@ -385,6 +411,14 @@ fn resolve_source_password(record: &cache::CardDavSourceRecord) -> Result<String
             record.id, record.account_id
         )
     })?;
+    // Same OAuth guard as caldav::resolve_source_password: a refresh-token
+    // blob must never be sent anywhere as a Basic-auth password.
+    if crate::oauth::parse_stored(&fallback).is_some() {
+        return Err(format!(
+            "the password for address book {} is gone and {} signs in with OAuth, so its mail credential can't stand in; remove and re-add the address book with its own password",
+            record.id, record.account_id
+        ));
+    }
     if let Err(e) = credentials::store_credential(key, fallback.clone()) {
         eprintln!("could not re-store healed CardDAV credential: {e}");
     }
@@ -394,7 +428,11 @@ fn resolve_source_password(record: &cache::CardDavSourceRecord) -> Result<String
 /// Re-fetches all vCards from the source and upserts them into the contacts
 /// table. Updates `last_synced_at` on success.
 #[tauri::command]
-pub fn sync_carddav(id: i64) -> Result<SyncResult, String> {
+pub async fn sync_carddav(id: i64) -> Result<SyncResult, String> {
+    crate::run_blocking(move || sync_carddav_blocking(id)).await
+}
+
+pub(crate) fn sync_carddav_blocking(id: i64) -> Result<SyncResult, String> {
     let conn = cache::open()?;
     let record = cache::get_carddav_source(&conn, id)?
         .ok_or_else(|| format!("no CardDAV source with id {id}"))?;
@@ -417,7 +455,15 @@ pub fn sync_carddav(id: i64) -> Result<SyncResult, String> {
 ///
 /// `host` may be a full base URL or just a hostname.
 #[tauri::command]
-pub fn discover_carddav(
+pub async fn discover_carddav(
+    host: String,
+    username: String,
+    password: String,
+) -> Result<Vec<CardDavDiscoveredBook>, String> {
+    crate::run_blocking(move || discover_carddav_blocking(host, username, password)).await
+}
+
+pub(crate) fn discover_carddav_blocking(
     host: String,
     username: String,
     password: String,

@@ -50,12 +50,14 @@ export function useMessageStore() {
     setMessagesByKey((current) => ({ ...current, [keyFor(account, folder)]: messages }));
   }
 
-  // Adds messages (e.g. server-side search hits) to a folder's list without
-  // disturbing those already present -- a message already loaded keeps its
-  // existing record (which may have a body fetched), and only genuinely new
-  // uids are appended. Used so an IMAP search can surface matches older than
-  // the initially-fetched window into the same folder the client-side filter
-  // already reads from.
+  // Adds messages (e.g. server-side search hits, or a background poll/IDLE
+  // reconciliation) to a folder's list without disturbing those already
+  // present -- a message already loaded keeps its existing record (which may
+  // have a body fetched), and only genuinely new uids are appended. Used so
+  // an IMAP search can surface matches older than the initially-fetched
+  // window into the same folder the client-side filter already reads from,
+  // and so new mail arriving while a folder is open appends in place instead
+  // of replacing the whole list.
   function mergeMessages(account: AccountId, folder: string, incoming: SampleMessage[]) {
     setMessagesByKey((current) => {
       const key = keyFor(account, folder);

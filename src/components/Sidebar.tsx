@@ -2,7 +2,7 @@ import { useEffect, useState, type ReactNode } from "react";
 import { Pressable, ScrollView, StyleSheet, Text, TextInput, View } from "react-native";
 import { resolveAccountColor, resolveAccountLabel, type AccountOverrides, type MailAccount } from "../data/accounts";
 import { folderLabel, normalizeFolderId } from "../data/folders";
-import { deleteCalDavSource, listCalDavSources, type CalDavSource } from "../lib/caldav";
+import { listCalDavSources, type CalDavSource } from "../lib/caldav";
 import { emitCalendarBus, onCalendarBus } from "../lib/calendarBus";
 import type { AddressBookSource } from "./AddressBookView";
 import { FolderIcon } from "./FolderIcon";
@@ -103,12 +103,6 @@ export function Sidebar({
     return onCalendarBus("sources-changed", load);
   }, [showAccountList, contactsMode]);
 
-  function handleRemoveCalendar(id: number) {
-    deleteCalDavSource(id)
-      .then(() => emitCalendarBus("sources-changed"))
-      .catch((e) => console.warn("delete_caldav_source failed:", e));
-  }
-
   const [contextMenu, setContextMenu] = useState<{ accountId: AccountId; top: number; left: number } | null>(null);
   const [renameDraft, setRenameDraft] = useState("");
   // Folder context menu (right-click a folder) and its rename draft.
@@ -205,15 +199,15 @@ export function Sidebar({
             {calendars.length === 0 && (
               <Text style={styles.calEmpty}>No calendars connected.</Text>
             )}
+            {/* No inline remove here on purpose -- an × next to every row is
+                one misclick away from deleting a calendar. Removal lives in
+                Settings > Calendar, behind an explicit Remove action. */}
             {calendars.map((cal) => (
               <View key={cal.id} style={styles.calRow}>
                 <View style={[styles.accountDot, { backgroundColor: cal.color ?? accentColor }]} />
                 <Text style={styles.calName} numberOfLines={1}>
                   {cal.display_name || cal.username}
                 </Text>
-                <Pressable onPress={() => handleRemoveCalendar(cal.id)}>
-                  <Text style={styles.calRemove}>&#215;</Text>
-                </Pressable>
               </View>
             ))}
           </View>

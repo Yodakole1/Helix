@@ -47,8 +47,15 @@ key that carries the new pubkey.
 2. Build with the signing key in the environment:
 
    ```
-   TAURI_SIGNING_PRIVATE_KEY_PATH=~/.tauri/helix-updater.key npm run tauri build
+   TAURI_SIGNING_PRIVATE_KEY="$(cat ~/.tauri/helix-updater.key)" npm run tauri build
    ```
+
+   The variable is `TAURI_SIGNING_PRIVATE_KEY` -- there is no `_PATH`
+   variant in the Tauri v2 CLI (a build with only the misnamed variable
+   set fails at the very end with "A public key has been found, but no
+   private key", after the installers are already bundled). Add
+   `TAURI_SIGNING_PRIVATE_KEY_PASSWORD` if the key was generated with
+   one.
 
    This produces the installers plus `.sig` files under
    `src-tauri/target/release/bundle/`.

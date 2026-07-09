@@ -77,3 +77,36 @@ discovered calendar/address book (`add_caldav_source`/
 `add_carddav_source`, best-effort) and opens the inbox. A failed probe is
 reported ("do you want to continue with what worked?") and never blocks
 mail -- mail is the gate: if the mail login fails, nothing is added.
+
+## Bulk import (added later)
+
+Onboarding many accounts at once -- one `key: value` text block per
+account, verified through this exact same `add_account`/
+`add_pop3_account` path and deleted afterwards because it contains
+passwords -- lives in `account_import.rs`; see
+`account-import-file.md`.
+
+## Import from Thunderbird (added later)
+
+`thunderbird_import.rs` reads a local Thunderbird installation and
+reconstructs the IMAP/POP3 + SMTP settings of every mail account in its
+profile(s), so someone migrating doesn't retype server fields. The one
+command it exposes, `discover_thunderbird_accounts`, is a **read-only**
+probe: it parses each profile's plain-text `prefs.js` (the account manager
+lists account ids; each account points at a server id and an identity id;
+the identity points at an SMTP server id) and returns a list of
+`DiscoveredAccount { email, display_name, protocol, incoming_host/port/
+starttls, smtp_host/port/starttls }`. Thunderbird's `socketType`/`try_ssl`
+map to Helix's STARTTLS-vs-implicit-TLS flag (2 = STARTTLS, 3 = implicit
+TLS); `type: "none"` servers (Local Folders) and non-mail accounts (RSS,
+NNTP) are skipped; results are de-duplicated by address.
+
+Passwords are deliberately **not** imported: Thunderbird stores them in an
+NSS-encrypted `key4.db`/`logins.json` (often behind a primary password),
+and decrypting that would mean bundling and driving NSS. Instead the
+onboarding form (`AddAccountView`) pre-fills every field from a chosen
+discovered account, forces the advanced-settings panel open so those exact
+servers are used rather than re-discovered, and leaves the password empty
+for the user to type once -- after which the account goes through the same
+verify-before-save `add_account`/`add_pop3_account` path as a hand-entered
+one. The command writes nothing and never touches the keychain.

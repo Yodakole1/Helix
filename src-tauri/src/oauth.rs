@@ -40,6 +40,10 @@ use crate::credentials;
 pub(crate) struct ProviderConfig {
     pub auth_url: &'static str,
     pub token_url: &'static str,
+    /// RFC 7009 token-revocation endpoint, when the provider has one.
+    /// Google does; Microsoft's identity platform offers none (a grant is
+    /// only revocable from the user's account portal), hence the Option.
+    pub revoke_url: Option<&'static str>,
     pub scopes: &'static str,
     pub redirect_host: &'static str,
     pub imap_host: &'static str,
@@ -64,6 +68,7 @@ pub(crate) fn provider_config(provider: &str) -> Result<ProviderConfig, String> 
         "gmail" => Ok(ProviderConfig {
             auth_url: "https://accounts.google.com/o/oauth2/v2/auth",
             token_url: "https://oauth2.googleapis.com/token",
+            revoke_url: Some("https://oauth2.googleapis.com/revoke"),
             scopes: "https://mail.google.com/",
             redirect_host: "127.0.0.1",
             imap_host: "imap.gmail.com",
@@ -78,6 +83,7 @@ pub(crate) fn provider_config(provider: &str) -> Result<ProviderConfig, String> 
         "microsoft" => Ok(ProviderConfig {
             auth_url: "https://login.microsoftonline.com/common/oauth2/v2.0/authorize",
             token_url: "https://login.microsoftonline.com/common/oauth2/v2.0/token",
+            revoke_url: None,
             scopes: "https://outlook.office.com/IMAP.AccessAsUser.All \
                      https://outlook.office.com/SMTP.Send \
                      offline_access",
@@ -171,6 +177,51 @@ pub(crate) fn forget_token(account_id: &str) {
     token_cache().lock().expect("token cache lock poisoned").remove(account_id);
 }
 
+/// Revokes the provider-side grant behind a stored OAuth secret (RFC
+/// 7009), for when the local credential is about to be deleted. Deleting
+/// the keychain blob alone would leave a live refresh token at the
+/// provider that no local record points at anymore -- unusable, but also
+/// unrevokable, sitting in the user's Google security page forever.
+///
+/// Best-effort by design: a no-op for password secrets and for providers
+/// without a revocation endpoint (Microsoft -- its grants are only
+/// revocable from account.microsoft.com), and failures are logged rather
+/// than propagated, because revocation must never be able to block
+/// removing an account (the user may be offline, or removing the account
+/// precisely because its token is dead).
+pub(crate) async fn revoke_grant_best_effort(account_id: &str, secret: &str) {
+    let Some(stored) = parse_stored(secret) else { return };
+    let Ok(config) = provider_config(&stored.provider) else { return };
+    let Some(revoke_url) = config.revoke_url else {
+        log::info!(
+            "{} ({}) has no revocation endpoint; the grant stays until revoked from the provider's account portal",
+            stored.provider,
+            account_id
+        );
+        return;
+    };
+
+    let result = reqwest::Client::new()
+        .post(revoke_url)
+        .form(&[("token", stored.refresh_token.as_str())])
+        .send()
+        .await;
+    match result {
+        Ok(resp) if resp.status().is_success() => {
+            log::info!("revoked the OAuth grant for {account_id}");
+        }
+        // Google answers 400 for a token that is already invalid; the goal
+        // (a dead grant) is met either way.
+        Ok(resp) if resp.status() == reqwest::StatusCode::BAD_REQUEST => {
+            log::info!("OAuth grant for {account_id} was already revoked");
+        }
+        Ok(resp) => {
+            log::warn!("could not revoke the OAuth grant for {account_id}: HTTP {}", resp.status());
+        }
+        Err(e) => log::warn!("could not revoke the OAuth grant for {account_id}: {e}"),
+    }
+}
+
 #[derive(Deserialize)]
 struct TokenEndpointResponse {
     access_token: String,
@@ -243,8 +294,22 @@ pub(crate) async fn access_token(account_id: &str, stored: &StoredOauth) -> Resu
     }
 
     let token = post_token_request(config.token_url, &form).await.map_err(|e| {
-        format!("could not refresh the {} login for {account_id}: {e}", stored.provider)
+        // invalid_grant is the provider saying the refresh token itself is
+        // dead (revoked, expired, password changed) -- retrying can't fix
+        // it, only a fresh browser sign-in can, so say where that lives.
+        let hint = if e.contains("invalid_grant") {
+            " -- the saved sign-in has expired or been revoked; open Settings > Accounts and use \"Sign in again\""
+        } else {
+            ""
+        };
+        let msg = format!("could not refresh the {} login for {account_id}: {e}{hint}", stored.provider);
+        crate::debug_log::record("oauth", &msg);
+        msg
     })?;
+    crate::debug_log::record(
+        "oauth",
+        format!("refreshed {} access token for {account_id}", stored.provider),
+    );
 
     if let Some(new_refresh) = &token.refresh_token {
         if *new_refresh != stored.refresh_token {
@@ -624,6 +689,15 @@ mod tests {
         assert!(provider_config("gmail").is_ok());
         assert!(provider_config("microsoft").is_ok());
         assert!(provider_config("aol").is_err());
+    }
+
+    #[test]
+    fn revocation_endpoint_asymmetry_is_deliberate() {
+        // Google supports RFC 7009; Microsoft's identity platform has no
+        // revocation endpoint at all. If Microsoft ever grows one, this
+        // test is the reminder to wire it in.
+        assert!(provider_config("gmail").unwrap().revoke_url.is_some());
+        assert!(provider_config("microsoft").unwrap().revoke_url.is_none());
     }
 
     #[test]

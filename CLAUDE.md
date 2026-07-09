@@ -102,7 +102,12 @@ shared shim types instead if a new web-only capability is needed.
 ### Theme system (`src/theme/`)
 
 `colors.ts`, `typography.ts`, `spacing.ts`, re-exported together via
-`index.ts`. The visual style is dark, glassmorphism-based (translucent
+`index.ts`. Two palettes (dark default, plus a muted-gray light theme)
+live behind one `Palette` shape in `colors.ts`; the active one is chosen
+at module load from `localStorage["helix:theme"]` (styles are baked into
+module-level StyleSheets, so switching theme reloads the window -- see
+frontend-layout.md's theming section). The visual style is dark-first,
+glassmorphism-based (translucent
 panels via `glassPanel`, ambient background glows in `App.tsx`), with a
 rotating accent-color system: `colorForIndex()` / `accentCycle` in
 `colors.ts` assigns distinct colors to senders/folders/avatars instead of
@@ -185,10 +190,18 @@ floating menu/popover should too rather than reaching for a bare `zIndex`.
 `src-tauri/src/lib.rs` is the single place Tauri commands get registered
 (`invoke_handler!`); each module owns its own commands, and each has a
 matching doc under `docs/technical/` with the full design and verification
-story:
+story. One hard rule for every command: **never a bare sync `fn`** --
+sync commands run on the main thread (the GTK event loop on Linux) and
+froze the whole window badly enough that GNOME offered Force Quit.
+Commands are `async fn`; genuinely blocking work (blocking HTTP, keychain
+DBus, Argon2, key generation, file writes) additionally hops through
+`crate::run_blocking()` onto the blocking pool. See architecture.md's
+"Tauri commands must never block the main thread". The modules:
 
 - `credentials.rs` -- wraps the `keyring` crate behind
-  `store_credential`/`get_credential`/`delete_credential`. Backend is chosen
+  `store_credential`/`get_credential`/`delete_credential` (sync, for the
+  many internal Rust callers) with `*_cmd` async command wrappers as the
+  actual Tauri commands. Backend is chosen
   per-OS at compile time in `Cargo.toml` (`sync-secret-service` on Linux,
   `apple-native` on macOS, `windows-native` on Windows) since `keyring` ships
   with none enabled by default. Secrets are namespaced under service name
@@ -313,7 +326,12 @@ sending a message is a real correspondence signal, showing up in a folder
 listing is not.
 
 Other modules follow the same one-module-one-concern shape, each with its
-own `docs/technical/` doc: `caldav.rs`/`carddav.rs` (RFC 6764 discovery,
+own `docs/technical/` doc: `account_import.rs` (bulk account onboarding
+from a `key: value` text file -- reuses `account.rs`'s add commands
+verbatim, and zero-overwrites and deletes the file after the run because
+it holds plaintext passwords; `accounts-import.example.txt` at the repo
+root is the user-facing template and a filled-in `accounts-import.txt`
+is gitignored), `caldav.rs`/`carddav.rs` (RFC 6764 discovery,
 sync, and -- for CardDAV -- contact upserts tagged with a
 `source` column so the address-book tab can filter per book), `drafts.rs`
 (local + IMAP-APPENDed drafts, the outbox behind undo/scheduled send),
@@ -323,11 +341,25 @@ connection), `lock.rs` (optional app lock: Argon2id-hashed password in
 the keychain under a reserved sentinel, plus FIDO2 passkey enrollment/
 assertion behind the optional `passkey` cargo feature -- default builds
 stub those two commands with a clear error so the frontend can explain),
-and `oauth.rs` (Gmail/Microsoft 365 OAuth2: RFC 8252 browser+loopback
+`oauth.rs` (Gmail/Microsoft 365 OAuth2: RFC 8252 browser+loopback
 flow, refresh token stored as a marked JSON blob in the same keychain
 entry a password would use -- IMAP/SMTP/POP3 each branch to XOAUTH2 by
 parsing the stored secret, not via a config flag; access tokens live in
-an in-process cache because every command opens its own connection).
+an in-process cache because every command opens its own connection; a
+dead refresh token is recoverable in place via
+`account::reauthorize_oauth_account`; removing an OAuth account revokes
+the provider-side grant best-effort (RFC 7009 -- Google only, Microsoft
+has no revocation endpoint); and Yahoo/AOL are deliberately
+unsupported -- their registrations reject loopback redirects, see
+`oauth.md`), `notifications.rs` (desktop notification delivery over one
+process-lifetime DBus connection on Linux -- the notification plugin's own
+per-call-connection path gets every notification instantly destroyed by
+GNOME Shell, see `notifications-and-refresh.md`; the plugin is still used
+for the permission UI and for non-Linux delivery), and `debug_log.rs` (a
+bounded in-memory app-wide activity log every subsystem `record()`s into,
+never holding secrets, surfaced in Settings > About behind the Debug mode
+toggle -- which also reveals the test-notification button; see
+`debug-log.md`).
 
 With the exception of `idle.rs`, no connection pooling or persistent
 IMAP/POP3 session exists anywhere -- every command call opens and closes

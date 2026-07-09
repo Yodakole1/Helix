@@ -11,6 +11,8 @@ interface RichTextEditorProps {
   // document.queryCommandState and highlight the formats active at the
   // new caret position.
   onSelectionChange?: () => void;
+  // Native browser spell checking on the editable body. Defaults on.
+  spellCheck?: boolean;
   // Bump to re-seed the editor's content from initialHtml -- the only way
   // the owner can programmatically replace the content (prefill arriving
   // after mount, template insertion) without a remount, since normal
@@ -29,7 +31,7 @@ interface RichTextEditorProps {
 // would reset the cursor position on every keystroke -- the `contentEditable`
 // div manages its own DOM mutations; React only sets the initial HTML on
 // mount and reads the final HTML via `exportHtml()`.
-export function RichTextEditor({ initialHtml = "", placeholder = "", onChange, onSelectionChange, seedVersion = 0, style }: RichTextEditorProps) {
+export function RichTextEditor({ initialHtml = "", placeholder = "", onChange, onSelectionChange, seedVersion = 0, spellCheck = true, style }: RichTextEditorProps) {
   const ref = useRef<HTMLDivElement>(null);
   const hasContentRef = useRef(false);
 
@@ -68,6 +70,10 @@ export function RichTextEditor({ initialHtml = "", placeholder = "", onChange, o
       <div
         ref={ref}
         contentEditable
+        // Native webview spell checking -- WebKitGTK/WebKit/WebView2 all
+        // underline via the OS dictionaries, so this costs nothing and
+        // works offline. Toggleable from Settings > General.
+        spellCheck={spellCheck}
         suppressContentEditableWarning
         onInput={handleInput}
         onFocus={handleFocus}

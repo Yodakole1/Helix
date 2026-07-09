@@ -2,8 +2,18 @@ import { useEffect, useState } from "react";
 import { Pressable, ScrollView, StyleSheet, Text, TextInput, View } from "react-native";
 import { resolveAccountColor, resolveAccountLabel, type AccountOverrides, type MailAccount } from "../data/accounts";
 import type { HoverState } from "../lib/pressable";
-import type { AccountId } from "../theme";
-import { accentCycle, colors, fontFamily, fontSize, radii, spacing, withAlpha } from "../theme";
+import type { AccountId, ThemeName } from "../theme";
+import {
+  avatarPaletteForStyle,
+  type AvatarColorStyle,
+  colors,
+  EXTENDED_PALETTE,
+  fontFamily,
+  fontSize,
+  radii,
+  spacing,
+  withAlpha,
+} from "../theme";
 import type { Rule } from "../lib/rules";
 import { comboFromEvent, formatKeyCombo, isCompleteCombo, SHORTCUTS, type ShortcutId } from "../lib/shortcuts";
 import type { MessageTemplate } from "./ComposeModal";
@@ -11,6 +21,9 @@ import CalDavSettings from "./CalDavSettings";
 import { ConnectedAccountsSettings } from "./ConnectedAccountsSettings";
 import { ContactsSettings } from "./ContactsSettings";
 import { DataStorageSettings, type SyncDepth } from "./DataStorageSettings";
+import { DebugSettings } from "./DebugLogSettings";
+import { DefaultMailClientSettings } from "./DefaultMailClientSettings";
+import { HexColorInput } from "./HexColorInput";
 import { SmimeSettings } from "./SmimeSettings";
 import { AppLockSettings } from "./AppLockSettings";
 import { ModalOverlay } from "./ModalOverlay";
@@ -62,6 +75,18 @@ const FONT_SCALE_OPTIONS: { value: number; label: string }[] = [
   { value: 1, label: "Default" },
   { value: 1.1, label: "Large" },
   { value: 1.25, label: "Larger" },
+  { value: 1.4, label: "Huge" },
+];
+
+const AVATAR_STYLE_OPTIONS: { value: AvatarColorStyle; label: string }[] = [
+  { value: "muted", label: "Muted" },
+  { value: "balanced", label: "Balanced" },
+  { value: "vivid", label: "Vivid" },
+];
+
+const THEME_OPTIONS: { value: ThemeName; label: string; description: string }[] = [
+  { value: "dark", label: "Dark", description: "OLED-first, the original Helix look." },
+  { value: "light", label: "Light", description: "Soft gray-whites -- easy on the eyes, not glaring." },
 ];
 
 // Every staged (Save/Done-applied) setting in one object. The modal edits a
@@ -76,8 +101,11 @@ export interface SettingsValues {
   readReceipts: boolean;
   encryptByDefault: boolean;
   signature: string;
+  spellCheck: boolean;
   syncDepth: SyncDepth;
   fontScale: number;
+  theme: ThemeName;
+  avatarColorStyle: AvatarColorStyle;
 }
 
 interface SettingsModalProps {
@@ -136,9 +164,20 @@ export function SettingsModal({
 
   function patchDraft(patch: Partial<SettingsValues>) {
     setDraft((current) => ({ ...current, ...patch }));
+    setJustSaved(false);
   }
 
   const dirty = JSON.stringify(draft) !== JSON.stringify(values);
+
+  // Flips the Save button's label to "Saved" for a few seconds so the
+  // click has visible confirmation, since Save (unlike Done) doesn't
+  // close the dialog.
+  const [justSaved, setJustSaved] = useState(false);
+  useEffect(() => {
+    if (!justSaved) return;
+    const timer = setTimeout(() => setJustSaved(false), 3000);
+    return () => clearTimeout(timer);
+  }, [justSaved]);
 
   // Shortcut rebinding: null when idle, otherwise the id currently waiting
   // for the next keypress. Captured at the window level (rather than a
@@ -298,6 +337,45 @@ export function SettingsModal({
 
           {category === "appearance" && (
             <View>
+              <Text style={styles.sectionTitle}>Theme</Text>
+              <View style={styles.fontScaleRow}>
+                {THEME_OPTIONS.map((option) => {
+                  const active = draft.theme === option.value;
+                  return (
+                    <Pressable
+                      key={option.value}
+                      onPress={() => patchDraft({ theme: option.value })}
+                      style={[styles.themeCard, active && { borderColor: accentColor, backgroundColor: withAlpha(accentColor, 0.08) }]}
+                    >
+                      <View
+                        style={[
+                          styles.themePreview,
+                          option.value === "dark"
+                            ? { backgroundColor: "#0D0D11", borderColor: "rgba(255,255,255,0.2)" }
+                            : { backgroundColor: "#F3F4F7", borderColor: "rgba(20,24,34,0.2)" },
+                        ]}
+                      >
+                        <View
+                          style={[
+                            styles.themePreviewLine,
+                            { backgroundColor: option.value === "dark" ? "#D6D6DE" : "#3A3D46" },
+                          ]}
+                        />
+                        <View
+                          style={[
+                            styles.themePreviewLine,
+                            { width: 22, backgroundColor: option.value === "dark" ? "#9C9CA8" : "#6C7078" },
+                          ]}
+                        />
+                      </View>
+                      <Text style={[styles.themeCardLabel, active && { color: accentColor }]}>{option.label}</Text>
+                      <Text style={styles.themeCardDescription}>{option.description}</Text>
+                    </Pressable>
+                  );
+                })}
+              </View>
+              <Text style={styles.hint}>Applies when you hit Save (the app reloads to switch its palette).</Text>
+
               <Text style={styles.sectionTitle}>Text size</Text>
               <View style={styles.fontScaleRow}>
                 {FONT_SCALE_OPTIONS.map((option) => {
@@ -317,14 +395,9 @@ export function SettingsModal({
               </View>
               <Text style={styles.hint}>Scales all text and controls. Applies when you hit Save.</Text>
 
-              <Text style={styles.sectionTitle}>Typography</Text>
-              <Text style={[styles.sample, { fontFamily: fontFamily.display }]}>Space Grotesk -- headers</Text>
-              <Text style={[styles.sample, { fontFamily: fontFamily.ui }]}>Inter -- body and UI text</Text>
-              <Text style={[styles.sample, { fontFamily: fontFamily.mono }]}>JetBrains Mono -- technical data</Text>
-
-              <Text style={styles.sectionTitle}>Accent palette -- {activeAccountLabel}</Text>
-              <View style={styles.swatchRow}>
-                {accentCycle.map((color) => (
+              <Text style={styles.sectionTitle}>Accent color -- {activeAccountLabel}</Text>
+              <View style={styles.swatchGrid}>
+                {EXTENDED_PALETTE.map((color) => (
                   <Pressable
                     key={color}
                     onPress={() => onUpdateAccountOverride(accountId, { color })}
@@ -332,12 +405,55 @@ export function SettingsModal({
                   />
                 ))}
               </View>
+              <View style={styles.customColorRow}>
+                <Text style={styles.customColorLabel}>Custom:</Text>
+                {/* Applies immediately like the swatches (accent overrides
+                    are not staged; they're the same override the sidebar
+                    sets). */}
+                <HexColorInput
+                  value={accentColor}
+                  onChange={(color) => onUpdateAccountOverride(accountId, { color })}
+                />
+              </View>
               <Text style={styles.hint}>
-                Click a color to set it as the active account's accent -- the same override right-clicking it in the
-                sidebar sets, just from here too.
+                Sets the active account's accent -- the color used for highlights across all three panes. The same
+                override right-clicking the account in the sidebar sets, just from here too.
               </Text>
 
-              <Text style={styles.hint}>Dark mode is the only mode -- Helix is OLED-first by design.</Text>
+              <Text style={styles.sectionTitle}>Avatar colors</Text>
+              <Text style={styles.hint}>
+                Sender and contact letter avatars in the inbox and address book -- every starting letter gets its
+                own distinct color, so "A" and "M" senders never blend together. Choose how loud those colors are.
+              </Text>
+              <View style={styles.avatarPreviewRow}>
+                {avatarPaletteForStyle(draft.avatarColorStyle).map((color, index) => (
+                  <View key={color + index} style={[styles.avatarPreviewCircle, { backgroundColor: color }]}>
+                    <Text style={styles.avatarPreviewLetter}>{String.fromCharCode(65 + index)}</Text>
+                  </View>
+                ))}
+              </View>
+              <View style={styles.fontScaleRow}>
+                {AVATAR_STYLE_OPTIONS.map((option) => {
+                  const active = draft.avatarColorStyle === option.value;
+                  return (
+                    <Pressable
+                      key={option.value}
+                      onPress={() => patchDraft({ avatarColorStyle: option.value })}
+                      style={[styles.fontScalePill, active && { backgroundColor: accentColor, borderColor: accentColor }]}
+                    >
+                      <Text style={[styles.fontScalePillText, active && { color: colors.background.base }]}>
+                        {option.label}
+                      </Text>
+                    </Pressable>
+                  );
+                })}
+              </View>
+              <Text style={styles.hint}>Applies when you hit Save (the app reloads, same as switching theme).</Text>
+
+              <Text style={styles.sectionTitle}>Typography</Text>
+              <Text style={[styles.sample, { fontFamily: fontFamily.display }]}>Space Grotesk -- headers</Text>
+              <Text style={[styles.sample, { fontFamily: fontFamily.ui }]}>Inter -- body and UI text</Text>
+              <Text style={[styles.sample, { fontFamily: fontFamily.mono }]}>JetBrains Mono -- technical data</Text>
             </View>
           )}
 
@@ -412,6 +528,13 @@ export function SettingsModal({
                 onChange={() => patchDraft({ separateUnread: !draft.separateUnread })}
                 color={accentColor}
               />
+              <SettingRow
+                label="Check spelling as you type"
+                description="Underlines misspellings in the compose subject and body using your OS dictionaries -- fully offline."
+                value={draft.spellCheck}
+                onChange={() => patchDraft({ spellCheck: !draft.spellCheck })}
+                color={accentColor}
+              />
 
               <Text style={styles.sectionTitle}>Signature</Text>
               <TextInput
@@ -427,6 +550,8 @@ export function SettingsModal({
                 Appended to the body when you start a new message, the same way any signature does -- it only
                 pre-fills an empty draft, so it never overwrites one already in progress.
               </Text>
+
+              <DefaultMailClientSettings accentColor={accentColor} />
             </View>
           )}
 
@@ -461,6 +586,8 @@ export function SettingsModal({
                 install -- a tampered package is rejected. Helix only checks when you ask it to.
               </Text>
               <UpdateSettings accentColor={accentColor} />
+
+              <DebugSettings accentColor={accentColor} />
             </View>
           )}
         </ScrollView>
@@ -472,10 +599,15 @@ export function SettingsModal({
             (Esc, the X) discards the draft. */}
         {dirty && <Text style={styles.unsavedHint}>Unsaved changes</Text>}
         <Pressable
-          onPress={() => onApply(draft)}
+          onPress={() => {
+            onApply(draft);
+            setJustSaved(true);
+          }}
           style={[styles.saveButton, styles.saveButtonSecondary, dirty && { borderColor: accentColor }]}
         >
-          <Text style={[styles.saveButtonSecondaryText, dirty && { color: accentColor }]}>Save</Text>
+          <Text style={[styles.saveButtonSecondaryText, dirty && { color: accentColor }]}>
+            {justSaved ? "Saved" : "Save"}
+          </Text>
         </Pressable>
         <Pressable
           onPress={() => {
@@ -659,7 +791,7 @@ const styles = StyleSheet.create({
   },
   navLabel: {
     fontFamily: fontFamily.ui,
-    fontSize: fontSize.sm,
+    fontSize: fontSize.base,
     color: colors.text.secondary,
   },
   content: {
@@ -667,7 +799,7 @@ const styles = StyleSheet.create({
   },
   sectionTitle: {
     fontFamily: fontFamily.ui,
-    fontSize: fontSize.xs,
+    fontSize: 12,
     fontWeight: "600",
     color: colors.text.muted,
     textTransform: "uppercase",
@@ -712,10 +844,10 @@ const styles = StyleSheet.create({
   },
   hint: {
     fontFamily: fontFamily.ui,
-    fontSize: fontSize.xs,
+    fontSize: 12.5,
     color: colors.text.muted,
     marginTop: spacing.lg,
-    lineHeight: 18,
+    lineHeight: 19,
   },
   signatureInput: {
     minHeight: 90,
@@ -731,9 +863,9 @@ const styles = StyleSheet.create({
   },
   aboutText: {
     fontFamily: fontFamily.ui,
-    fontSize: fontSize.sm,
+    fontSize: fontSize.base,
     color: colors.text.secondary,
-    lineHeight: 20,
+    lineHeight: 21,
     marginBottom: spacing.md,
   },
   aboutLink: {
@@ -757,19 +889,88 @@ const styles = StyleSheet.create({
     color: colors.text.primary,
     marginBottom: spacing.sm,
   },
-  swatchRow: {
+  avatarPreviewRow: {
     flexDirection: "row",
+    flexWrap: "wrap",
+    marginBottom: spacing.sm,
+  },
+  avatarPreviewCircle: {
+    width: 32,
+    height: 32,
+    borderRadius: 16,
+    alignItems: "center",
+    justifyContent: "center",
+    marginRight: spacing.sm,
+    marginBottom: spacing.sm,
+  },
+  avatarPreviewLetter: {
+    fontFamily: fontFamily.display,
+    fontSize: fontSize.sm,
+    fontWeight: "600",
+    color: colors.background.base,
+  },
+  swatchGrid: {
+    flexDirection: "row",
+    flexWrap: "wrap",
+    maxWidth: 6 * (28 + spacing.sm),
   },
   swatch: {
     width: 28,
     height: 28,
     borderRadius: 14,
     marginRight: spacing.sm,
+    marginBottom: spacing.sm,
     borderWidth: 2,
     borderColor: "transparent",
   },
   swatchActive: {
     borderColor: colors.text.primary,
+  },
+  customColorRow: {
+    flexDirection: "row",
+    alignItems: "center",
+    gap: spacing.sm,
+    marginTop: spacing.xs,
+  },
+  customColorLabel: {
+    fontFamily: fontFamily.ui,
+    fontSize: fontSize.sm,
+    color: colors.text.secondary,
+  },
+  themeCard: {
+    width: 168,
+    padding: spacing.md,
+    borderRadius: radii.md,
+    borderWidth: 1,
+    borderColor: colors.border.subtle,
+    marginRight: spacing.md,
+    marginBottom: spacing.sm,
+  },
+  themePreview: {
+    height: 44,
+    borderRadius: radii.sm,
+    borderWidth: 1,
+    padding: spacing.sm,
+    gap: 5,
+    marginBottom: spacing.sm,
+  },
+  themePreviewLine: {
+    height: 4,
+    width: 48,
+    borderRadius: 2,
+  },
+  themeCardLabel: {
+    fontFamily: fontFamily.ui,
+    fontSize: fontSize.sm,
+    fontWeight: "700",
+    color: colors.text.primary,
+    marginBottom: 2,
+  },
+  themeCardDescription: {
+    fontFamily: fontFamily.ui,
+    fontSize: fontSize.xs,
+    color: colors.text.muted,
+    lineHeight: 16,
   },
   settingRow: {
     flexDirection: "row",
@@ -785,14 +986,15 @@ const styles = StyleSheet.create({
   },
   settingLabel: {
     fontFamily: fontFamily.ui,
-    fontSize: fontSize.sm,
+    fontSize: 15,
     fontWeight: "600",
     color: colors.text.primary,
     marginBottom: 2,
   },
   settingDescription: {
     fontFamily: fontFamily.ui,
-    fontSize: fontSize.xs,
+    fontSize: 12.5,
     color: colors.text.muted,
+    lineHeight: 18,
   },
 });

@@ -91,6 +91,10 @@ async fn run_idle_loop(
             Ok(()) => break, // graceful stop (shouldn't happen in practice)
             Err(e) => {
                 log::warn!("IDLE session for {account_id} ended: {e}; reconnecting in {backoff:?}");
+                crate::debug_log::record(
+                    "idle",
+                    format!("session for {account_id} ({folder}) ended: {e}; reconnecting in {backoff:?}"),
+                );
                 tokio::time::sleep(backoff).await;
                 backoff = (backoff * 2).min(Duration::from_secs(300));
             }
@@ -194,8 +198,9 @@ async fn run_poll_loop(
 }
 
 /// EXAMINEs the folder to get the current message count, and emits a
-/// `helix://imap-new-mail` event if the count has increased since the last
-/// check. Also resets `last_exists` when the count decreases (expunge).
+/// `new-mail` event (the name App.tsx listens for) if the count has increased
+/// since the last check. Also resets `last_exists` when the count decreases
+/// (expunge).
 async fn emit_if_new_mail(
     session: &mut imap::ImapSession,
     app: &tauri::AppHandle,
@@ -211,8 +216,12 @@ async fn emit_if_new_mail(
 
     if current > *last_exists {
         let new_count = current - *last_exists;
+        crate::debug_log::record(
+            "idle",
+            format!("{new_count} new message(s) in {folder} for {account_id}"),
+        );
         if let Err(e) = app.emit(
-            "helix://imap-new-mail",
+            "new-mail",
             NewMailEvent {
                 account_id: account_id.to_string(),
                 folder: folder.to_string(),
@@ -220,7 +229,7 @@ async fn emit_if_new_mail(
                 new_count,
             },
         ) {
-            log::warn!("could not emit helix://imap-new-mail: {e}");
+            log::warn!("could not emit new-mail: {e}");
         }
     }
 

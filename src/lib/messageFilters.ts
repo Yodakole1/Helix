@@ -1,6 +1,6 @@
 import { calendarDayDiff, type SampleMessage } from "../data/messages";
 
-export type SortKey = "newest" | "oldest";
+export type SortKey = "newest" | "oldest" | "unread";
 export type DateRange = "any" | "today" | "7days" | "30days" | "custom";
 
 function currentYearMonth(): string {
@@ -34,12 +34,10 @@ export const DEFAULT_FILTERS: MessageFilters = {
   hasAttachment: null,
 };
 
-// Just the two: date-based ordering is the only sort that earns its place
-// in the menu (sender/unread groupings are covered by filters and the
-// unread-section setting instead).
 export const SORT_OPTIONS: { key: SortKey; label: string }[] = [
   { key: "newest", label: "Newest first" },
   { key: "oldest", label: "Oldest first" },
+  { key: "unread", label: "Unread first" },
 ];
 
 export const DATE_RANGE_OPTIONS: { key: DateRange; label: string }[] = [
@@ -125,6 +123,12 @@ export function sortMessages<T extends SampleMessage>(messages: T[], sortKey: So
   const sorted = [...messages];
   if (sortKey === "oldest") {
     sorted.sort((a, b) => new Date(a.date).getTime() - new Date(b.date).getTime());
+  } else if (sortKey === "unread") {
+    // Unread above read, newest first inside each group.
+    sorted.sort((a, b) => {
+      if (Boolean(a.unread) !== Boolean(b.unread)) return a.unread ? -1 : 1;
+      return new Date(b.date).getTime() - new Date(a.date).getTime();
+    });
   } else {
     sorted.sort((a, b) => new Date(b.date).getTime() - new Date(a.date).getTime());
   }

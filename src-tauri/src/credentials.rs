@@ -11,7 +11,11 @@ fn entry_for(account_id: &str) -> Result<Entry, String> {
     Entry::new(SERVICE_NAME, account_id).map_err(|e| e.to_string())
 }
 
-#[tauri::command]
+// The synchronous implementations keep their original names so the many
+// internal callers across the backend stay unchanged; the `#[tauri::command]`
+// wrappers below hop onto a blocking thread because keychain access on Linux
+// is a synchronous DBus round trip to the Secret Service -- run directly on
+// the main thread it stalls the whole UI while the keyring answers.
 pub fn store_credential(account_id: String, mut secret: String) -> Result<(), String> {
     let result = entry_for(&account_id)
         .and_then(|entry| entry.set_password(&secret).map_err(|e| e.to_string()));
@@ -19,7 +23,6 @@ pub fn store_credential(account_id: String, mut secret: String) -> Result<(), St
     result
 }
 
-#[tauri::command]
 pub fn get_credential(account_id: String) -> Result<String, String> {
     entry_for(&account_id)?
         .get_password()
@@ -39,11 +42,25 @@ pub(crate) fn get_credential_if_exists(account_id: &str) -> Result<Option<String
     }
 }
 
-#[tauri::command]
 pub fn delete_credential(account_id: String) -> Result<(), String> {
     entry_for(&account_id)?
         .delete_credential()
         .map_err(|e| e.to_string())
+}
+
+#[tauri::command]
+pub async fn store_credential_cmd(account_id: String, secret: String) -> Result<(), String> {
+    crate::run_blocking(move || store_credential(account_id, secret)).await
+}
+
+#[tauri::command]
+pub async fn get_credential_cmd(account_id: String) -> Result<String, String> {
+    crate::run_blocking(move || get_credential(account_id)).await
+}
+
+#[tauri::command]
+pub async fn delete_credential_cmd(account_id: String) -> Result<(), String> {
+    crate::run_blocking(move || delete_credential(account_id)).await
 }
 
 #[cfg(test)]

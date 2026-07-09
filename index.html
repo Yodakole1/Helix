@@ -12,15 +12,24 @@
 
       /* Native widgets (datetime/time pickers, dropdowns) should render in
          their dark variants everywhere -- individual inputs shouldn't have
-         to remember to set colorScheme themselves. */
+         to remember to set colorScheme themselves. The data-theme attribute
+         is stamped by the inline script below (from the same localStorage
+         key src/theme/colors.ts reads) before the app mounts, so native
+         widgets, selection, and scrollbars follow the chosen theme. */
       :root {
         color-scheme: dark;
+      }
+      :root[data-theme="light"] {
+        color-scheme: light;
       }
 
       /* Default selection blue reads as a foreign element against the
          near-black glass theme; a quiet white wash matches every accent. */
       ::selection {
         background: rgba(255, 255, 255, 0.22);
+      }
+      :root[data-theme="light"] ::selection {
+        background: rgba(20, 24, 34, 0.18);
       }
 
       /* Keyboard-only focus ring. react-native-web strips native outlines
@@ -56,6 +65,18 @@
       *::-webkit-scrollbar-thumb:hover {
         background-color: rgba(255, 255, 255, 0.32);
       }
+      :root[data-theme="light"] * {
+        scrollbar-color: rgba(20, 24, 34, 0.25) transparent;
+      }
+      :root[data-theme="light"] *::-webkit-scrollbar-thumb {
+        background-color: rgba(20, 24, 34, 0.25);
+      }
+      :root[data-theme="light"] *::-webkit-scrollbar-thumb:hover {
+        background-color: rgba(20, 24, 34, 0.4);
+      }
+      :root[data-theme="light"] .rte-body.rte-empty::before {
+        color: rgba(20, 24, 34, 0.35);
+      }
 
       /* Rich-text editor placeholder -- shown when the editor is empty and
          not focused. The .rte-empty class is managed by RichTextEditor.tsx. */
@@ -69,6 +90,16 @@
   </head>
   <body>
     <div id="root"></div>
+    <script>
+      // Must run before the app bundle: stamps the saved theme onto <html>
+      // so the CSS above (and native widget rendering) matches the palette
+      // src/theme/colors.ts is about to load for the same key.
+      try {
+        if (localStorage.getItem("helix:theme") === "light") {
+          document.documentElement.dataset.theme = "light";
+        }
+      } catch (e) { /* no storage -- dark default stands */ }
+    </script>
     <script type="module" src="/src/main.tsx"></script>
   </body>
 </html>

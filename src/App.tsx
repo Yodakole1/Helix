@@ -1,7 +1,7 @@
 import { useEffect, useRef, useState } from "react";
 import { Pressable, StyleSheet, Text, View } from "react-native";
 import { listen } from "@tauri-apps/api/event";
-import { isTauri } from "@tauri-apps/api/core";
+import { invoke, isTauri } from "@tauri-apps/api/core";
 import { AddAccountView } from "./components/AddAccountView";
 import { ComposeModal, type ComposePrefill, type MessageTemplate } from "./components/ComposeModal";
 import { MessageList } from "./components/MessageList";
@@ -17,7 +17,7 @@ import { LockScreen } from "./components/LockScreen";
 import { listCardDavSources, type CardDavSource } from "./lib/carddav";
 import { getAppLockConfig, type AppLockConfig } from "./lib/lock";
 import { icalToIso, listCalDavSources, listCalendarEvents, syncCalDav } from "./lib/caldav";
-import { isPermissionGranted, sendNotification } from "@tauri-apps/plugin-notification";
+import { isPermissionGranted } from "@tauri-apps/plugin-notification";
 import { resolveAccountColor, type AccountOverrides } from "./data/accounts";
 import { folderLabel, normalizeFolderId } from "./data/folders";
 import { formatMessageTime, parseFromField, summaryToMessage, type SampleMessage } from "./data/messages";
@@ -34,18 +34,33 @@ import { deleteMessage as deletePop3Message, fetchPop3Message, listMessages, pop
 import { fetchUnifiedInbox, listAccounts as listAccountRecords, reportSpam } from "./lib/account";
 import { listIdentities, listMutedThreads, muteThread, unmuteThread, type IdentitySummary } from "./lib/identities";
 import { parseIcsInvite, respondToInvite, type InviteInfo } from "./lib/ics";
+import { getLaunchMailto, parseMailto } from "./lib/mailto";
 import { startIdle, stopIdle } from "./lib/idle";
+import { notifyNewMail, sendDesktopNotification } from "./lib/notifications";
 import { cancelQueuedSend, flushOutbox, queueForSend } from "./lib/drafts";
 import { trainMessage } from "./lib/bayes";
 import { snoozeMessage, listAllSnoozed, listDueSnoozed, cancelSnooze } from "./lib/snooze";
 import { UndoSendToast } from "./components/UndoSendToast";
+import { StatusToast } from "./components/StatusToast";
 import type { SyncDepth } from "./components/DataStorageSettings";
 import type { Rule } from "./lib/rules";
 import { fileToBase64, sendMdn, type OutgoingAttachment } from "./lib/smtp";
 import { DEFAULT_SHORTCUT_BINDINGS, type ShortcutId } from "./lib/shortcuts";
 import type { WebViewStyle } from "./lib/webStyle";
 import type { AccountId } from "./theme";
-import { colors, withAlpha } from "./theme";
+import {
+  AVATAR_COLOR_STYLE_STORAGE_KEY,
+  type AvatarColorStyle,
+  colors,
+  DEFAULT_AVATAR_COLOR_STYLE,
+  fontFamily,
+  fontSize,
+  radii,
+  spacing,
+  THEME_STORAGE_KEY,
+  themeName,
+  withAlpha,
+} from "./theme";
 
 function clamp(value: number, min: number, max: number): number {
   return Math.min(Math.max(value, min), max);
@@ -235,6 +250,9 @@ export default function App() {
     }
   }
   const [signature, setSignature] = usePersistedJSON<string>("helix:signature", "");
+  // Native webview spell checking in compose (subject + body). On by
+  // default -- it uses the OS dictionaries, nothing bundled or online.
+  const [spellCheck, setSpellCheck] = usePersistedJSON<boolean>("helix:spellCheck", true);
   const [encryptByDefault, setEncryptByDefault] = usePersistedJSON<boolean>("helix:encryptByDefault", false);
   // Unread messages grouped above read ones in the message list.
   const [separateUnread, setSeparateUnread] = usePersistedJSON<boolean>("helix:separateUnread", false);
@@ -244,6 +262,13 @@ export default function App() {
   useEffect(() => {
     (document.body.style as CSSStyleDeclaration & { zoom: string }).zoom = String(fontScale);
   }, [fontScale]);
+  // Avatar letter-circle color style (how loud the per-letter palette is).
+  // Baked into theme's module-level avatarLetterPalette at load, same as
+  // theme itself, so a change here also takes a reload -- see onApply below.
+  const [avatarColorStyle, setAvatarColorStyle] = usePersistedJSON<AvatarColorStyle>(
+    AVATAR_COLOR_STYLE_STORAGE_KEY,
+    DEFAULT_AVATAR_COLOR_STYLE,
+  );
   // Muted thread root Message-IDs, per-account. Loaded from the cache when
   // the active account changes and updated optimistically on mute/unmute.
   const [mutedByAccount, setMutedByAccount] = useState<Record<AccountId, Set<string>>>({});
@@ -255,6 +280,25 @@ export default function App() {
 
   // Send-as identities for the active account, loaded when account changes.
   const [identitiesByAccount, setIdentitiesByAccount] = useState<Record<AccountId, IdentitySummary[]>>({});
+
+  // One-off confirmation toast (attachment downloaded, etc.). Bottom-center,
+  // auto-dismissing; only one shows at a time -- the newest wins.
+  const [statusToast, setStatusToast] = useState<{ message: string; kind: "success" | "error" | "info" } | null>(null);
+
+  // In-app viewer for the reader's attachment "Open" action. Images render
+  // as an <img>; PDFs and text render in an iframe (WebKitGTK ships a
+  // built-in PDF.js viewer since 2.40, so PDFs display without any bundled
+  // viewer of our own). The blob URL is revoked when the viewer closes.
+  const [attachmentPreview, setAttachmentPreview] = useState<
+    { name: string; url: string; kind: "image" | "frame" } | null
+  >(null);
+
+  function closeAttachmentPreview() {
+    setAttachmentPreview((current) => {
+      if (current?.url.startsWith("blob:")) URL.revokeObjectURL(current.url);
+      return null;
+    });
+  }
 
   // Undo-send toast state: set after queue_for_send returns an outbox_id.
   // Cleared when the toast dismisses (countdown expires or Undo pressed).
@@ -493,26 +537,16 @@ export default function App() {
       "new-mail",
       ({ payload }) => {
         // Reload whichever account+folder just got new messages. If the
-        // affected folder is the currently active one the list refreshes
-        // in place; otherwise the count updates silently for when the user
-        // switches to it.
-        loadFolder(payload.account_id as AccountId, payload.folder);
-
-        // Desktop notification for new mail, when the setting is on and the
-        // OS permission was granted. Read from localStorage at event time so
-        // a toggle in Settings applies without restarting.
-        if (localStorage.getItem("helix:notifyNewMail") === "1") {
-          isPermissionGranted()
-            .then((granted) => {
-              if (!granted) return;
-              const count = payload.new_count;
-              sendNotification({
-                title: "New mail",
-                body: `${count} new message${count === 1 ? "" : "s"} in ${folderLabel(payload.folder)} (${payload.account_id})`,
-              });
-            })
-            .catch(() => {});
-        }
+        // affected folder is the currently active one the new messages are
+        // merged into the visible list in place (no full-list replace, no
+        // flash/scroll-reset); otherwise the count updates silently for when
+        // the user switches to it. The notification is built from the
+        // actual newly-merged messages (onMerged), not the event's bare
+        // new_count -- the IDLE event itself carries no sender/subject, only
+        // a count, so that's the only way to show who mail is from.
+        loadFolder(payload.account_id as AccountId, payload.folder, true, (added) => {
+          notifyNewMail(added.map((m) => ({ sender: m.sender, senderEmail: m.senderEmail, subject: m.subject })));
+        });
       },
     );
 
@@ -541,40 +575,65 @@ export default function App() {
   // the grouping the message list re-applies for display; otherwise it does
   // the plain flat fetch. A threaded fetch that fails falls back to the flat
   // path so a server that can't be grouped still shows a usable list.
-  function loadFolder(forAccountId: AccountId, folder: string) {
+  // `merge` distinguishes an initial folder visit (full replace, cache-first
+  // preview while the live fetch is in flight) from a background
+  // reconciliation -- the 60s poll and IDLE's new-mail push -- which should
+  // only append genuinely-new messages via store.mergeMessages rather than
+  // swap out the whole list and flash/reset the view the user is looking at.
+  // `onMerged`, when given, is called with the genuinely-new messages a
+  // merge found (empty if none) -- used to fire a new-mail notification with
+  // real sender/subject content instead of just a count.
+  function loadFolder(
+    forAccountId: AccountId,
+    folder: string,
+    merge = false,
+    onMerged?: (added: SampleMessage[]) => void,
+  ) {
     const rec = getRecord(forAccountId);
     if (!rec) return;
     if (isPop3(rec)) {
-      loadPop3Folder(forAccountId);
+      loadPop3Folder(forAccountId, merge, onMerged);
       return;
     }
     if (conversationView && !unifiedInbox) {
       // Cache-first here too: show the last-cached flat list immediately
       // (regrouping into threads is cheap once the live tree lands) rather
-      // than sitting blank while the threaded fetch is in flight.
+      // than sitting blank while the threaded fetch is in flight. Skipped
+      // for a background reconciliation -- the store already has a live
+      // view, so there's nothing to preview from disk.
       let liveLoaded = false;
-      loadCachedMessages(forAccountId, folder, MESSAGES_LIMIT)
-        .then((summaries) => {
-          if (liveLoaded || summaries.length === 0) return;
-          store.loadMessages(forAccountId, folder, summaries.map((s, i) => summaryToMessage(s, i)));
-        })
-        .catch(() => {});
+      if (!merge) {
+        loadCachedMessages(forAccountId, folder, MESSAGES_LIMIT)
+          .then((summaries) => {
+            if (liveLoaded || summaries.length === 0) return;
+            store.loadMessages(forAccountId, folder, summaries.map((s, i) => summaryToMessage(s, i)));
+          })
+          .catch(() => {});
+      }
 
       const key = `${forAccountId}:${folder}`;
       fetchThreadedMessages(forAccountId, rec.imap_host, rec.imap_port, folder, MESSAGES_LIMIT)
         .then((threads) => {
           liveLoaded = true;
           const { summaries, meta } = buildThreadData(threads);
-          store.loadMessages(forAccountId, folder, summaries.map((s, i) => summaryToMessage(s, i)));
+          const messages = summaries.map((s, i) => summaryToMessage(s, i));
+          if (merge) {
+            const existingIds = new Set(store.getMessages(forAccountId, folder).map((m) => m.id));
+            const added = messages.filter((m) => !existingIds.has(m.id));
+            store.mergeMessages(forAccountId, folder, messages);
+            onMerged?.(added);
+          } else {
+            store.loadMessages(forAccountId, folder, messages);
+          }
           setThreadsByKey((prev) => ({ ...prev, [key]: meta }));
         })
         .catch((e) => {
           console.warn("fetch_threaded_messages failed for", forAccountId, folder, e, "-- falling back to flat");
-          loadFlatFolder(forAccountId, folder);
+          loadFlatFolder(forAccountId, folder, merge, onMerged);
         });
       return;
     }
-    loadFlatFolder(forAccountId, folder);
+    loadFlatFolder(forAccountId, folder, merge, onMerged);
   }
 
   // The flat (non-threaded) fetch. Cache-first: the last-cached summaries
@@ -582,24 +641,40 @@ export default function App() {
   // waiting on a network round trip), and the live IMAP fetch that follows
   // reconciles once it lands, win over the cached view unless it lands
   // first. On a live-fetch failure (offline, server down) the cached view
-  // simply stays put instead of the mailbox going blank.
-  function loadFlatFolder(forAccountId: AccountId, folder: string) {
+  // simply stays put instead of the mailbox going blank. `merge` (background
+  // poll/IDLE reconciliation) skips the cache-first preview and appends only
+  // the new messages instead of replacing the list wholesale.
+  function loadFlatFolder(
+    forAccountId: AccountId,
+    folder: string,
+    merge = false,
+    onMerged?: (added: SampleMessage[]) => void,
+  ) {
     const rec = getRecord(forAccountId);
     if (!rec) return;
 
     let liveLoaded = false;
-    loadCachedMessages(forAccountId, folder, MESSAGES_LIMIT)
-      .then((summaries) => {
-        if (liveLoaded || summaries.length === 0) return;
-        store.loadMessages(forAccountId, folder, summaries.map((s, i) => summaryToMessage(s, i)));
-      })
-      .catch(() => {});
+    if (!merge) {
+      loadCachedMessages(forAccountId, folder, MESSAGES_LIMIT)
+        .then((summaries) => {
+          if (liveLoaded || summaries.length === 0) return;
+          store.loadMessages(forAccountId, folder, summaries.map((s, i) => summaryToMessage(s, i)));
+        })
+        .catch(() => {});
+    }
 
     fetchMessages(forAccountId, rec.imap_host, rec.imap_port, folder, MESSAGES_LIMIT)
       .then((summaries) => {
         liveLoaded = true;
         const messages = summaries.map((s, i) => summaryToMessage(s, i));
-        store.loadMessages(forAccountId, folder, messages);
+        if (merge) {
+          const existingIds = new Set(store.getMessages(forAccountId, folder).map((m) => m.id));
+          const added = messages.filter((m) => !existingIds.has(m.id));
+          store.mergeMessages(forAccountId, folder, messages);
+          onMerged?.(added);
+        } else {
+          store.loadMessages(forAccountId, folder, messages);
+        }
         // Eager body pre-fetch when "bodies" sync depth is selected. Only
         // fires for messages that have a real UID (so they can be fetched)
         // and haven't had their body loaded yet. Best-effort, fires silently.
@@ -625,22 +700,32 @@ export default function App() {
   // message number. On network failure, the cached view (keyed by UIDL,
   // though the number in each row may be stale -- body fetches for offline
   // messages use UIDL via pop3Uidl) simply stays put.
-  function loadPop3Folder(forAccountId: AccountId) {
+  function loadPop3Folder(forAccountId: AccountId, merge = false, onMerged?: (added: SampleMessage[]) => void) {
     const rec = getRecord(forAccountId);
     if (!rec || !rec.pop3_host || rec.pop3_port == null) return;
 
     let liveLoaded = false;
-    loadCachedPop3Messages(forAccountId, MESSAGES_LIMIT)
-      .then((summaries) => {
-        if (liveLoaded || summaries.length === 0) return;
-        store.loadMessages(forAccountId, "INBOX", summaries.map(pop3SummaryToMessage));
-      })
-      .catch(() => {});
+    if (!merge) {
+      loadCachedPop3Messages(forAccountId, MESSAGES_LIMIT)
+        .then((summaries) => {
+          if (liveLoaded || summaries.length === 0) return;
+          store.loadMessages(forAccountId, "INBOX", summaries.map(pop3SummaryToMessage));
+        })
+        .catch(() => {});
+    }
 
     listMessages(forAccountId, rec.pop3_host, rec.pop3_port)
       .then((summaries) => {
         liveLoaded = true;
-        store.loadMessages(forAccountId, "INBOX", summaries.map(pop3SummaryToMessage));
+        const messages = summaries.map(pop3SummaryToMessage);
+        if (merge) {
+          const existingIds = new Set(store.getMessages(forAccountId, "INBOX").map((m) => m.id));
+          const added = messages.filter((m) => !existingIds.has(m.id));
+          store.mergeMessages(forAccountId, "INBOX", messages);
+          onMerged?.(added);
+        } else {
+          store.loadMessages(forAccountId, "INBOX", messages);
+        }
       })
       .catch((e) => {
         console.warn("list_messages (POP3) failed for", forAccountId, e, "-- keeping cached view");
@@ -714,11 +799,11 @@ export default function App() {
           const key = `${event.source_id}:${event.uid}:${event.dtstart}`;
           if (start <= now || start - now > leadMs || notifiedEventsRef.current.has(key)) continue;
           notifiedEventsRef.current.add(key);
-          const at = new Date(iso).toLocaleTimeString([], { hour: "2-digit", minute: "2-digit" });
-          sendNotification({
-            title: "Upcoming event",
-            body: `${event.summary ?? "(untitled event)"} at ${at}${event.location ? ` -- ${event.location}` : ""}`,
-          });
+          const at = new Date(iso).toLocaleTimeString([], { hour: "2-digit", minute: "2-digit", hour12: false });
+          await sendDesktopNotification(
+            "Upcoming event",
+            `${event.summary ?? "(untitled event)"} at ${at}${event.location ? ` -- ${event.location}` : ""}`,
+          );
         }
       } catch (e) {
         console.warn("calendar reminder check failed:", e);
@@ -745,6 +830,45 @@ export default function App() {
       clearInterval(syncTimer);
     };
   }, []);
+
+  // Auto-refresh, Thunderbird-style: the inbox gets pushed to instantly via
+  // IDLE, but every other folder (and servers whose IDLE session dropped)
+  // would otherwise only update on a manual refresh. Poll the folder being
+  // looked at once a minute -- loadFolder merges through the store, so an
+  // unchanged folder repaints identically and the poll is invisible. Also
+  // fires the same new-mail notification IDLE's push does, from the actual
+  // newly-merged messages loadFolder/mergeMessages report back -- this is
+  // what covers new mail arriving while an account's IDLE session has
+  // dropped and not yet reconnected.
+  useEffect(() => {
+    if (!isTauri() || !onboarded || !accountId) return;
+    const folder = selectedFolder[accountId] ?? "INBOX";
+    const timer = setInterval(() => {
+      if (unifiedInbox) {
+        fetchUnifiedInbox(MESSAGES_LIMIT)
+          .then((results) => {
+            const byAccount = new Map<AccountId, SampleMessage[]>();
+            results.forEach((r, i) => {
+              const list = byAccount.get(r.account_id) ?? [];
+              list.push(summaryToMessage(r, i));
+              byAccount.set(r.account_id, list);
+            });
+            for (const [account, messages] of byAccount.entries()) {
+              const existingIds = new Set(store.getMessages(account, "INBOX").map((m) => m.id));
+              const added = messages.filter((m) => !existingIds.has(m.id));
+              store.mergeMessages(account, "INBOX", messages);
+              notifyNewMail(added.map((m) => ({ sender: m.sender, senderEmail: m.senderEmail, subject: m.subject })));
+            }
+          })
+          .catch(() => {});
+      } else {
+        loadFolder(accountId, folder, true, (added) => {
+          notifyNewMail(added.map((m) => ({ sender: m.sender, senderEmail: m.senderEmail, subject: m.subject })));
+        });
+      }
+    }, 60_000);
+    return () => clearInterval(timer);
+  }, [accountId, selectedFolder[accountId], unifiedInbox, onboarded]);
 
   // Load muted threads for the active account whenever it changes so the
   // mute indicator in the reader pane reflects the real persisted state.
@@ -786,6 +910,30 @@ export default function App() {
       })
       .catch(console.warn);
   }, [accountId]);
+
+  // When Helix is the system's mailto: handler, a clicked link launches it
+  // with the URL as a command-line argument -- open compose pre-filled once
+  // accounts are ready. Consumed once per app run.
+  const launchMailtoHandled = useRef(false);
+  useEffect(() => {
+    if (!isTauri() || !onboarded || launchMailtoHandled.current) return;
+    launchMailtoHandled.current = true;
+    getLaunchMailto()
+      .then((url) => {
+        if (!url) return;
+        const fields = parseMailto(url);
+        if (!fields) return;
+        setComposePrefill({
+          to: fields.to,
+          cc: fields.cc.length > 0 ? fields.cc : undefined,
+          subject: fields.subject,
+          quote: fields.body,
+        });
+        setComposeFromAccountId(accounts[0]?.id ?? null);
+        setComposeOpen(true);
+      })
+      .catch(() => {});
+  }, [onboarded]);
 
   // Load send-as identities for the active account so the compose From:
   // picker is populated with the real alias list.
@@ -1267,15 +1415,52 @@ export default function App() {
     }
   }
 
-  // The first arg is the IMAP UID for IMAP accounts and the POP3 message
-  // number for POP3 accounts (ReaderPane passes whichever the message has).
-  // Falls back to the cached copy for IMAP when offline.
-  async function handleDownloadAttachment(uidOrNumber: number, attachmentIndex: number) {
+  // Resolves an attachment's bytes cache-first: the encrypted local cache
+  // answers instantly for anything fetched before, and only a cache miss
+  // pays for a fresh IMAP/POP3 round trip (which then write-through-caches
+  // for next time). The uidOrNumber arg is the IMAP UID for IMAP accounts
+  // and the POP3 message number for POP3 (ReaderPane passes whichever the
+  // message has).
+  async function fetchAttachmentContent(
+    uidOrNumber: number,
+    attachmentIndex: number,
+  ): Promise<{ content_base64: string; content_type: string | null; filename: string | null }> {
     const rec = getRecord(accountId);
-    if (!rec) return;
-    const folder = selectedFolder[accountId];
+    if (!rec) throw new Error("No active account record");
+    const folder = selectedFolder[accountId] ?? "INBOX";
+    const selectedMsg = store.findMessage(accountId, folder, selectedId);
 
-    function triggerDownload(content: { content_base64: string; content_type: string | null; filename: string | null }) {
+    if (isPop3(rec) && rec.pop3_host && rec.pop3_port != null) {
+      const uidl = selectedMsg?.pop3Uidl;
+      if (uidl) {
+        const cached = await loadCachedPop3Attachment(accountId, uidl, attachmentIndex).catch(() => null);
+        if (cached) return cached;
+      }
+      return pop3FetchAttachment(accountId, rec.pop3_host, rec.pop3_port, uidOrNumber, attachmentIndex);
+    }
+
+    const cached = await loadCachedAttachment(accountId, folder, uidOrNumber, attachmentIndex).catch(() => null);
+    if (cached) return cached;
+    return fetchAttachment(accountId, rec.imap_host, rec.imap_port, folder, uidOrNumber, attachmentIndex);
+  }
+
+  // Download: writes into the OS Downloads folder (the webview has no
+  // download manager of its own) and confirms with a toast; browser dev
+  // mode falls back to a plain anchor download. A progress toast shows
+  // immediately so a slow first fetch doesn't look like a dead button.
+  async function handleDownloadAttachment(uidOrNumber: number, attachmentIndex: number) {
+    setStatusToast({ message: "Downloading attachment…", kind: "info" });
+    try {
+      const content = await fetchAttachmentContent(uidOrNumber, attachmentIndex);
+      const filename = content.filename ?? "attachment";
+      if (isTauri()) {
+        const path = await invoke<string>("save_to_downloads", {
+          filename,
+          contentBase64: content.content_base64,
+        });
+        setStatusToast({ message: `Downloaded "${filename}" to ${path}`, kind: "success" });
+        return;
+      }
       const bytes = atob(content.content_base64);
       const array = new Uint8Array(bytes.length);
       for (let i = 0; i < bytes.length; i++) array[i] = bytes.charCodeAt(i);
@@ -1283,36 +1468,63 @@ export default function App() {
       const url = URL.createObjectURL(blob);
       const a = document.createElement("a");
       a.href = url;
-      a.download = content.filename ?? "attachment";
+      a.download = filename;
       a.click();
       URL.revokeObjectURL(url);
-    }
-
-    const selectedMsg = store.findMessage(accountId, selectedFolder[accountId] ?? "INBOX", selectedId);
-    try {
-      if (isPop3(rec) && rec.pop3_host && rec.pop3_port != null) {
-        const content = await pop3FetchAttachment(accountId, rec.pop3_host, rec.pop3_port, uidOrNumber, attachmentIndex)
-          .catch(async (liveErr) => {
-            const uidl = selectedMsg?.pop3Uidl;
-            if (!uidl) throw liveErr;
-            console.warn("pop3_fetch_attachment failed:", liveErr, "-- trying cache");
-            const cached = await loadCachedPop3Attachment(accountId, uidl, attachmentIndex);
-            if (!cached) throw liveErr;
-            return cached;
-          });
-        triggerDownload(content);
-      } else {
-        const content = await fetchAttachment(accountId, rec.imap_host, rec.imap_port, folder, uidOrNumber, attachmentIndex)
-          .catch(async (liveErr) => {
-            console.warn("fetch_attachment failed:", liveErr, "-- trying cache");
-            const cached = await loadCachedAttachment(accountId, folder, uidOrNumber, attachmentIndex);
-            if (!cached) throw liveErr;
-            return cached;
-          });
-        triggerDownload(content);
-      }
+      setStatusToast({ message: `Downloaded "${filename}"`, kind: "success" });
     } catch (e) {
-      console.warn("fetch_attachment failed (no cache fallback):", e);
+      console.warn("attachment download failed:", e);
+      setStatusToast({ message: "Download failed -- could not fetch the attachment.", kind: "error" });
+    }
+  }
+
+  // Open: view the attachment without a trip to the Downloads folder.
+  // Images, PDFs, and text open in-app (the viewer overlay) so reading a
+  // document never requires a trip to the Downloads folder; anything the
+  // webview can't render is staged to a temp file and handed to the OS's
+  // default application for its type.
+  async function handleOpenAttachment(uidOrNumber: number, attachmentIndex: number) {
+    setStatusToast({ message: "Opening attachment…", kind: "info" });
+    try {
+      const content = await fetchAttachmentContent(uidOrNumber, attachmentIndex);
+      const type = content.content_type ?? "application/octet-stream";
+      const name = content.filename ?? "attachment";
+
+      if (type.startsWith("image/")) {
+        setAttachmentPreview({ name, url: `data:${type};base64,${content.content_base64}`, kind: "image" });
+        setStatusToast(null);
+        return;
+      }
+
+      const viewableInFrame =
+        type === "application/pdf" || (type.startsWith("text/") && type !== "text/calendar");
+      if (viewableInFrame) {
+        const bytes = atob(content.content_base64);
+        const array = new Uint8Array(bytes.length);
+        for (let i = 0; i < bytes.length; i++) array[i] = bytes.charCodeAt(i);
+        // text/html from a mail attachment must never render live -- show
+        // it as plain text instead of executing someone's markup.
+        const frameType = type === "text/html" ? "text/plain" : type;
+        const url = URL.createObjectURL(new Blob([array], { type: frameType }));
+        setAttachmentPreview({ name, url, kind: "frame" });
+        setStatusToast(null);
+        return;
+      }
+
+      if (isTauri()) {
+        await invoke<string>("open_attachment", { filename: name, contentBase64: content.content_base64 });
+        setStatusToast({ message: `Opened "${name}" with your system viewer.`, kind: "success" });
+        return;
+      }
+      const bytes = atob(content.content_base64);
+      const array = new Uint8Array(bytes.length);
+      for (let i = 0; i < bytes.length; i++) array[i] = bytes.charCodeAt(i);
+      const url = URL.createObjectURL(new Blob([array], { type }));
+      window.open(url, "_blank");
+      setStatusToast(null);
+    } catch (e) {
+      console.warn("attachment open failed:", e);
+      setStatusToast({ message: "Could not open the attachment.", kind: "error" });
     }
   }
 
@@ -1608,6 +1820,7 @@ export default function App() {
 
   const isMuted = mutedByAccount[accountId]?.has(selectedMessage?.messageId ?? "") ?? false;
   const isSpamFolder = normalizeFolderId(currentFolder) === "spam";
+  const isArchiveFolder = normalizeFolderId(currentFolder) === "archive";
 
   const readerPaneProps = {
     accountId,
@@ -1620,8 +1833,11 @@ export default function App() {
     onAllowImageDomain: handleAllowImageDomain,
     isMuted,
     isSpamFolder,
+    // In the archive folder the Archive button flips to Unarchive -- moving
+    // the message back to the inbox instead of re-archiving it in place.
+    isArchiveFolder,
     onToggleStar: handleToggleStar,
-    onArchive: (id: number) => handleMoveMessage(id, "archive"),
+    onArchive: (id: number) => handleMoveMessage(id, isArchiveFolder ? "INBOX" : "archive"),
     onMoveToSpam: (id: number) => handleMoveMessage(id, "spam"),
     onDelete: (id: number) => handleMoveMessage(id, "trash"),
     onMarkUnread: handleMarkUnread,
@@ -1631,6 +1847,7 @@ export default function App() {
     onReplyAll: handleReplyAll,
     onForward: handleForward,
     onDownloadAttachment: handleDownloadAttachment,
+    onOpenAttachment: handleOpenAttachment,
     onMuteThread: handleMuteThread,
     onFetchSource,
     onFetchInvite: isTauri() ? handleFetchInvite : undefined,
@@ -1836,6 +2053,7 @@ export default function App() {
         identities={identitiesByAccount[composeFromAccountId ?? accountId] ?? []}
         signature={signature}
         encryptByDefault={encryptByDefault}
+        spellCheck={spellCheck}
         prefill={composePrefill}
         templates={templates}
         onSaveTemplate={handleSaveTemplate}
@@ -1853,6 +2071,48 @@ export default function App() {
           };
         })()}
       />
+      {attachmentPreview && (
+        <Pressable style={styles.previewBackdrop} onPress={closeAttachmentPreview}>
+          {/* Stop backdrop-dismiss from firing when the click lands on the
+              viewer itself (scrolling a PDF shouldn't close it). */}
+          <Pressable style={styles.previewFrame} onPress={() => {}}>
+            {attachmentPreview.kind === "image" ? (
+              <img
+                src={attachmentPreview.url}
+                alt={attachmentPreview.name}
+                style={{ maxWidth: "100%", maxHeight: "78vh", borderRadius: 8, display: "block" }}
+              />
+            ) : (
+              <iframe
+                src={attachmentPreview.url}
+                title={attachmentPreview.name}
+                style={{
+                  width: "min(880px, 80vw)",
+                  height: "78vh",
+                  border: "none",
+                  borderRadius: 8,
+                  background: "#FFFFFF",
+                  display: "block",
+                }}
+              />
+            )}
+            <View style={styles.previewCaptionRow}>
+              <Text style={styles.previewCaption} numberOfLines={1}>{attachmentPreview.name}</Text>
+              <Pressable onPress={closeAttachmentPreview}>
+                <Text style={[styles.previewClose, { color: accentColor || "#00BCD4" }]}>Close</Text>
+              </Pressable>
+            </View>
+          </Pressable>
+        </Pressable>
+      )}
+      {statusToast && (
+        <StatusToast
+          message={statusToast.message}
+          kind={statusToast.kind}
+          accentColor={accentColor || "#00BCD4"}
+          onDismiss={() => setStatusToast(null)}
+        />
+      )}
       {undoSendState && (
         <UndoSendToast
           outboxId={undoSendState.outboxId}
@@ -1888,8 +2148,11 @@ export default function App() {
           readReceipts,
           encryptByDefault,
           signature,
+          spellCheck,
           syncDepth,
           fontScale,
+          theme: themeName,
+          avatarColorStyle,
         }}
         onApply={(v) => {
           setCompactList(v.compactList);
@@ -1900,8 +2163,18 @@ export default function App() {
           setReadReceipts(v.readReceipts);
           setEncryptByDefault(v.encryptByDefault);
           setSignature(v.signature);
+          setSpellCheck(v.spellCheck);
           setSyncDepth(v.syncDepth);
           setFontScale(v.fontScale);
+          // Both are baked into module-level state at load, so either one
+          // changing takes a reload; every other setting above is already
+          // persisted by its own setter before the reload fires.
+          const avatarStyleChanged = v.avatarColorStyle !== avatarColorStyle;
+          if (avatarStyleChanged) setAvatarColorStyle(v.avatarColorStyle);
+          if (v.theme !== themeName || avatarStyleChanged) {
+            localStorage.setItem(THEME_STORAGE_KEY, v.theme);
+            window.location.reload();
+          }
         }}
         onAddAccount={openAddAccount}
         templates={templates}
@@ -1989,5 +2262,42 @@ const styles = StyleSheet.create({
   },
   menuButtonText: {
     fontSize: 14,
+  },
+  previewBackdrop: {
+    position: "absolute",
+    top: 0,
+    left: 0,
+    right: 0,
+    bottom: 0,
+    alignItems: "center",
+    justifyContent: "center",
+    backgroundColor: "rgba(0,0,0,0.72)",
+    zIndex: 9998,
+  },
+  previewFrame: {
+    maxWidth: "86%",
+    padding: spacing.md,
+    borderRadius: radii.lg,
+    backgroundColor: colors.background.panel,
+    borderWidth: 1,
+    borderColor: colors.border.subtle,
+  },
+  previewCaptionRow: {
+    flexDirection: "row",
+    alignItems: "center",
+    justifyContent: "space-between",
+    gap: spacing.md,
+    marginTop: spacing.sm,
+  },
+  previewCaption: {
+    flex: 1,
+    fontFamily: fontFamily.mono,
+    fontSize: fontSize.xs,
+    color: colors.text.secondary,
+  },
+  previewClose: {
+    fontFamily: fontFamily.ui,
+    fontSize: fontSize.sm,
+    fontWeight: "700",
   },
 });

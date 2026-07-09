@@ -15,7 +15,7 @@ import {
 } from "../lib/messageFilters";
 import { glassPanel } from "../lib/webStyle";
 import type { AccountId } from "../theme";
-import { colorForKey, colors, fontFamily, fontSize, radii, spacing, withAlpha } from "../theme";
+import { colorForLetter, colors, fontFamily, fontSize, radii, spacing, withAlpha } from "../theme";
 import { FloatingPortal } from "./FloatingPortal";
 import { ListIcon } from "./ListIcon";
 import { Tooltip } from "./Tooltip";
@@ -207,7 +207,8 @@ export function MessageList({
     // both hold a message with the same uid.
     const selected = item.id === selectedId && item.accountId === accountId && item.folder === folder;
     const checked = selectedIds.has(item.id);
-    const avatarColor = colorForKey(item.senderEmail || item.sender);
+    const avatarInitial = (item.sender || "?").charAt(0).toUpperCase();
+    const avatarColor = colorForLetter(avatarInitial);
     const attachment = item.realAttachments?.[0];
     const extraAttachments = (item.realAttachments?.length ?? 0) - 1;
     const otherFolderLabel = searchActive && item.folder !== folder ? folderLabel(item.folder) : undefined;
@@ -259,7 +260,7 @@ export function MessageList({
           ]}
         >
           <View style={[styles.avatar, compact && styles.avatarCompact, { backgroundColor: avatarColor }]}>
-            <Text style={styles.avatarText}>{(item.sender || "?").charAt(0).toUpperCase()}</Text>
+            <Text style={styles.avatarText}>{avatarInitial}</Text>
           </View>
           <View style={styles.rowContent}>
             <View style={styles.rowTop}>
@@ -319,6 +320,17 @@ export function MessageList({
 
   return (
     <View style={[styles.pane, { width }]}>
+      {/* The blur lives on its own static, childless layer behind
+          everything else. It used to sit directly on `pane`, which made
+          it an ancestor of the actively-scrolling FlatList -- WebKitGTK's
+          software compositor (the fallback path forced by the DMA-BUF
+          opt-out in main.rs, needed to kill the black-cube artifact)
+          recomputes an ancestor's backdrop-filter blur on every descendant
+          repaint, so every scrolled row triggered a blur recompute and
+          left the previous frame's row text ghosted underneath. Splitting
+          the blur onto a layer with nothing scrolling inside it means
+          scrolling the list no longer touches the blurred layer at all. */}
+      <View style={styles.paneBackdrop} />
       <View style={styles.header}>
         <View style={styles.headerTop}>
           <View style={styles.titleGroup}>
@@ -444,7 +456,7 @@ export function MessageList({
         showsVerticalScrollIndicator={false}
         ListEmptyComponent={
           <View style={styles.emptyState}>
-            <svg width={28} height={28} viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth={1.4} strokeLinecap="round" strokeLinejoin="round" style={{ color: "rgba(255,255,255,0.1)", marginBottom: 8 }}>
+            <svg width={28} height={28} viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth={1.4} strokeLinecap="round" strokeLinejoin="round" style={{ color: colors.border.subtle, marginBottom: 8 }}>
               {allMessages.length === 0
                 ? <><rect x="2" y="5" width="20" height="14" rx="2" /><polyline points="2 5 12 13 22 5" /></>
                 : <><circle cx="11" cy="11" r="8" /><line x1="21" y1="21" x2="16.65" y2="16.65" /></>}
@@ -464,9 +476,19 @@ const paneGlass = glassPanel(colors.background.surface, 0.4, 24);
 const styles = StyleSheet.create({
   pane: {
     height: "100%",
-    ...paneGlass,
+    position: "relative",
     borderRightWidth: 1,
     borderRightColor: colors.border.strong,
+  },
+  // Carries the blur alone, behind everything, with no children of its own
+  // -- see the comment where this is rendered for why that matters.
+  paneBackdrop: {
+    position: "absolute",
+    top: 0,
+    left: 0,
+    right: 0,
+    bottom: 0,
+    ...paneGlass,
   },
   header: {
     paddingHorizontal: spacing.lg,

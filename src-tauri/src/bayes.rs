@@ -196,7 +196,7 @@ fn score_text_inner(conn: &Connection, text: &str) -> Result<bool, String> {
 /// as spam or confirms it's legitimate. Each unique token counts once regardless of how many
 /// times it appears in the text.
 #[tauri::command]
-pub fn train_message(text: String, is_spam: bool) -> Result<(), String> {
+pub async fn train_message(text: String, is_spam: bool) -> Result<(), String> {
     let tokens = tokenize(&text);
     if tokens.is_empty() {
         return Ok(());
@@ -211,7 +211,7 @@ pub fn train_message(text: String, is_spam: bool) -> Result<(), String> {
 /// `was_spam` must match what `train_message` was originally called with.
 /// Over-retracting is safe — counts floor at 0.
 #[tauri::command]
-pub fn retract_message(text: String, was_spam: bool) -> Result<(), String> {
+pub async fn retract_message(text: String, was_spam: bool) -> Result<(), String> {
     let tokens = tokenize(&text);
     if tokens.is_empty() {
         return Ok(());
@@ -225,7 +225,7 @@ pub fn retract_message(text: String, was_spam: bool) -> Result<(), String> {
 /// Returns the raw probability [0.0–1.0] without applying the classification threshold.
 /// Returns 0.0 when the model is undertrained.
 #[tauri::command]
-pub fn get_spam_score(text: String) -> Result<f64, String> {
+pub async fn get_spam_score(text: String) -> Result<f64, String> {
     let conn = cache::open()?;
     let (total_spam, total_ham) = db_stats(&conn)?;
     if total_spam < MIN_SPAM_MSGS || total_ham < MIN_HAM_MSGS {
@@ -250,7 +250,7 @@ pub fn get_spam_score(text: String) -> Result<f64, String> {
 /// Returns training corpus size. The frontend uses this to show a "needs training" notice
 /// when spam_messages < 10 or ham_messages < 10.
 #[tauri::command]
-pub fn get_bayes_stats() -> Result<BayesStats, String> {
+pub async fn get_bayes_stats() -> Result<BayesStats, String> {
     let conn = cache::open()?;
     let (spam_messages, ham_messages) = db_stats(&conn)?;
     let distinct_tokens: i64 = conn

@@ -67,7 +67,11 @@ fn verify_lock_hash(password: &str, hash: &str) -> bool {
 // -- commands ----------------------------------------------------------------
 
 #[tauri::command]
-pub fn get_app_lock_config() -> Result<AppLockConfig, String> {
+pub async fn get_app_lock_config() -> Result<AppLockConfig, String> {
+    crate::run_blocking(get_app_lock_config_blocking).await
+}
+
+fn get_app_lock_config_blocking() -> Result<AppLockConfig, String> {
     let password_set = credentials::get_credential(LOCK_PASSWORD_ENTRY.to_string()).is_ok();
     let passkey_set = cache::open()
         .and_then(|conn| cache::get_app_lock_passkey(&conn))
@@ -81,7 +85,11 @@ pub fn get_app_lock_config() -> Result<AppLockConfig, String> {
 }
 
 #[tauri::command]
-pub fn set_app_lock_password(mut password: String) -> Result<(), String> {
+pub async fn set_app_lock_password(password: String) -> Result<(), String> {
+    crate::run_blocking(move || set_app_lock_password_blocking(password)).await
+}
+
+fn set_app_lock_password_blocking(mut password: String) -> Result<(), String> {
     if password.len() < 4 {
         password.zeroize();
         return Err("the lock password needs at least 4 characters".to_string());
@@ -92,12 +100,16 @@ pub fn set_app_lock_password(mut password: String) -> Result<(), String> {
 }
 
 #[tauri::command]
-pub fn clear_app_lock_password() -> Result<(), String> {
-    credentials::delete_credential(LOCK_PASSWORD_ENTRY.to_string())
+pub async fn clear_app_lock_password() -> Result<(), String> {
+    crate::run_blocking(|| credentials::delete_credential(LOCK_PASSWORD_ENTRY.to_string())).await
 }
 
 #[tauri::command]
-pub fn verify_app_lock_password(mut password: String) -> Result<bool, String> {
+pub async fn verify_app_lock_password(password: String) -> Result<bool, String> {
+    crate::run_blocking(move || verify_app_lock_password_blocking(password)).await
+}
+
+fn verify_app_lock_password_blocking(mut password: String) -> Result<bool, String> {
     let hash = credentials::get_credential(LOCK_PASSWORD_ENTRY.to_string())?;
     let ok = verify_lock_hash(&password, &hash);
     password.zeroize();
@@ -105,9 +117,12 @@ pub fn verify_app_lock_password(mut password: String) -> Result<bool, String> {
 }
 
 #[tauri::command]
-pub fn clear_app_lock_passkey() -> Result<(), String> {
-    let conn = cache::open()?;
-    cache::clear_app_lock_passkey(&conn)
+pub async fn clear_app_lock_passkey() -> Result<(), String> {
+    crate::run_blocking(|| {
+        let conn = cache::open()?;
+        cache::clear_app_lock_passkey(&conn)
+    })
+    .await
 }
 
 /// Enrolls the connected FIDO2 key: MakeCredential against the local RP id,
@@ -115,7 +130,12 @@ pub fn clear_app_lock_passkey() -> Result<(), String> {
 /// `pin` is the security key's own PIN, needed only if the key has one set.
 #[cfg(feature = "passkey")]
 #[tauri::command]
-pub fn register_app_lock_passkey(pin: Option<String>) -> Result<(), String> {
+pub async fn register_app_lock_passkey(pin: Option<String>) -> Result<(), String> {
+    crate::run_blocking(move || register_app_lock_passkey_blocking(pin)).await
+}
+
+#[cfg(feature = "passkey")]
+fn register_app_lock_passkey_blocking(pin: Option<String>) -> Result<(), String> {
     use ctap_hid_fido2::fidokey::MakeCredentialArgsBuilder;
     use ctap_hid_fido2::{verifier, Cfg, FidoKeyHidFactory};
 
@@ -150,7 +170,12 @@ pub fn register_app_lock_passkey(pin: Option<String>) -> Result<(), String> {
 /// Returns true on a valid assertion (i.e. unlock granted).
 #[cfg(feature = "passkey")]
 #[tauri::command]
-pub fn passkey_unlock(pin: Option<String>) -> Result<bool, String> {
+pub async fn passkey_unlock(pin: Option<String>) -> Result<bool, String> {
+    crate::run_blocking(move || passkey_unlock_blocking(pin)).await
+}
+
+#[cfg(feature = "passkey")]
+fn passkey_unlock_blocking(pin: Option<String>) -> Result<bool, String> {
     use ctap_hid_fido2::fidokey::GetAssertionArgsBuilder;
     use ctap_hid_fido2::{verifier, Cfg, FidoKeyHidFactory};
 
@@ -184,14 +209,14 @@ pub fn passkey_unlock(pin: Option<String>) -> Result<bool, String> {
 
 #[cfg(not(feature = "passkey"))]
 #[tauri::command]
-pub fn register_app_lock_passkey(pin: Option<String>) -> Result<(), String> {
+pub async fn register_app_lock_passkey(pin: Option<String>) -> Result<(), String> {
     let _ = pin;
     Err("this build has no passkey support -- rebuild with `--features passkey` (needs libudev-dev on Linux)".to_string())
 }
 
 #[cfg(not(feature = "passkey"))]
 #[tauri::command]
-pub fn passkey_unlock(pin: Option<String>) -> Result<bool, String> {
+pub async fn passkey_unlock(pin: Option<String>) -> Result<bool, String> {
     let _ = pin;
     Err("this build has no passkey support -- rebuild with `--features passkey` (needs libudev-dev on Linux)".to_string())
 }

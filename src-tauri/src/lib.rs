@@ -1,23 +1,43 @@
 mod account;
+mod account_import;
 mod bayes;
 mod cache;
 mod caldav;
 mod carddav;
 mod credentials;
+mod debug_log;
 mod discovery;
 mod drafts;
+mod files;
 mod ics;
 mod idle;
 mod identities;
 mod imap;
 mod lock;
 mod mailstore;
+mod mailto;
+mod notifications;
 mod oauth;
 mod pgp;
 mod pop3;
 mod smime;
 mod smtp;
 mod snooze;
+mod thunderbird_import;
+
+/// Runs a blocking closure on the runtime's dedicated blocking thread pool
+/// and flattens the join error into the command's error string. Synchronous
+/// Tauri commands execute on the main thread, which on Linux is also the GTK
+/// event loop -- any command doing blocking work (network, keychain DBus,
+/// Argon2, key generation) must hop through this instead or the whole window
+/// stops responding while it runs.
+pub(crate) async fn run_blocking<T: Send + 'static>(
+    f: impl FnOnce() -> Result<T, String> + Send + 'static,
+) -> Result<T, String> {
+    tauri::async_runtime::spawn_blocking(f)
+        .await
+        .map_err(|e| format!("background task failed: {e}"))?
+}
 
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
 pub fn run() {
@@ -42,8 +62,9 @@ pub fn run() {
       Ok(())
     })
     .invoke_handler(tauri::generate_handler![
-      credentials::store_credential,
-      credentials::delete_credential,
+      credentials::store_credential_cmd,
+      credentials::get_credential_cmd,
+      credentials::delete_credential_cmd,
       imap::list_folders,
       imap::fetch_messages,
       imap::fetch_threaded_messages,
@@ -67,16 +88,24 @@ pub fn run() {
       imap::list_subscribed_folders,
       account::add_account,
       account::add_oauth_account,
+      account::reauthorize_oauth_account,
       account::add_pop3_account,
       account::update_account,
       account::list_accounts,
       account::remove_account,
       account::fetch_unified_inbox,
       account::report_spam,
+      account_import::import_accounts_file,
+      thunderbird_import::discover_thunderbird_accounts,
       smtp::send_message,
       smtp::send_mdn,
       discovery::discover_server_config,
       oauth::oauth_provider_info,
+      files::save_to_downloads,
+      files::open_attachment,
+      mailto::is_default_mail_client,
+      mailto::set_default_mail_client,
+      mailto::get_launch_mailto,
       mailstore::import_mbox,
       mailstore::import_eml_files,
       mailstore::export_folder_mbox,
@@ -108,6 +137,7 @@ pub fn run() {
       pgp::delete_own_key,
       pgp::delete_contact_key,
       pgp::discover_pgp_key_wkd,
+      pgp::ensure_contact_key_wkd,
       drafts::save_draft,
       drafts::list_drafts,
       drafts::get_draft,
@@ -159,6 +189,7 @@ pub fn run() {
       carddav::discover_carddav,
       caldav::add_caldav_source,
       caldav::list_caldav_sources,
+      caldav::update_caldav_source_color,
       caldav::delete_caldav_source,
       caldav::sync_caldav,
       caldav::discover_caldav,
@@ -166,6 +197,9 @@ pub fn run() {
       caldav::create_event,
       caldav::update_event,
       caldav::delete_event,
+      debug_log::get_debug_log,
+      debug_log::clear_debug_log,
+      notifications::send_desktop_notification,
     ])
     .run(tauri::generate_context!())
     .expect("error while running tauri application");

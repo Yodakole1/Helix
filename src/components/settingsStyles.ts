@@ -10,7 +10,7 @@ import { colors, fontFamily, fontSize, radii, spacing } from "../theme";
 export const settingsStyles = StyleSheet.create({
   sectionTitle: {
     fontFamily: fontFamily.ui,
-    fontSize: fontSize.xs,
+    fontSize: 12,
     fontWeight: "600",
     color: colors.text.muted,
     textTransform: "uppercase",
@@ -20,9 +20,9 @@ export const settingsStyles = StyleSheet.create({
   },
   hint: {
     fontFamily: fontFamily.ui,
-    fontSize: fontSize.xs,
+    fontSize: 12.5,
     color: colors.text.muted,
-    lineHeight: 18,
+    lineHeight: 19,
     marginBottom: spacing.md,
   },
   error: {
@@ -33,7 +33,7 @@ export const settingsStyles = StyleSheet.create({
   },
   label: {
     fontFamily: fontFamily.ui,
-    fontSize: fontSize.xs,
+    fontSize: 12.5,
     color: colors.text.secondary,
     marginBottom: spacing.xs,
   },
@@ -105,14 +105,15 @@ export const settingsStyles = StyleSheet.create({
   },
   settingLabel: {
     fontFamily: fontFamily.ui,
-    fontSize: fontSize.sm,
+    fontSize: 15,
     fontWeight: "600",
     color: colors.text.primary,
     marginBottom: 2,
   },
   settingDescription: {
     fontFamily: fontFamily.ui,
-    fontSize: fontSize.xs,
+    fontSize: 12.5,
     color: colors.text.muted,
+    lineHeight: 18,
   },
 });

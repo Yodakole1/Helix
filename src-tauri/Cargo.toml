@@ -68,6 +68,11 @@ passkey = ["dep:ctap-hid-fido2"]
 
 [target.'cfg(target_os = "linux")'.dependencies]
 keyring = { version = "3", features = ["sync-secret-service"] }
+# Desktop notifications are sent over one process-lifetime DBus connection
+# (see notifications.rs for why the notification plugin's per-call
+# connection never produced a visible banner on GNOME). Already in the
+# dependency tree via notify-rust, so this adds no new transitive code.
+zbus = "5"
 
 [target.'cfg(target_os = "macos")'.dependencies]
 keyring = { version = "3", features = ["apple-native"] }

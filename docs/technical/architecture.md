@@ -132,6 +132,34 @@ which the UI surfaces as an inline error rather than crashing.
 There is no account list, IMAP/SMTP sync, or persistence layer yet --
 connecting an account today stores a credential and nothing else.
 
+## Tauri commands must never block the main thread
+
+In Tauri 2, a command declared as a plain `fn` executes on the app's main
+thread -- which on Linux is also the GTK event loop that paints the window
+and answers the compositor's "are you alive?" pings. Any blocking work in a
+sync command (network I/O, a keychain DBus round trip, SQLCipher's key
+derivation on every `cache::open()`, Argon2 hashing, RSA key generation)
+freezes the entire UI while it runs; long enough, and GNOME overlays the
+window with "Application is not responding / Force Quit". That exact
+symptom shipped for a while: CalDAV/CardDAV sync used `reqwest::blocking`
+inside sync commands, so every background calendar re-sync (a 15-minute
+timer in `App.tsx`) stalled the event loop for the whole round trip.
+
+The rule now: **every command is `async`**. Commands whose body is genuinely
+blocking-and-slow (the DAV modules' `reqwest::blocking` calls, `lock.rs`'s
+Argon2/FIDO2 work, `pgp::generate_keypair`, `credentials.rs`'s keychain
+access, `files::save_to_downloads`) hop through `crate::run_blocking()`
+(`lib.rs`), a thin wrapper over `tauri::async_runtime::spawn_blocking` --
+the dedicated blocking pool exists precisely so this work doesn't tie up
+the async runtime's core threads that all IMAP/SMTP futures share. Quick
+DB-only commands (cache reads, contact/identity/snooze CRUD) are plain
+`async fn`: the whole body runs in one poll on a runtime worker, which is
+off the main thread and short enough not to matter. `credentials.rs` keeps
+its original sync functions for the many internal Rust callers and exposes
+`*_cmd` async wrappers as the actual Tauri commands. A new command should
+never be a bare sync `fn` unless it provably does nothing but move a few
+bytes in memory.
+
 ## A note on react-native-svg
 
 Small icons (e.g. `src/components/FolderIcon.tsx`, the sidebar's folder

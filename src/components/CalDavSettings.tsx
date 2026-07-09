@@ -19,6 +19,7 @@ import {
   listCalendarEvents,
   syncCalDav,
 } from "../lib/caldav";
+import { emitCalendarBus } from "../lib/calendarBus";
 import { colors, fontFamily, withAlpha } from "../theme";
 
 // ── Helpers ───────────────────────────────────────────────────────────────────
@@ -136,10 +137,12 @@ function AddSourceForm({
   const set = (k: keyof AddFormState) => (v: string) =>
     setForm((f) => ({ ...f, [k]: v }));
 
-  // Server to discover against: what was typed, or the domain of an
-  // email-style username -- so "you@example.com" + password is enough.
-  const effectiveHost =
-    form.host.trim() || (form.username.includes("@") ? form.username.split("@")[1].trim() : "");
+  // Server to discover against: what was typed, or mail.<domain>:2080
+  // derived from an email-style username -- the common self-hosted layout,
+  // same guess the calendar tab's add form makes -- so "you@example.com" +
+  // password is enough.
+  const usernameDomain = /@([^\s@]+\.[^\s@]+)$/.exec(form.username.trim())?.[1];
+  const effectiveHost = form.host.trim() || (usernameDomain ? `mail.${usernameDomain}:2080` : "");
 
   const handleDiscover = async () => {
     if (!effectiveHost || !form.username.trim() || !form.password) {
@@ -392,6 +395,10 @@ export default function CalDavSettings({ accentColor }: { accentColor: string })
     try {
       await deleteCalDavSource(id);
       await loadAll();
+      // The sidebar's calendar list and any open calendar tab watch the
+      // bus -- removal here (the only place it lives now; the sidebar's
+      // per-row × was retired as too easy to misclick) must reach them.
+      emitCalendarBus("sources-changed");
     } catch (e) {
       setError(String(e));
     }

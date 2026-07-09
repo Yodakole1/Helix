@@ -1,11 +1,23 @@
 import { useRef, useState } from "react";
 import { Pressable, ScrollView, StyleSheet, Text, TextInput, View } from "react-native";
 import { isTauri } from "@tauri-apps/api/core";
-import { addAccount, addOauthAccount, addPop3Account, oauthProviderInfo } from "../lib/account";
+import { open } from "@tauri-apps/plugin-dialog";
+import {
+  addAccount,
+  addOauthAccount,
+  addPop3Account,
+  discoverThunderbirdAccounts,
+  importAccountsFile,
+  oauthProviderInfo,
+  type AccountImportOutcome,
+  type ImportAccountsReport,
+  type ThunderbirdAccount,
+} from "../lib/account";
 import { addCalDavSource, discoverCalDav, type CalDavDiscoveredCalendar } from "../lib/caldav";
 import { addCardDavSource, discoverCardDav, type CardDavDiscoveredBook } from "../lib/carddav";
 import { emitCalendarBus } from "../lib/calendarBus";
 import { discoverServerConfig } from "../lib/discovery";
+import type { HoverState } from "../lib/pressable";
 import { glassPanel } from "../lib/webStyle";
 import { colors, fontFamily, fontSize, radii, spacing, withAlpha } from "../theme";
 import { Switch } from "./Switch";
@@ -66,6 +78,19 @@ export function AddAccountView({ accentColor, onCancel, onDone }: AddAccountView
   const [oauthClientId, setOauthClientId] = useState("");
   const [oauthClientSecret, setOauthClientSecret] = useState("");
 
+  // Bulk import from a key:value text file -- see the block at the bottom
+  // of the form step. The report is the backend's per-account verdict list.
+  const [importing, setImporting] = useState(false);
+  const [importReport, setImportReport] = useState<ImportAccountsReport | null>(null);
+  const [importError, setImportError] = useState("");
+
+  // Import from Thunderbird: scan the local profile for account settings and
+  // let the user pick one to pre-fill the form (Thunderbird encrypts
+  // passwords, so they type theirs once -- see thunderbird_import.rs).
+  const [tbScanning, setTbScanning] = useState(false);
+  const [tbAccounts, setTbAccounts] = useState<ThunderbirdAccount[] | null>(null);
+  const [tbError, setTbError] = useState("");
+
   const [calendarProbe, setCalendarProbe] = useState<CalendarProbe>({ status: "pending", detail: "", calendars: [] });
   const [contactsProbe, setContactsProbe] = useState<ContactsProbe>({ status: "pending", detail: "", books: [] });
   const [finishing, setFinishing] = useState(false);
@@ -73,6 +98,7 @@ export function AddAccountView({ accentColor, onCancel, onDone }: AddAccountView
   // that succeeded (so retrying after a partial failure can't duplicate).
   const [addErrors, setAddErrors] = useState<string[]>([]);
   const addedSources = useRef<Set<string>>(new Set());
+  const scrollRef = useRef<ScrollView>(null);
 
   const advancedOpen = showAdvanced || protocol === "pop3";
   const canSubmit =
@@ -237,6 +263,98 @@ export function AddAccountView({ accentColor, onCancel, onDone }: AddAccountView
 
   const canOauth = email.trim().length > 0 && !submitting && oauthSubmitting === null;
 
+  // Bulk import: pick the filled-in accounts file, let the backend verify
+  // every account in it (and delete the file -- it contains passwords),
+  // then show the per-account verdicts here.
+  async function handleImportFile() {
+    if (!isTauri()) {
+      setImportError("Account import only works inside the desktop app. Run 'npm run tauri dev' to use real accounts.");
+      return;
+    }
+    const path = await open({
+      title: "Import accounts from a file",
+      multiple: false,
+      filters: [
+        { name: "Text files", extensions: ["txt", "conf", "env"] },
+        { name: "All files", extensions: ["*"] },
+      ],
+    });
+    if (typeof path !== "string") return;
+    setImporting(true);
+    setImportReport(null);
+    setImportError("");
+    try {
+      setImportReport(await importAccountsFile(path));
+    } catch (err) {
+      setImportError(typeof err === "string" ? err : err instanceof Error ? err.message : String(err));
+    } finally {
+      setImporting(false);
+    }
+  }
+
+  function importRowText(row: AccountImportOutcome): string {
+    if (row.status === "added") {
+      const extras: string[] = [];
+      if (row.calendars_added > 0) {
+        extras.push(`${row.calendars_added} calendar${row.calendars_added === 1 ? "" : "s"}`);
+      }
+      if (row.address_books_added > 0) {
+        extras.push(`${row.address_books_added} address book${row.address_books_added === 1 ? "" : "s"}`);
+      }
+      const withExtras = extras.length > 0 ? ` (with ${extras.join(" and ")})` : "";
+      return `${row.email} -- added${withExtras}${row.detail ? `. Note: ${row.detail}.` : ""}`;
+    }
+    return `${row.email} -- ${row.status}: ${row.detail ?? "no further detail"}`;
+  }
+
+  // Scan the local Thunderbird profile(s) for account settings. Read-only;
+  // an empty result means Thunderbird isn't installed or has no IMAP/POP3
+  // accounts, which we say plainly rather than treating as an error.
+  async function handleScanThunderbird() {
+    if (!isTauri()) {
+      setTbError("Importing from Thunderbird only works inside the desktop app.");
+      return;
+    }
+    setTbScanning(true);
+    setTbError("");
+    setTbAccounts(null);
+    try {
+      const found = await discoverThunderbirdAccounts();
+      setTbAccounts(found);
+      if (found.length === 0) {
+        setTbError("No Thunderbird accounts found on this computer.");
+      }
+    } catch (err) {
+      setTbError(typeof err === "string" ? err : err instanceof Error ? err.message : String(err));
+    } finally {
+      setTbScanning(false);
+    }
+  }
+
+  // Pre-fill the form from a discovered Thunderbird account. Everything but
+  // the password comes over; advanced settings are forced open so these
+  // exact servers are used (not re-discovered), and the user just enters the
+  // password and hits Connect -- the normal verify-before-save path.
+  function prefillFromThunderbird(account: ThunderbirdAccount) {
+    setName(account.display_name ?? "");
+    setEmail(account.email);
+    setPassword("");
+    setProtocol(account.protocol);
+    setImapHost(account.incoming_host);
+    setImapPort(String(account.incoming_port));
+    setImapUseStarttls(account.incoming_starttls);
+    setSmtpHost(account.smtp_host);
+    setSmtpPort(String(account.smtp_port));
+    setSmtpUseStarttls(account.smtp_starttls);
+    setShowAdvanced(true);
+    setErrorMessage("");
+    setTbAccounts(null);
+    setTbError("");
+    scrollRef.current?.scrollTo({ y: 0, animated: true });
+  }
+
+  const importedAccounts = importReport?.results.filter((r) => r.status === "added") ?? [];
+
   const probing = calendarProbe.status === "pending" || contactsProbe.status === "pending";
   const anyFailed = calendarProbe.status === "failed" || contactsProbe.status === "failed";
 
@@ -322,7 +440,7 @@ export function AddAccountView({ accentColor, onCancel, onDone }: AddAccountView
   }
 
   return (
-    <ScrollView style={styles.pane} contentContainerStyle={styles.paneContent}>
+    <ScrollView ref={scrollRef} style={styles.pane} contentContainerStyle={styles.paneContent}>
       <View style={styles.card}>
         {step === "form" && (
           <>
@@ -529,6 +647,91 @@ export function AddAccountView({ accentColor, onCancel, onDone }: AddAccountView
               >
                 <Text style={styles.primaryButtonText}>{submitting ? "Connecting..." : "Connect"}</Text>
               </Pressable>
+            </View>
+
+            <View style={styles.importBlock}>
+              <Text style={styles.oauthLead}>
+                Switching from Thunderbird? Bring your account settings over -- Helix reads the server
+                details from your Thunderbird profile so you don't retype them. Passwords stay in
+                Thunderbird's encrypted store, so you'll enter yours once per account.
+              </Text>
+              <Pressable
+                onPress={handleScanThunderbird}
+                disabled={tbScanning || submitting}
+                style={[styles.importButton, (tbScanning || submitting) && styles.primaryButtonDisabled]}
+              >
+                <Text style={styles.oauthButtonText}>
+                  {tbScanning ? "Scanning Thunderbird..." : "Import from Thunderbird..."}
+                </Text>
+              </Pressable>
+              {tbError !== "" && <Text style={styles.hint}>{tbError}</Text>}
+              {tbAccounts && tbAccounts.length > 0 && (
+                <View style={styles.importResults}>
+                  <Text style={styles.oauthLead}>
+                    Found {tbAccounts.length} account{tbAccounts.length === 1 ? "" : "s"}. Pick one to fill in
+                    the form, then enter its password:
+                  </Text>
+                  {tbAccounts.map((account) => (
+                    <Pressable
+                      key={account.email}
+                      onPress={() => prefillFromThunderbird(account)}
+                      style={({ hovered }: HoverState) => [
+                        styles.tbRow,
+                        hovered ? { borderColor: withAlpha(accentColor, 0.6) } : null,
+                      ]}
+                    >
+                      <Text style={styles.tbRowEmail}>{account.email}</Text>
+                      <Text style={styles.tbRowDetail}>
+                        {account.protocol.toUpperCase()} · {account.incoming_host} · SMTP {account.smtp_host}
+                      </Text>
+                    </Pressable>
+                  ))}
+                </View>
+              )}
+
+              <Text style={[styles.oauthLead, styles.importSectionGap]}>
+                Setting up many accounts? Import them all at once from a text file: one block of "key: value"
+                lines per account (accounts-import.example.txt in the Helix repository is a ready-to-fill
+                template). Every account is verified before it's saved, and the file is deleted after the
+                import, since it contains your passwords.
+              </Text>
+              <Pressable
+                onPress={handleImportFile}
+                disabled={importing || submitting}
+                style={[styles.importButton, (importing || submitting) && styles.primaryButtonDisabled]}
+              >
+                <Text style={styles.oauthButtonText}>
+                  {importing ? "Importing..." : "Import accounts from a file..."}
+                </Text>
+              </Pressable>
+              {importError !== "" && <Text style={styles.error}>{importError}</Text>}
+              {importReport && (
+                <View style={styles.importResults}>
+                  {importReport.results.map((row) => (
+                    <Text
+                      key={row.email}
+                      style={row.status === "added" ? styles.importRowOk : styles.importRowProblem}
+                    >
+                      {importRowText(row)}
+                    </Text>
+                  ))}
+                  {!importReport.file_deleted && (
+                    <Text style={styles.importRowProblem}>
+                      The import file could not be deleted
+                      {importReport.delete_error ? ` (${importReport.delete_error})` : ""} -- it still contains
+                      your passwords, so please delete it yourself.
+                    </Text>
+                  )}
+                  {importedAccounts.length > 0 && (
+                    <Pressable
+                      onPress={() => onDone(importedAccounts[0].email)}
+                      style={[styles.primaryButton, styles.importDoneButton, { backgroundColor: accentColor }]}
+                    >
+                      <Text style={styles.primaryButtonText}>Open inbox</Text>
+                    </Pressable>
+                  )}
+                </View>
+              )}
             </View>
           </>
         )}
@@ -752,6 +955,68 @@ const styles = StyleSheet.create({
     fontSize: fontSize.xs,
     color: colors.accent.amber,
     marginBottom: spacing.md,
+  },
+  importBlock: {
+    marginTop: spacing.lg,
+    paddingTop: spacing.md,
+    borderTopWidth: 1,
+    borderTopColor: colors.border.subtle,
+  },
+  importButton: {
+    alignSelf: "flex-start",
+    paddingVertical: spacing.sm,
+    paddingHorizontal: spacing.md,
+    borderRadius: radii.sm,
+    borderWidth: 1,
+    borderColor: colors.border.subtle,
+    backgroundColor: withAlpha(colors.background.panel, 0.6),
+  },
+  importResults: {
+    marginTop: spacing.sm,
+  },
+  importSectionGap: {
+    marginTop: spacing.lg,
+    paddingTop: spacing.md,
+    borderTopWidth: 1,
+    borderTopColor: colors.border.subtle,
+  },
+  tbRow: {
+    marginTop: spacing.xs,
+    paddingVertical: spacing.sm,
+    paddingHorizontal: spacing.md,
+    borderRadius: radii.sm,
+    borderWidth: 1,
+    borderColor: colors.border.subtle,
+    backgroundColor: withAlpha(colors.background.panel, 0.6),
+  },
+  tbRowEmail: {
+    fontFamily: fontFamily.ui,
+    fontSize: fontSize.sm,
+    color: colors.text.primary,
+  },
+  tbRowDetail: {
+    fontFamily: fontFamily.ui,
+    fontSize: fontSize.xs,
+    color: colors.text.secondary,
+    marginTop: 2,
+  },
+  importRowOk: {
+    fontFamily: fontFamily.ui,
+    fontSize: fontSize.xs,
+    color: colors.accent.green,
+    marginBottom: spacing.xs,
+    lineHeight: 18,
+  },
+  importRowProblem: {
+    fontFamily: fontFamily.ui,
+    fontSize: fontSize.xs,
+    color: colors.accent.amber,
+    marginBottom: spacing.xs,
+    lineHeight: 18,
+  },
+  importDoneButton: {
+    alignSelf: "flex-end",
+    marginTop: spacing.sm,
   },
   serviceList: {
     marginBottom: spacing.lg,

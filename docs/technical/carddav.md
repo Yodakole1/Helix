@@ -175,7 +175,8 @@ read): a missing `carddav__{id}` entry falls back to the owning account's
 mail credential and re-stores it under the source's own key — the same
 one-time self-heal as `caldav::resolve_source_password`, and with the same
 guarantee that only `keyring::Error::NoEntry` triggers the fallback, never
-a locked or unreachable keychain. Then runs the full PROPFIND + GET loop,
+a locked or unreachable keychain (and the same refusal to fall back to an
+OAuth account's credential blob, which is not a password). Then runs the full PROPFIND + GET loop,
 upserts contacts, updates `last_synced_at`. `SyncResult`:
 `{ contacts_added: u32, contacts_updated: u32 }` (counts from the upsert
 operation — "added" = new email key, "updated" = existing key with a new

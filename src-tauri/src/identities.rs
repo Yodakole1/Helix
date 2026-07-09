@@ -14,7 +14,7 @@ pub struct IdentitySummary {
 /// the account's stored credential. Idempotent: re-adding the same address
 /// updates `display_name` and `signature` in place.
 #[tauri::command]
-pub fn add_identity(
+pub async fn add_identity(
     account_id: String,
     address: String,
     display_name: Option<String>,
@@ -35,7 +35,7 @@ pub fn add_identity(
 
 /// Returns all send-as identities for the given account.
 #[tauri::command]
-pub fn list_identities(account_id: String) -> Result<Vec<IdentitySummary>, String> {
+pub async fn list_identities(account_id: String) -> Result<Vec<IdentitySummary>, String> {
     let conn = cache::open()?;
     cache::list_identities(&conn, &account_id).map(|records| {
         records
@@ -52,7 +52,7 @@ pub fn list_identities(account_id: String) -> Result<Vec<IdentitySummary>, Strin
 
 /// Removes a send-as identity. Silently succeeds if the address isn't found.
 #[tauri::command]
-pub fn delete_identity(account_id: String, address: String) -> Result<(), String> {
+pub async fn delete_identity(account_id: String, address: String) -> Result<(), String> {
     let conn = cache::open()?;
     cache::delete_identity(&conn, &account_id, &address)
 }
@@ -62,14 +62,14 @@ pub fn delete_identity(account_id: String, address: String) -> Result<(), String
 /// header (angle brackets stripped, the same format stored in cache). The mute
 /// is account-scoped so muting on one account doesn't affect another.
 #[tauri::command]
-pub fn mute_thread(account_id: String, message_id: String) -> Result<(), String> {
+pub async fn mute_thread(account_id: String, message_id: String) -> Result<(), String> {
     let conn = cache::open()?;
     cache::mute_thread_in(&conn, &account_id, &message_id)
 }
 
 /// Removes the mute from a thread. Silently succeeds if the thread wasn't muted.
 #[tauri::command]
-pub fn unmute_thread(account_id: String, message_id: String) -> Result<(), String> {
+pub async fn unmute_thread(account_id: String, message_id: String) -> Result<(), String> {
     let conn = cache::open()?;
     cache::unmute_thread_in(&conn, &account_id, &message_id)
 }
@@ -77,14 +77,14 @@ pub fn unmute_thread(account_id: String, message_id: String) -> Result<(), Strin
 /// Returns `true` if the thread rooted at `message_id` is currently muted
 /// for this account.
 #[tauri::command]
-pub fn is_thread_muted(account_id: String, message_id: String) -> Result<bool, String> {
+pub async fn is_thread_muted(account_id: String, message_id: String) -> Result<bool, String> {
     let conn = cache::open()?;
     cache::is_thread_muted(&conn, &account_id, &message_id)
 }
 
 /// Returns all muted thread root Message-IDs for an account.
 #[tauri::command]
-pub fn list_muted_threads(account_id: String) -> Result<Vec<String>, String> {
+pub async fn list_muted_threads(account_id: String) -> Result<Vec<String>, String> {
     let conn = cache::open()?;
     cache::list_muted_threads(&conn, &account_id)
 }

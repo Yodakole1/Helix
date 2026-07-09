@@ -3,20 +3,24 @@ import { Pressable, ScrollView, StyleSheet, Text, TextInput, View } from "react-
 import {
   addCalDavSource,
   createEvent,
+  deleteEvent,
   discoverCalDav,
   icalToIso,
   listCalDavSources,
   listCalendarEvents,
   syncCalDav,
   toIcalDate,
+  updateCalDavSourceColor,
+  updateEvent,
   type CalDavDiscoveredCalendar,
   type CalDavSource,
   type CalendarEvent,
 } from "../lib/caldav";
 import { emitCalendarBus, onCalendarBus } from "../lib/calendarBus";
 import type { HoverState } from "../lib/pressable";
-import { colors, fontFamily, fontSize, radii, spacing, withAlpha } from "../theme";
+import { CALENDAR_DEFAULT_COLORS, colors, EXTENDED_PALETTE, fontFamily, fontSize, radii, spacing, withAlpha } from "../theme";
 import { Dropdown } from "./Dropdown";
+import { HexColorInput } from "./HexColorInput";
 
 interface CalendarViewProps {
   accentColor: string;
@@ -64,6 +68,20 @@ function isoDateOf(dtstart: string | null): string | null {
   return icalToIso(dtstart)?.slice(0, 10) ?? null; // "YYYY-MM-DD"
 }
 
+// Calendar times are always 24-hour ("14:30", never "2:30 PM"), regardless
+// of the OS locale's preference.
+function formatEventTime(icalOrIso: string): string {
+  const iso = icalToIso(icalOrIso);
+  if (!iso || !iso.includes("T")) return "";
+  return new Date(iso).toLocaleTimeString([], { hour: "2-digit", minute: "2-digit", hour12: false });
+}
+
+// An all-day event's DTSTART is a bare date (no "T" time part).
+function isAllDayEvent(ev: CalendarEvent): boolean {
+  const iso = icalToIso(ev.dtstart);
+  return !!iso && !iso.includes("T");
+}
+
 // Maps raw connection errors to plain-English explanations a non-technical
 // user can act on.
 function friendlyError(raw: string): string {
@@ -82,6 +100,8 @@ function friendlyError(raw: string): string {
     return "Secure connection failed. The server's certificate may be invalid.";
   if (r.includes("url") || r.includes("invalid"))
     return "The URL doesn't look right. It should start with https:// and end with a path to your calendar.";
+  if (r.includes("remove and re-add"))
+    return raw.charAt(0).toUpperCase() + raw.slice(1) + ".";
   return "Something went wrong connecting to the calendar. Check your URL and credentials, then try again.";
 }
 
@@ -176,6 +196,16 @@ const fieldStyles = StyleSheet.create({
 // localStorage/usePersistedState -- it holds a password.
 let addFormDraft = { open: false, server: "", url: "", user: "", pass: "", name: "" };
 
+// The usual self-hosted layout puts CalDAV on mail.<domain>:2080, so the
+// server field pre-fills itself from the username's domain. Only a guess:
+// the field stays editable, and a manually-typed value is never overwritten
+// (see the username onChangeText -- it only replaces an empty field or the
+// previous guess).
+function derivedServerFor(user: string): string {
+  const domain = /@([^\s@]+\.[^\s@]+)$/.exec(user.trim())?.[1];
+  return domain ? `mail.${domain}:2080` : "";
+}
+
 export function CalendarView({ accentColor }: CalendarViewProps) {
   const today = new Date();
   const [year, setYear] = useState(today.getFullYear());
@@ -207,6 +237,7 @@ export function CalendarView({ accentColor }: CalendarViewProps) {
   const [showAddTask, setShowAddTask] = useState(false);
   const [taskTitle, setTaskTitle] = useState("");
   const [taskDate, setTaskDate] = useState(""); // "YYYY-MM-DD"
+  const [taskAllDay, setTaskAllDay] = useState(false);
   const [taskStart, setTaskStart] = useState("09:00");
   const [taskEnd, setTaskEnd] = useState("10:00");
   const [taskLocation, setTaskLocation] = useState("");
@@ -218,6 +249,38 @@ export function CalendarView({ accentColor }: CalendarViewProps) {
   const [taskCustomReminderUnit, setTaskCustomReminderUnit] = useState("minutes");
   const [taskError, setTaskError] = useState<string | null>(null);
   const [taskSaving, setTaskSaving] = useState(false);
+
+  // Which calendar's color palette is expanded in the legend row, if any.
+  const [colorPickerSourceId, setColorPickerSourceId] = useState<number | null>(null);
+
+  // Set while the add-task form is editing an existing event instead of
+  // creating a new one -- submit then goes through update_event (in place,
+  // same UID) rather than create_event.
+  const [editingEvent, setEditingEvent] = useState<CalendarEvent | null>(null);
+
+  // Each calendar's display color -- the per-source override when one is
+  // set, otherwise a distinct pick from the palette's muted row (below),
+  // one per calendar in list order. Previously every uncolored calendar
+  // shared the account accent, so with no override set they all rendered
+  // as the same loud cyan; cycling through the muted row instead keeps
+  // multiple calendars visually distinct and easier on the eyes in both
+  // themes. Events inherit their calendar's color.
+  const colorBySource: Record<number, string> = {};
+  sources.forEach((src, index) => {
+    colorBySource[src.id] = src.color || CALENDAR_DEFAULT_COLORS[index % CALENDAR_DEFAULT_COLORS.length];
+  });
+  const sourceColor = (sourceId: number) => colorBySource[sourceId] ?? CALENDAR_DEFAULT_COLORS[0];
+
+  async function handlePickSourceColor(sourceId: number, color: string) {
+    setColorPickerSourceId(null);
+    try {
+      await updateCalDavSourceColor(sourceId, color);
+      await loadSources();
+      emitCalendarBus("sources-changed");
+    } catch (e) {
+      console.warn("could not update calendar color:", e);
+    }
+  }
 
   // Mirror every change back into the draft so the latest keystrokes are
   // what a remounted instance picks up.
@@ -351,13 +414,61 @@ export function CalendarView({ accentColor }: CalendarViewProps) {
     const fallback = `${today.getFullYear()}-${String(today.getMonth() + 1).padStart(2, "0")}-${String(today.getDate()).padStart(2, "0")}`;
     setTaskDate(selectedDateKey ?? fallback);
     if (taskSourceId === null && sources[0]) setTaskSourceId(sources[0].id);
+    setEditingEvent(null);
     setShowAdd(false);
     setShowAddTask(true);
   }
 
+  // Opens the same form pre-filled from an existing event; submit updates
+  // in place instead of creating.
+  function openEditTask(ev: CalendarEvent) {
+    setEditingEvent(ev);
+    setTaskTitle(ev.summary ?? "");
+    setTaskLocation(ev.location ?? "");
+    setTaskSourceId(ev.source_id);
+    const startIso = icalToIso(ev.dtstart);
+    setTaskDate(startIso?.slice(0, 10) ?? "");
+    if (startIso && startIso.includes("T")) {
+      setTaskAllDay(false);
+      const start = new Date(startIso);
+      setTaskStart(start.toLocaleTimeString([], { hour: "2-digit", minute: "2-digit", hour12: false }));
+      const endIso = icalToIso(ev.dtend);
+      if (endIso && endIso.includes("T")) {
+        const end = new Date(endIso);
+        setTaskEnd(end.toLocaleTimeString([], { hour: "2-digit", minute: "2-digit", hour12: false }));
+      }
+    } else {
+      setTaskAllDay(true);
+    }
+    const rrule = ev.rrule ?? "";
+    const simple = { "FREQ=DAILY": "daily", "FREQ=WEEKLY": "weekly", "FREQ=MONTHLY": "monthly", "FREQ=YEARLY": "yearly" }[rrule];
+    if (!rrule) {
+      setTaskRepeat("none"); setTaskCustomRrule("");
+    } else if (simple) {
+      setTaskRepeat(simple); setTaskCustomRrule("");
+    } else {
+      setTaskRepeat("custom"); setTaskCustomRrule(rrule);
+    }
+    setTaskReminder("none");
+    setTaskError(null);
+    setShowAdd(false);
+    setShowAddTask(true);
+  }
+
+  async function handleDeleteEvent(ev: CalendarEvent) {
+    try {
+      await deleteEvent(ev.source_id, ev.uid);
+      await loadEvents();
+    } catch (e) {
+      console.warn("delete_event failed:", e);
+    }
+  }
+
   function closeAddTask() {
     setShowAddTask(false);
+    setEditingEvent(null);
     setTaskTitle(""); setTaskLocation("");
+    setTaskAllDay(false);
     setTaskRepeat("none"); setTaskCustomRrule("");
     setTaskReminder("none");
     setTaskError(null);
@@ -372,14 +483,31 @@ export function CalendarView({ accentColor }: CalendarViewProps) {
   async function handleCreateTask() {
     if (!taskTitle.trim()) { setTaskError("Give the event a title."); return; }
     if (taskSourceId === null) { setTaskError("Connect a calendar first."); return; }
-    if (!taskDate || !taskStart) { setTaskError("Pick a date and start time."); return; }
-    const start = new Date(`${taskDate}T${taskStart}`);
-    const end = taskEnd ? new Date(`${taskDate}T${taskEnd}`) : new Date(start.getTime() + 3600000);
-    if (Number.isNaN(start.getTime()) || Number.isNaN(end.getTime())) {
-      setTaskError("That date or time doesn't parse.");
-      return;
+    if (!taskDate) { setTaskError("Pick a date."); return; }
+
+    // All-day events use bare dates: DTSTART is the day itself and DTEND is
+    // the next day, exclusive, per RFC 5545. No times to validate.
+    let dtstartValue: string;
+    let dtendValue: string;
+    if (taskAllDay) {
+      const day = new Date(`${taskDate}T00:00`);
+      if (Number.isNaN(day.getTime())) { setTaskError("That date doesn't parse."); return; }
+      const next = new Date(day);
+      next.setDate(next.getDate() + 1);
+      dtstartValue = taskDate.replace(/-/g, "");
+      dtendValue = `${next.getFullYear()}${String(next.getMonth() + 1).padStart(2, "0")}${String(next.getDate()).padStart(2, "0")}`;
+    } else {
+      if (!taskStart) { setTaskError("Pick a start time (or mark the event all-day)."); return; }
+      const start = new Date(`${taskDate}T${taskStart}`);
+      const end = taskEnd ? new Date(`${taskDate}T${taskEnd}`) : new Date(start.getTime() + 3600000);
+      if (Number.isNaN(start.getTime()) || Number.isNaN(end.getTime())) {
+        setTaskError("That date or time doesn't parse.");
+        return;
+      }
+      if (end.getTime() <= start.getTime()) { setTaskError("End time must be after the start time."); return; }
+      dtstartValue = toCompactUtc(start);
+      dtendValue = toCompactUtc(end);
     }
-    if (end.getTime() <= start.getTime()) { setTaskError("End time must be after the start time."); return; }
 
     const rrule =
       taskRepeat === "none"
@@ -401,15 +529,27 @@ export function CalendarView({ accentColor }: CalendarViewProps) {
     setTaskSaving(true);
     setTaskError(null);
     try {
-      await createEvent({
-        sourceId: taskSourceId,
-        summary: taskTitle.trim(),
-        dtstart: toCompactUtc(start),
-        dtend: toCompactUtc(end),
-        location: taskLocation.trim() || undefined,
-        rrule,
-        reminderMinutesBefore,
-      });
+      if (editingEvent) {
+        await updateEvent({
+          sourceId: editingEvent.source_id,
+          uid: editingEvent.uid,
+          summary: taskTitle.trim(),
+          dtstart: dtstartValue,
+          dtend: dtendValue,
+          location: taskLocation.trim() || undefined,
+          rrule,
+        });
+      } else {
+        await createEvent({
+          sourceId: taskSourceId,
+          summary: taskTitle.trim(),
+          dtstart: dtstartValue,
+          dtend: dtendValue,
+          location: taskLocation.trim() || undefined,
+          rrule,
+          reminderMinutesBefore,
+        });
+      }
       closeAddTask();
       await loadEvents();
     } catch (e) {
@@ -561,7 +701,16 @@ export function CalendarView({ accentColor }: CalendarViewProps) {
               <TextInput
                 style={styles.addInput}
                 value={addUser}
-                onChangeText={(t) => { setAddUser(t); setAddError(null); }}
+                onChangeText={(t) => {
+                  const previousGuess = derivedServerFor(addUser);
+                  setAddUser(t);
+                  setAddError(null);
+                  // Keep the server guess tracking the typed email, but never
+                  // clobber a server the user typed themselves.
+                  setAddServer((current) =>
+                    current.trim() === "" || current === previousGuess ? derivedServerFor(t) : current,
+                  );
+                }}
                 placeholder="you@example.com"
                 placeholderTextColor={colors.text.muted}
                 autoCapitalize="none"
@@ -587,7 +736,7 @@ export function CalendarView({ accentColor }: CalendarViewProps) {
 
             <FormField
               label="Server"
-              hint="Just the server address — Helix finds the calendar path itself."
+              hint="Pre-filled from your email as mail.<domain>:2080 — the common setup. Change it if your provider uses a different address."
               example="mail.example.com:2080"
               accentColor={accentColor}
             >
@@ -718,8 +867,8 @@ export function CalendarView({ accentColor }: CalendarViewProps) {
               <Text style={[styles.addBackText, { color: accentColor }]}>‹ Back</Text>
             </Pressable>
 
-            <Text style={[styles.addEyebrow, { color: accentColor }]}>Add task</Text>
-            <Text style={styles.addTitle}>New event</Text>
+            <Text style={[styles.addEyebrow, { color: accentColor }]}>{editingEvent ? "Edit task" : "Add task"}</Text>
+            <Text style={styles.addTitle}>{editingEvent ? "Edit event" : "New event"}</Text>
 
             <FormField
               label="Title"
@@ -763,19 +912,32 @@ export function CalendarView({ accentColor }: CalendarViewProps) {
                   onChange={(e) => { setTaskDate((e.target as HTMLInputElement).value); setTaskError(null); }}
                   style={taskInputStyle}
                 />
-                <input
-                  type="time"
-                  value={taskStart}
-                  onChange={(e) => { setTaskStart((e.target as HTMLInputElement).value); setTaskError(null); }}
-                  style={taskInputStyle}
-                />
-                <Text style={styles.taskTimeDash}>–</Text>
-                <input
-                  type="time"
-                  value={taskEnd}
-                  onChange={(e) => { setTaskEnd((e.target as HTMLInputElement).value); setTaskError(null); }}
-                  style={taskInputStyle}
-                />
+                {!taskAllDay && (
+                  <>
+                    <input
+                      type="time"
+                      value={taskStart}
+                      onChange={(e) => { setTaskStart((e.target as HTMLInputElement).value); setTaskError(null); }}
+                      style={taskInputStyle}
+                    />
+                    <Text style={styles.taskTimeDash}>–</Text>
+                    <input
+                      type="time"
+                      value={taskEnd}
+                      onChange={(e) => { setTaskEnd((e.target as HTMLInputElement).value); setTaskError(null); }}
+                      style={taskInputStyle}
+                    />
+                  </>
+                )}
+                <Pressable
+                  onPress={() => { setTaskAllDay((v) => !v); setTaskError(null); }}
+                  style={[
+                    styles.taskPill,
+                    taskAllDay && { backgroundColor: withAlpha(accentColor, 0.18), borderColor: accentColor },
+                  ]}
+                >
+                  <Text style={[styles.taskPillText, taskAllDay && { color: accentColor }]}>All day</Text>
+                </Pressable>
               </View>
             </View>
 
@@ -827,6 +989,10 @@ export function CalendarView({ accentColor }: CalendarViewProps) {
               )}
             </View>
 
+            {/* Reminders are create-time only: update_event rebuilds the ICS
+                without a VALARM (see caldav.rs), so offering the picker while
+                editing would silently drop or lie about the alarm. */}
+            {!editingEvent && (
             <View style={fieldStyles.wrap}>
               <Text style={fieldStyles.label}>Reminder</Text>
               <View style={styles.taskPillRow}>
@@ -871,6 +1037,7 @@ export function CalendarView({ accentColor }: CalendarViewProps) {
                 </View>
               )}
             </View>
+            )}
 
             {taskError && (
               <View style={styles.errorBox}>
@@ -900,7 +1067,9 @@ export function CalendarView({ accentColor }: CalendarViewProps) {
                   taskSaving && { opacity: 0.55 },
                 ]}
               >
-                <Text style={styles.connectBtnText}>{taskSaving ? "Adding…" : "Add task"}</Text>
+                <Text style={styles.connectBtnText}>
+                  {taskSaving ? "Saving…" : editingEvent ? "Save changes" : "Add task"}
+                </Text>
               </Pressable>
             </View>
           </View>
@@ -960,6 +1129,55 @@ export function CalendarView({ accentColor }: CalendarViewProps) {
         </View>
       </View>
 
+      {/* Calendar legend: one chip per connected calendar in its display
+          color. Clicking a chip opens a palette to recolor that calendar --
+          softer tones than the accent cycle, so events don't have to be neon. */}
+      {sources.length > 0 && (
+        <View style={styles.legendRow}>
+          {sources.map((src) => {
+            const c = sourceColor(src.id);
+            const open = colorPickerSourceId === src.id;
+            return (
+              <Pressable
+                key={src.id}
+                onPress={() => setColorPickerSourceId(open ? null : src.id)}
+                style={({ hovered }: HoverState) => [
+                  styles.legendChip,
+                  { borderColor: withAlpha(c, 0.5) },
+                  (hovered || open) && { backgroundColor: withAlpha(c, 0.12) },
+                ]}
+              >
+                <View style={[styles.legendDot, { backgroundColor: c }]} />
+                <Text style={styles.legendLabel} numberOfLines={1}>
+                  {src.display_name || src.username}
+                </Text>
+              </Pressable>
+            );
+          })}
+        </View>
+      )}
+      {colorPickerSourceId !== null && (
+        <View style={styles.legendPalette}>
+          {EXTENDED_PALETTE.map((color) => (
+            <Pressable
+              key={color}
+              onPress={() => handlePickSourceColor(colorPickerSourceId, color)}
+              style={[
+                styles.legendSwatch,
+                { backgroundColor: color },
+                sourceColor(colorPickerSourceId) === color && styles.legendSwatchActive,
+              ]}
+            />
+          ))}
+          <HexColorInput
+            value={sourceColor(colorPickerSourceId)}
+            onChange={(color) => handlePickSourceColor(colorPickerSourceId, color)}
+            width={74}
+            height={22}
+          />
+        </View>
+      )}
+
       <View style={styles.body}>
         {/* The calendar list itself lives in the app sidebar while a
             calendar tab is open (see Sidebar's calendar section + the
@@ -1008,13 +1226,16 @@ export function CalendarView({ accentColor }: CalendarViewProps) {
                           {day}
                         </Text>
                       </View>
-                      {dayEvents.slice(0, 3).map((ev, i) => (
-                        <View key={ev.id} style={[styles.eventChip, { backgroundColor: withAlpha(accentColor, 0.25) }]}>
-                          <Text style={[styles.eventChipText, { color: accentColor }]} numberOfLines={1}>
-                            {ev.summary ?? "Event"}
-                          </Text>
-                        </View>
-                      ))}
+                      {dayEvents.slice(0, 3).map((ev) => {
+                        const evColor = sourceColor(ev.source_id);
+                        return (
+                          <View key={ev.id} style={[styles.eventChip, { backgroundColor: withAlpha(evColor, 0.25) }]}>
+                            <Text style={[styles.eventChipText, { color: evColor }]} numberOfLines={1}>
+                              {ev.summary ?? "Event"}
+                            </Text>
+                          </View>
+                        );
+                      })}
                       {dayEvents.length > 3 && (
                         <Text style={[styles.moreEvents, { color: accentColor }]}>+{dayEvents.length - 3} more</Text>
                       )}
@@ -1037,15 +1258,24 @@ export function CalendarView({ accentColor }: CalendarViewProps) {
             ) : (
               <ScrollView>
                 {selectedEvents.map((ev) => (
-                  <View key={ev.id} style={[styles.detailEvent, { borderLeftColor: accentColor }]}>
+                  <View key={ev.id} style={[styles.detailEvent, { borderLeftColor: sourceColor(ev.source_id) }]}>
                     <Text style={styles.detailEventTitle}>{ev.summary ?? "Untitled"}</Text>
                     {ev.dtstart && (
                       <Text style={styles.detailEventTime}>
-                        {new Date(icalToIso(ev.dtstart)!).toLocaleTimeString([], { hour: "2-digit", minute: "2-digit" })}
-                        {ev.dtend ? ` – ${new Date(icalToIso(ev.dtend)!).toLocaleTimeString([], { hour: "2-digit", minute: "2-digit" })}` : ""}
+                        {isAllDayEvent(ev)
+                          ? "All day"
+                          : `${formatEventTime(ev.dtstart)}${ev.dtend ? ` – ${formatEventTime(ev.dtend)}` : ""}`}
                       </Text>
                     )}
                     {ev.location && <Text style={styles.detailEventMeta}>{ev.location}</Text>}
+                    <View style={styles.detailEventActions}>
+                      <Pressable onPress={() => openEditTask(ev)}>
+                        <Text style={[styles.detailEventAction, { color: accentColor }]}>Edit</Text>
+                      </Pressable>
+                      <Pressable onPress={() => handleDeleteEvent(ev)}>
+                        <Text style={[styles.detailEventAction, { color: colors.accent.amber }]}>Delete</Text>
+                      </Pressable>
+                    </View>
                   </View>
                 ))}
               </ScrollView>
@@ -1330,6 +1560,54 @@ const styles = StyleSheet.create({
     fontWeight: "600",
   },
 
+  // ── Calendar legend + color palette ──
+  legendRow: {
+    flexDirection: "row",
+    alignItems: "center",
+    flexWrap: "wrap",
+    gap: spacing.sm,
+    paddingHorizontal: spacing.xxl,
+    paddingVertical: spacing.sm,
+  },
+  legendChip: {
+    flexDirection: "row",
+    alignItems: "center",
+    gap: spacing.xs,
+    paddingVertical: 4,
+    paddingHorizontal: spacing.sm,
+    borderRadius: radii.pill,
+    borderWidth: 1,
+    maxWidth: 220,
+  },
+  legendDot: {
+    width: 10,
+    height: 10,
+    borderRadius: 5,
+  },
+  legendLabel: {
+    fontFamily: fontFamily.ui,
+    fontSize: fontSize.xs,
+    color: colors.text.secondary,
+  },
+  legendPalette: {
+    flexDirection: "row",
+    alignItems: "center",
+    flexWrap: "wrap",
+    gap: spacing.xs,
+    paddingHorizontal: spacing.xxl,
+    paddingBottom: spacing.sm,
+  },
+  legendSwatch: {
+    width: 22,
+    height: 22,
+    borderRadius: 11,
+    borderWidth: 2,
+    borderColor: "transparent",
+  },
+  legendSwatchActive: {
+    borderColor: colors.text.primary,
+  },
+
   // ── Body (grid + detail side by side) ──
   body: {
     flex: 1,
@@ -1457,6 +1735,16 @@ const styles = StyleSheet.create({
     fontSize: fontSize.xs,
     color: colors.text.muted,
     marginTop: 2,
+  },
+  detailEventActions: {
+    flexDirection: "row",
+    gap: spacing.md,
+    marginTop: spacing.xs,
+  },
+  detailEventAction: {
+    fontFamily: fontFamily.ui,
+    fontSize: fontSize.xs,
+    fontWeight: "700",
   },
   // ── Add-task form extras ──
   taskTimeRow: {

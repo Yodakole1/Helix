@@ -1,6 +1,12 @@
 import { useEffect, useState } from "react";
 import { Pressable, StyleSheet, Text, TextInput, View } from "react-native";
-import { listAccounts, removeAccount, updateAccount, type AccountRecord } from "../lib/account";
+import {
+  listAccounts,
+  reauthorizeOauthAccount,
+  removeAccount,
+  updateAccount,
+  type AccountRecord,
+} from "../lib/account";
 import { colors, fontFamily, fontSize, radii, spacing } from "../theme";
 import { FolderSubscriptionPanel } from "./FolderSubscriptionPanel";
 import { IdentitySettings } from "./IdentitySettings";
@@ -37,6 +43,27 @@ export function ConnectedAccountsSettings({ accentColor, onAddAccount }: Connect
   const [folderSubsFor, setFolderSubsFor] = useState<string | null>(null);
   // Which account has the identity (alias) panel open.
   const [identitiesFor, setIdentitiesFor] = useState<string | null>(null);
+  // OAuth re-authorization: which account's browser flow is running, and
+  // a per-account success note once one completes.
+  const [reauthorizingId, setReauthorizingId] = useState<string | null>(null);
+  const [reauthorizedId, setReauthorizedId] = useState<string | null>(null);
+
+  // Re-runs the browser sign-in for an OAuth account whose saved sign-in
+  // stopped working (revoked, expired). Keeps the account -- cached mail,
+  // aliases, settings -- unlike the old advice to remove and re-add it.
+  async function handleReauthorize(account: AccountRecord) {
+    setReauthorizingId(account.account_id);
+    setReauthorizedId(null);
+    setErrorMessage("");
+    try {
+      await reauthorizeOauthAccount(account.account_id);
+      setReauthorizedId(account.account_id);
+    } catch (err) {
+      setErrorMessage(err instanceof Error ? err.message : typeof err === "string" ? err : "Could not sign in again.");
+    } finally {
+      setReauthorizingId(null);
+    }
+  }
 
   function startEdit(account: AccountRecord) {
     setEditingId(account.account_id);
@@ -252,11 +279,31 @@ export function ConnectedAccountsSettings({ accentColor, onAddAccount }: Connect
                     <Text style={styles.toggleLabel}>SMTP uses STARTTLS</Text>
                   </View>
                   {isOauth ? (
-                    <Text style={styles.hint}>
-                      This account signs in with {account.oauth_provider === "microsoft" ? "Microsoft" : "Google"} --
-                      there's no password to change here. If access stops working, remove the account and sign in
-                      again.
-                    </Text>
+                    <View>
+                      <Text style={styles.hint}>
+                        This account signs in with {account.oauth_provider === "microsoft" ? "Microsoft" : "Google"} --
+                        there's no password to change here. If access stops working (sign-in revoked or expired),
+                        sign in again below; the account and its cached mail stay put.
+                      </Text>
+                      <Pressable
+                        onPress={() => handleReauthorize(account)}
+                        disabled={reauthorizingId !== null}
+                        style={[
+                          styles.reauthButton,
+                          { borderColor: accentColor },
+                          reauthorizingId !== null && styles.saveButtonDisabled,
+                        ]}
+                      >
+                        <Text style={[styles.reauthButtonText, { color: accentColor }]}>
+                          {reauthorizingId === account.account_id
+                            ? "Waiting for browser..."
+                            : `Sign in with ${account.oauth_provider === "microsoft" ? "Microsoft" : "Google"} again`}
+                        </Text>
+                      </Pressable>
+                      {reauthorizedId === account.account_id && (
+                        <Text style={styles.reauthOk}>Signed in again -- this account is reconnected.</Text>
+                      )}
+                    </View>
                   ) : (
                     <TextInput
                       style={[styles.fieldInput, styles.fieldFull]}
@@ -407,6 +454,25 @@ const styles = StyleSheet.create({
     paddingVertical: 8,
     borderRadius: radii.sm,
     marginTop: spacing.xs,
+  },
+  reauthButton: {
+    alignSelf: "flex-start",
+    paddingVertical: spacing.sm,
+    paddingHorizontal: spacing.md,
+    borderRadius: radii.sm,
+    borderWidth: 1,
+    marginBottom: spacing.sm,
+  },
+  reauthButtonText: {
+    fontFamily: fontFamily.ui,
+    fontSize: fontSize.xs,
+    fontWeight: "600",
+  },
+  reauthOk: {
+    fontFamily: fontFamily.ui,
+    fontSize: fontSize.xs,
+    color: colors.accent.green,
+    marginBottom: spacing.sm,
   },
   saveButtonDisabled: {
     opacity: 0.6,

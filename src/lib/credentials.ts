@@ -6,9 +6,9 @@ import { invoke } from "@tauri-apps/api/core";
 // on Windows) via the `keyring` crate on the Rust side.
 
 export function storeCredential(accountId: string, secret: string): Promise<void> {
-  return invoke("store_credential", { accountId, secret });
+  return invoke("store_credential_cmd", { accountId, secret });
 }
 
 export function deleteCredential(accountId: string): Promise<void> {
-  return invoke("delete_credential", { accountId });
+  return invoke("delete_credential_cmd", { accountId });
 }

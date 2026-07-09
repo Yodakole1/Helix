@@ -6,11 +6,11 @@ import { usePersistedState } from "../hooks/usePersistedState";
 import { resolveAccountColor, resolveAccountLabel, type AccountOverrides, type MailAccount } from "../data/accounts";
 import { saveDraft, deleteDraft } from "../lib/drafts";
 import type { IdentitySummary } from "../lib/identities";
-import { discoverPgpKeyWkd, importContactKey } from "../lib/pgp";
+import { ensureContactKeyWkd } from "../lib/pgp";
 import { fileToBase64 } from "../lib/smtp";
 import { glassPanel } from "../lib/webStyle";
 import type { HoverState } from "../lib/pressable";
-import { colors, fontFamily, fontSize, radii, spacing, withAlpha, type AccountId } from "../theme";
+import { colors, fontFamily, fontSize, isLightTheme, radii, spacing, withAlpha, type AccountId } from "../theme";
 import { AddressField } from "./AddressField";
 import { FloatingPortal } from "./FloatingPortal";
 import { ListIcon } from "./ListIcon";
@@ -66,6 +66,9 @@ interface ComposeModalProps {
   identities: IdentitySummary[];
   signature: string;
   encryptByDefault: boolean;
+  // Settings > General "Check spelling as you type" -- threads down to the
+  // subject and body inputs' native spellcheck.
+  spellCheck?: boolean;
   prefill: ComposePrefill | null;
   templates: MessageTemplate[];
   onSaveTemplate: (name: string, subject: string, body: string) => void;
@@ -197,6 +200,7 @@ export function ComposeModal({
   identities,
   signature,
   encryptByDefault,
+  spellCheck = true,
   prefill,
   templates,
   onSaveTemplate,
@@ -230,7 +234,7 @@ export function ComposeModal({
   // "not-found" → WKD lookup failed, user should import manually.
   const [wkdByEmail, setWkdByEmail] = useState<Record<string, "checking" | "found" | "not-found">>({});
   // Rich text is the default compose mode -- the formatting toolbar works
-  // out of the box. Toggling off converts to plain text (needed for PGP).
+  // out of the box. Toggling off converts to plain text.
   const [richText, setRichText] = useState(true);
   // Latest HTML from the rich-text editor, updated via onChange callback.
   const htmlBodyRef = useRef<string>("");
@@ -283,17 +287,19 @@ export function ComposeModal({
     setFromAddress(null);
   }, [fromAccountId]);
 
-  // When Encrypt is on and the To list changes, run WKD discovery for any
-  // address we haven't checked yet. Found keys are auto-imported so the next
-  // send can actually encrypt without the user doing anything extra.
+  // When Encrypt is on and the To list changes, make sure we have a key for
+  // any address we haven't checked yet, so the next send can encrypt without
+  // the user doing anything extra. ensureContactKeyWkd never overwrites a key
+  // already on file (a manually verified key must win over WKD), and "found"
+  // is only set once a key is actually present -- an existing one kept, or a
+  // freshly fetched one stored.
   useEffect(() => {
     if (!encrypt || to.length === 0) return;
     for (const address of to) {
       if (wkdByEmail[address] !== undefined) continue;
       setWkdByEmail((current) => ({ ...current, [address]: "checking" }));
-      discoverPgpKeyWkd(address)
-        .then((keyInfo) => {
-          importContactKey(address, keyInfo.public_key).catch(() => {});
+      ensureContactKeyWkd(address)
+        .then(() => {
           setWkdByEmail((current) => ({ ...current, [address]: "found" }));
         })
         .catch(() => {
@@ -439,11 +445,11 @@ export function ComposeModal({
       ? new Date(sendLaterAt).toISOString()
       : null;
     // In rich text mode the plain body is stripped from the HTML; the HTML
-    // itself is passed separately. When Encrypt is on, only the plain part
-    // goes out -- the backend hard-rejects encrypt+HTML (inline PGP is
-    // plain-text only), so sending the HTML alongside would fail the send.
+    // itself is passed separately. Encrypted sends are PGP/MIME now, so
+    // HTML and attachments travel inside the encrypted entity like any
+    // other message.
     const plainBody = richText ? htmlToPlainText(htmlBodyRef.current) : body;
-    const htmlBody = richText && htmlBodyRef.current && !encrypt ? htmlBodyRef.current : null;
+    const htmlBody = richText && htmlBodyRef.current ? htmlBodyRef.current : null;
     try {
       await onSend(to, cc, bcc, subject, plainBody, encrypt, attachments.map((a) => a.file), prefill ?? null, fromAddress, rfc3339SendAt, htmlBody);
       reset();
@@ -747,6 +753,7 @@ export function ComposeModal({
             value={subject}
             onChangeText={setSubject}
             placeholderTextColor={colors.text.muted}
+            spellCheck={spellCheck}
           />
         </View>
 
@@ -969,6 +976,7 @@ export function ComposeModal({
             initialHtml={editorSeed.html}
             seedVersion={editorSeed.version}
             placeholder="Write your message..."
+            spellCheck={spellCheck}
             // Keep `body` as a live plain-text mirror so autosave, template
             // saving, and the RT toggle all see what's actually typed.
             onChange={(html) => {
@@ -987,6 +995,7 @@ export function ComposeModal({
             placeholderTextColor={colors.text.muted}
             multiline
             textAlignVertical="top"
+            spellCheck={spellCheck}
           />
         )}
       </View>
@@ -1047,7 +1056,7 @@ export function ComposeModal({
                   fontSize: 12,
                   padding: "4px 8px",
                   outline: "none",
-                  colorScheme: "dark",
+                  colorScheme: isLightTheme ? "light" : "dark",
                 }}
               />
               <Pressable

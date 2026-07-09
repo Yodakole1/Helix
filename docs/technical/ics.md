@@ -57,8 +57,13 @@ calendar replies (as opposed to human-readable meeting-response emails).
 
 `respond_to_invite` follows the exact same `starttls_relay()`/`relay()`
 pattern as `smtp::send_message` — same credential lookup, same TLS flag
-semantics. No separate `smtp_password` parameter: the password comes from
-the keychain via `credentials::get_credential(account_id)`.
+semantics. No separate `smtp_password` parameter: authentication is
+resolved through `smtp::transport_credentials`, the shared helper
+`send_message` uses, so an OAuth account gets a fresh access token with
+XOAUTH2 pinned and a password account gets its keychain password. (It
+originally did its own `get_credential` + PLAIN, which predated OAuth
+and would have sent an OAuth account's token blob as a password — see
+security.md's 2026-07-06 entry.)
 
 ## Limitations
 

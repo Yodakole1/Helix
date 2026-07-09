@@ -629,7 +629,7 @@ fn cache_stats_in(conn: &Connection, path: &Path) -> Result<CacheStats, String> 
 }
 
 #[tauri::command]
-pub fn cache_stats() -> Result<CacheStats, String> {
+pub async fn cache_stats() -> Result<CacheStats, String> {
     let path = cache_db_path()?;
     let conn = open()?;
     cache_stats_in(&conn, &path)
@@ -653,7 +653,7 @@ fn clear_cache_in(conn: &Connection) -> Result<(), String> {
 /// particular is unrecoverable once deleted. "Clear cache" should never
 /// be able to take out an encryption identity as a side effect.
 #[tauri::command]
-pub fn clear_cache() -> Result<(), String> {
+pub async fn clear_cache() -> Result<(), String> {
     let conn = open()?;
     clear_cache_in(&conn)
 }
@@ -781,7 +781,7 @@ pub fn get_cached_summaries(
 /// `fetch_messages` fails (offline, server down) so the mailbox isn't just
 /// blank.
 #[tauri::command]
-pub fn load_cached_messages(
+pub async fn load_cached_messages(
     account_id: String,
     folder: String,
     limit: u32,
@@ -863,7 +863,7 @@ pub fn get_cached_body(
 /// Offline-read command for a single message's body. `Ok(None)` means the
 /// body isn't cached and a live fetch is required.
 #[tauri::command]
-pub fn load_cached_message_body(
+pub async fn load_cached_message_body(
     account_id: String,
     folder: String,
     uid: u32,
@@ -1065,7 +1065,7 @@ pub fn get_cached_attachment(
 /// means it isn't cached (never downloaded, or evicted) and a live
 /// `fetch_attachment` is required.
 #[tauri::command]
-pub fn load_cached_attachment(
+pub async fn load_cached_attachment(
     account_id: String,
     folder: String,
     uid: u32,
@@ -1189,7 +1189,7 @@ pub fn get_cached_pop3_summaries(
 
 /// Offline-read command for a POP3 account's cached inbox summaries.
 #[tauri::command]
-pub fn load_cached_pop3_messages(account_id: String, limit: u32) -> Result<Vec<Pop3MessageSummary>, String> {
+pub async fn load_cached_pop3_messages(account_id: String, limit: u32) -> Result<Vec<Pop3MessageSummary>, String> {
     let conn = open()?;
     get_cached_pop3_summaries(&conn, &account_id, limit)
 }
@@ -1272,7 +1272,7 @@ pub fn get_cached_pop3_body(conn: &Connection, account_id: &str, uidl: &str) -> 
 
 /// Offline-read command for one cached POP3 message body, addressed by UIDL.
 #[tauri::command]
-pub fn load_cached_pop3_message_body(account_id: String, uidl: String) -> Result<Option<MessageBody>, String> {
+pub async fn load_cached_pop3_message_body(account_id: String, uidl: String) -> Result<Option<MessageBody>, String> {
     let conn = open()?;
     get_cached_pop3_body(&conn, &account_id, &uidl)
 }
@@ -1349,7 +1349,7 @@ pub fn get_cached_pop3_attachment(
 
 /// Offline-read command for one downloaded POP3 attachment, addressed by UIDL.
 #[tauri::command]
-pub fn load_cached_pop3_attachment(
+pub async fn load_cached_pop3_attachment(
     account_id: String,
     uidl: String,
     attachment_index: usize,
@@ -1541,7 +1541,7 @@ pub fn search_cached_messages(
 ///   criteria. This keeps the FTS index fast while still supporting exact
 ///   flag/date matching that FTS can't express.
 #[tauri::command]
-pub fn search_local_messages(
+pub async fn search_local_messages(
     account_id: Option<String>,
     query: String,
     limit: u32,
@@ -1858,7 +1858,7 @@ pub fn total_unseen_count(conn: &Connection, account_id: Option<&str>) -> Result
 /// a specific account or all accounts (if `account_id` is `None`). The
 /// frontend calls this after fetch/mutation events to update the badge.
 #[tauri::command]
-pub fn get_unseen_count(account_id: Option<String>) -> Result<u32, String> {
+pub async fn get_unseen_count(account_id: Option<String>) -> Result<u32, String> {
     let conn = open()?;
     total_unseen_count(&conn, account_id.as_deref())
 }
@@ -2221,7 +2221,7 @@ fn search_contacts_in(
 }
 
 #[tauri::command]
-pub fn search_contacts(query: String, limit: u32, source: Option<String>) -> Result<Vec<ContactRecord>, String> {
+pub async fn search_contacts(query: String, limit: u32, source: Option<String>) -> Result<Vec<ContactRecord>, String> {
     let conn = open()?;
     search_contacts_in(&conn, &query, limit, source.as_deref())
 }
@@ -2253,7 +2253,7 @@ fn list_contacts_in(conn: &Connection, limit: u32, source: Option<&str>) -> Resu
 }
 
 #[tauri::command]
-pub fn list_contacts(limit: u32, source: Option<String>) -> Result<Vec<ContactRecord>, String> {
+pub async fn list_contacts(limit: u32, source: Option<String>) -> Result<Vec<ContactRecord>, String> {
     let conn = open()?;
     list_contacts_in(&conn, limit, source.as_deref())
 }
@@ -2276,7 +2276,7 @@ fn update_contact_in(conn: &Connection, email: &str, display_name: Option<&str>)
 }
 
 #[tauri::command]
-pub fn update_contact(email: String, display_name: Option<String>) -> Result<(), String> {
+pub async fn update_contact(email: String, display_name: Option<String>) -> Result<(), String> {
     let conn = open()?;
     update_contact_in(&conn, &email, display_name.as_deref())
 }
@@ -2284,7 +2284,7 @@ pub fn update_contact(email: String, display_name: Option<String>) -> Result<(),
 /// Adds a contact by hand (source "local"), for the address-book view's
 /// explicit add flow as opposed to the automatic mail harvesting.
 #[tauri::command]
-pub fn add_contact(email: String, display_name: Option<String>) -> Result<(), String> {
+pub async fn add_contact(email: String, display_name: Option<String>) -> Result<(), String> {
     let trimmed = email.trim().to_string();
     if trimmed.is_empty() || !trimmed.contains('@') {
         return Err("a contact needs a valid email address".to_string());
@@ -2307,7 +2307,7 @@ fn delete_contact_in(conn: &Connection, email: &str) -> Result<(), String> {
 }
 
 #[tauri::command]
-pub fn delete_contact(email: String) -> Result<(), String> {
+pub async fn delete_contact(email: String) -> Result<(), String> {
     let conn = open()?;
     delete_contact_in(&conn, &email)
 }
@@ -3206,6 +3206,19 @@ pub(crate) fn delete_caldav_source_db(conn: &Connection, id: i64) -> Result<(), 
         .map_err(|e| format!("could not delete events for CalDAV source {id}: {e}"))?;
     conn.execute("DELETE FROM caldav_sources WHERE id = ?1", params![id])
         .map_err(|e| format!("could not delete CalDAV source {id}: {e}"))?;
+    Ok(())
+}
+
+pub(crate) fn update_caldav_source_color_db(
+    conn: &Connection,
+    id: i64,
+    color: Option<&str>,
+) -> Result<(), String> {
+    conn.execute(
+        "UPDATE caldav_sources SET color = ?1 WHERE id = ?2",
+        params![color, id],
+    )
+    .map_err(|e| format!("could not update CalDAV source color for {id}: {e}"))?;
     Ok(())
 }
 

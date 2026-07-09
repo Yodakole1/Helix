@@ -16,8 +16,13 @@ use crate::smime;
 /// fresh access token with the XOAUTH2 mechanism pinned (offering PLAIN
 /// alongside would let the server pick a mechanism the token can't
 /// satisfy), for a password account the password with lettre's default
-/// PLAIN/LOGIN negotiation.
-async fn transport_credentials(account_id: &str) -> Result<(Credentials, Vec<Mechanism>), String> {
+/// PLAIN/LOGIN negotiation. `pub(crate)` because it is the *only* correct
+/// way to authenticate SMTP for a stored account -- anything building its
+/// own transport (`ics.rs`'s invite replies) must come through here or it
+/// silently breaks for OAuth accounts.
+pub(crate) async fn transport_credentials(
+    account_id: &str,
+) -> Result<(Credentials, Vec<Mechanism>), String> {
     let mut secret = credentials::get_credential(account_id.to_string())?;
     let result = match oauth::access_token_for_secret(account_id, &secret).await {
         Ok(Some(access_token)) => Ok((
@@ -113,6 +118,32 @@ fn build_multipart_body(text: String, html: Option<String>, attachments: &[Outgo
     Ok(mixed)
 }
 
+/// The RFC 3156 envelope: multipart/encrypted with the fixed
+/// application/pgp-encrypted version part and the armored payload as
+/// application/octet-stream. The filename on the payload part is a
+/// convention (it's what non-PGP clients show as a downloadable
+/// attachment), not something the format requires.
+fn pgp_encrypted_multipart(armored: String) -> Result<MultiPart, String> {
+    let version_part = SinglePart::builder()
+        .header(
+            ContentType::parse("application/pgp-encrypted")
+                .map_err(|e| format!("could not build PGP version part: {e}"))?,
+        )
+        .body("Version: 1\r\n".to_string());
+    let payload_part = SinglePart::builder()
+        .header(
+            ContentType::parse("application/octet-stream; name=\"encrypted.asc\"")
+                .map_err(|e| format!("could not build PGP payload part: {e}"))?,
+        )
+        .body(armored);
+    Ok(MultiPart::builder()
+        .kind(lettre::message::MultiPartKind::Encrypted {
+            protocol: "application/pgp-encrypted".to_string(),
+        })
+        .singlepart(version_part)
+        .singlepart(payload_part))
+}
+
 fn cache_contact(email: &str, name: Option<&str>) {
     let result = cache::open()
         .and_then(|conn| cache::upsert_contacts(&conn, &[(email.to_string(), name.map(|n| n.to_string()))]));
@@ -196,13 +227,6 @@ pub async fn send_message(
     smime_sign: Option<bool>,
     smime_encrypt: Option<bool>,
 ) -> Result<(), String> {
-    if encrypt && (html.is_some() || !attachments.is_empty()) {
-        return Err(
-            "PGP encryption only supports a plain-text body -- remove the HTML body and attachments, or disable encryption"
-                .to_string(),
-        );
-    }
-
     let do_smime_sign = smime_sign.unwrap_or(false);
     let do_smime_encrypt = smime_encrypt.unwrap_or(false);
 
@@ -243,13 +267,6 @@ pub async fn send_message(
 
     let (creds, auth_mechanisms) = transport_credentials(&account_id).await?;
 
-    let body = if encrypt {
-        let to_email = to_list[0].email.to_string();
-        pgp::encrypt_and_sign(&account_id, &to_email, &body)?
-    } else {
-        body
-    };
-
     let from_addr = from_override.as_deref().unwrap_or(&account_id);
     let from = from_addr
         .parse()
@@ -285,6 +302,23 @@ pub async fn send_message(
         email_builder
             .singlepart(SinglePart::builder().header(ct).body(smime_body))
             .map_err(|e| format!("could not build S/MIME message: {e}"))?
+    } else if encrypt {
+        // PGP/MIME (RFC 3156): serialize the message content -- plain
+        // text, or the full multipart tree with HTML and attachments --
+        // as one MIME entity, encrypt+sign that, and wrap it in
+        // multipart/encrypted. Encrypting the complete entity is what
+        // lets an encrypted message carry attachments without silently
+        // leaving part of it in the clear.
+        let to_email = to_list[0].email.to_string();
+        let inner_bytes = if html.is_none() && attachments.is_empty() {
+            SinglePart::plain(body).formatted()
+        } else {
+            build_multipart_body(body, html, &attachments)?.formatted()
+        };
+        let armored = pgp::encrypt_and_sign_bytes(&account_id, &to_email, &inner_bytes)?;
+        email_builder
+            .multipart(pgp_encrypted_multipart(armored)?)
+            .map_err(|e| format!("could not build PGP/MIME message: {e}"))?
     } else if html.is_none() && attachments.is_empty() {
         email_builder
             .header(ContentType::TEXT_PLAIN)
@@ -318,7 +352,11 @@ pub async fn send_message(
     mailer
         .send(email)
         .await
-        .map_err(|e| format!("send failed: {e}"))?;
+        .map_err(|e| {
+            crate::debug_log::record("smtp", format!("send via {host}:{port} from {account_id} failed: {e}"));
+            format!("send failed: {e}")
+        })?;
+    crate::debug_log::record("smtp", format!("sent message via {host}:{port} from {account_id}"));
 
     // Harvest every recipient into the contact cache -- sending to someone is
     // a real correspondence signal regardless of which field they were in.
@@ -781,11 +819,14 @@ mod tests {
         use lettre::transport::smtp::client::{Tls, TlsParameters};
 
         crate::pgp::generate_keypair("helix@helix.test".to_string(), "Helix Test".to_string())
+            .await
             .expect("keygen should succeed");
         let public_key = crate::pgp::export_public_key("helix@helix.test".to_string())
+            .await
             .expect("export should succeed")
             .public_key;
         crate::pgp::import_contact_key("helix@helix.test".to_string(), public_key)
+            .await
             .expect("import should succeed");
 
         let plaintext = "This was sent through send_message's encrypted SMTP path.";

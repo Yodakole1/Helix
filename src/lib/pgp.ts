@@ -63,3 +63,20 @@ export function deleteContactKey(email: string): Promise<void> {
 export function discoverPgpKeyWkd(email: string): Promise<PublicKeyInfo> {
   return invoke("discover_pgp_key_wkd", { email });
 }
+
+export interface WkdEnsureOutcome {
+  // "already_present": a stored key was kept as-is; "imported": a new key
+  // was fetched via WKD and stored.
+  status: "already_present" | "imported";
+  fingerprint: string;
+}
+
+// Opportunistic WKD acquisition for the compose/encrypt flow: ensures a key
+// exists for `email` so the message can be encrypted, but never overwrites a
+// key already on file (a manually verified key must not be silently replaced
+// by whatever the domain's WKD currently serves). Use discoverPgpKeyWkd +
+// importContactKey for the explicit, overwrite-capable key-management path.
+// Throws if the domain publishes no key for the address.
+export function ensureContactKeyWkd(email: string): Promise<WkdEnsureOutcome> {
+  return invoke("ensure_contact_key_wkd", { email });
+}

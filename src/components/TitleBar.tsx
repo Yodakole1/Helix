@@ -12,7 +12,7 @@ import {
   type MessageFilters,
 } from "../lib/messageFilters";
 import type { HoverState } from "../lib/pressable";
-import { colors, fontFamily, fontSize, radii, spacing, withAlpha } from "../theme";
+import { colors, fontFamily, fontSize, isLightTheme, radii, spacing, withAlpha } from "../theme";
 import { Dropdown } from "./Dropdown";
 import { FloatingPortal } from "./FloatingPortal";
 import { ListIcon } from "./ListIcon";
@@ -374,9 +374,9 @@ const styles = StyleSheet.create({
     paddingVertical: 6,
     position: "relative",
     zIndex: 20,
-    backgroundColor: "rgba(10,10,15,0.72)",
+    backgroundColor: isLightTheme ? "rgba(226,228,232,0.85)" : "rgba(10,10,15,0.72)",
     borderBottomWidth: 1,
-    borderBottomColor: "rgba(255,255,255,0.06)",
+    borderBottomColor: colors.border.subtle,
   },
   // Browser-style shrink: the strip flexes but never pushes the search or
   // window controls off; each tab starts at its preferred width and every

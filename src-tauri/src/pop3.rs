@@ -135,13 +135,22 @@ async fn connect_and_login(
     account_id: &str,
     password: &str,
 ) -> Result<Pop3Session, String> {
-    let mut session = connect_pop3s(host, port).await?;
+    let mut session = connect_pop3s(host, port).await.map_err(|e| {
+        crate::debug_log::record("pop3", format!("connect to {host}:{port} failed: {e}"));
+        e
+    })?;
 
     send_command(&mut session, &format!("USER {account_id}")).await?;
-    read_status_line(&mut session).await.map_err(|e| format!("login failed: {e}"))?;
+    read_status_line(&mut session).await.map_err(|e| {
+        crate::debug_log::record("pop3", format!("login to {host}:{port} as {account_id} failed: {e}"));
+        format!("login failed: {e}")
+    })?;
 
     send_command(&mut session, &format!("PASS {password}")).await?;
-    read_status_line(&mut session).await.map_err(|e| format!("login failed: {e}"))?;
+    read_status_line(&mut session).await.map_err(|e| {
+        crate::debug_log::record("pop3", format!("login to {host}:{port} as {account_id} failed: {e}"));
+        format!("login failed: {e}")
+    })?;
 
     Ok(session)
 }
@@ -353,22 +362,14 @@ pub async fn list_messages(
     result
 }
 
-/// `RETR n` -- fetches one message's raw RFC 822 bytes. Split out from
-/// `retrieve_message` so `fetch_attachment` can re-fetch the same raw bytes
-/// without going through the full body-parsing path, same split as
-/// `imap.rs`'s `fetch_raw_message_by_uid`/`fetch_body_by_uid`.
+/// `RETR n` -- fetches one message's raw RFC 822 bytes, kept separate from
+/// body-parsing so `fetch_attachment` can re-fetch the same raw bytes
+/// without going through the full parse path, same split as `imap.rs`'s
+/// `fetch_raw_message_by_uid`/`fetch_body_by_uid`.
 async fn retrieve_raw_message(session: &mut Pop3Session, number: u32) -> Result<Vec<u8>, String> {
     send_command(session, &format!("RETR {number}")).await?;
     read_status_line(session).await.map_err(|e| format!("RETR failed: {e}"))?;
     read_multiline_raw(session).await.map_err(|e| format!("RETR failed: {e}"))
-}
-
-async fn retrieve_message(
-    session: &mut Pop3Session,
-    number: u32,
-) -> Result<(MessageBody, Option<String>, Vec<(String, Option<String>)>), String> {
-    let raw = retrieve_raw_message(session, number).await?;
-    imap::parse_message_body(&raw)
 }
 
 /// Same best-effort, log-and-continue caching as the IMAP and SMTP
@@ -409,6 +410,10 @@ pub async fn fetch_message(account_id: String, host: String, port: u16, number: 
     let (body, sender_email, contacts) = imap::parse_message_body(&raw)?;
     cache_contacts(&contacts);
     cache_body(&account_id, uidl.as_deref(), &body);
+    // Same order as imap::fetch_message_body: harvest a sender key the
+    // message may carry, then PGP/MIME, then legacy inline armor.
+    pgp::harvest_autocrypt(sender_email.as_deref(), &raw);
+    let body = pgp::maybe_decrypt_mime(&account_id, sender_email.as_deref(), body, &raw);
     let body = pgp::maybe_decrypt(&account_id, sender_email.as_deref(), body);
     let body = smime::maybe_process_smime(&account_id, body, &raw);
 
@@ -475,7 +480,11 @@ pub async fn pop3_fetch_attachment(
     };
     quit(&mut session).await;
 
-    let content = imap::extract_attachment(&result?, attachment_index)?;
+    // Same PGP/MIME view alignment as imap::fetch_attachment: indexes
+    // refer to the decrypted content when the message is encrypted.
+    let raw = result?;
+    let raw = pgp::maybe_decrypt_raw(&account_id, &raw).unwrap_or(raw);
+    let content = imap::extract_attachment(&raw, attachment_index)?;
     cache_attachment(&account_id, uidl.as_deref(), attachment_index, &content);
     Ok(content)
 }
@@ -605,8 +614,9 @@ mod tests {
     async fn fetches_a_real_message_body_from_a_local_test_server() {
         let mut session = connect_to_greenmail_and_login().await;
 
-        let (body, sender_email, contacts) = retrieve_message(&mut session, 1).await.expect("fetch should succeed");
+        let raw = retrieve_raw_message(&mut session, 1).await.expect("RETR should succeed");
         quit(&mut session).await;
+        let (body, sender_email, contacts) = imap::parse_message_body(&raw).expect("parse should succeed");
 
         assert_eq!(body.text.as_deref(), Some("This is a test message body for Helix POP3 fetch testing."));
         assert_eq!(sender_email.as_deref(), Some("sender@helix.test"));

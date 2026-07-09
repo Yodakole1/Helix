@@ -36,7 +36,75 @@ one, Settings > Accounts > "Add account" -- opens the account setup page
    later from Settings, and "Skip, just mail" sets up only the mailbox.
 
 Remove or edit an account later from Settings > Accounts. Removing an
-account deletes its keychain credential and its cached mail.
+account deletes its keychain credential and its cached mail. For a
+Google account added via "Sign in with Google", Helix also disconnects
+itself on Google's side, so nothing lingers under your Google Account's
+"Third-party apps" list. Microsoft offers no way for an app to do that
+about itself -- if you remove a Microsoft 365 account and want the
+authorization gone too, revoke Helix under account.microsoft.com >
+Privacy > App access.
+
+### Switching from Thunderbird
+
+If Thunderbird is installed on the same computer, press **"Import from
+Thunderbird..."** at the bottom of the add-account page. Helix reads your
+Thunderbird profile and lists the accounts it finds; pick one and its
+server settings (address, incoming and outgoing servers, ports, and
+encryption) fill in the form for you. Enter that account's password and
+press Connect -- Helix verifies it against the server exactly like a
+hand-entered account before saving.
+
+Helix only reads Thunderbird's settings; it never changes anything in
+Thunderbird. Passwords aren't copied over, because Thunderbird keeps them
+in its own encrypted store -- so you enter each password once, here.
+
+### Importing many accounts from a file
+
+If you have a lot of mailboxes to set up (say, a dozen addresses on your
+own domain), you don't have to click through the form for each one. Copy
+[`accounts-import.example.txt`](../../accounts-import.example.txt) from
+the Helix repository, fill in one block per account, and press "Import
+accounts from a file..." at the bottom of the add-account page.
+
+Each block is plain `key: value` lines (a `=` also works), and there is
+no limit on how many blocks a file can hold. Blank lines (or a `---`
+line) separate accounts; lines starting with `#` or `;` are comments.
+The full set of keys:
+
+| Key | Meaning |
+| --- | --- |
+| `email_address` | The account's address. Required. (`email` works too.) |
+| `password` | The account or app password. Required. Stored only in your OS keychain. |
+| `display_name` | Optional account label, same as the form's "Display name". |
+| `imap_host`, `imap_port`, `imap_starttls` | IMAP server. Port defaults to 993, or 143 with `imap_starttls: on`. |
+| `pop3_host`, `pop3_port` | POP3 server instead of IMAP (never both). Port defaults to 995. |
+| `smtp_host`, `smtp_port`, `smtp_starttls` | Outgoing server. Port defaults to 465, or 587 with `smtp_starttls: on`. |
+| `caldav_state` | `on` to also connect the provider's calendar (CalDAV) with the same credentials. |
+| `carddav_state` | `on` to also connect the provider's address book (CardDAV) with the same credentials. |
+
+Only `email_address` and `password` are required: leave all the server
+keys out and Helix auto-discovers the servers from the address, exactly
+like the form with "advanced server settings" collapsed. If you do name
+a server, name both sides -- the incoming host (`imap_host` or
+`pop3_host`) and `smtp_host`. All connections use TLS or STARTTLS; there
+is no plaintext option to configure.
+
+A mistake in the file -- a misspelled key, a missing password, a bad
+port -- stops the import before anything is touched, with the line
+number, so you can fix it and try again. (One exception on spelling:
+`email_adress` with one d is accepted.)
+
+Every account in the file is verified against its real server exactly
+like the form would, and you get a per-account result list: added,
+skipped (already configured), or failed with the reason. One wrong
+password only fails that account, never the whole run.
+
+**The file is deleted after the import.** It contains your passwords in
+plain text, so once they're safely in your OS keychain Helix overwrites
+and removes it -- don't keep a filled-in copy anywhere, and never share
+one. (If the file has a syntax error, nothing is imported and the file is
+left in place for you to fix -- the error message will remind you it
+still contains passwords.)
 
 ## The window
 
@@ -79,11 +147,15 @@ view with a back button.
   "mark unread" is in the action row.
 - **Action row**: star, archive, spam, delete, snooze, mark unread, print,
   view source, mute thread. Moves and deletes show up in the destination
-  folder immediately.
+  folder immediately. In the Archive folder the archive button becomes
+  **Unarchive** and moves the message back to the inbox.
 - **Remote images** are blocked by default (they're how senders track
   you). Per message you can load them once, or allow a sender's domain
   permanently; the default lives in Settings > Privacy & Security.
-- **Attachments** are listed with name and size -- click to download.
+- **Attachments**: click one to open it right away -- images, PDFs, and
+  text files display inside Helix; other types open in your system's
+  default app. **Download** is separate and saves a copy into your OS
+  Downloads folder, confirmed with a small toast showing where it went.
   Calendar invites (.ics) render as a card with Accept / Tentative /
   Decline buttons that reply to the organizer.
 - **Conversation view** (Settings > General) groups a folder into
@@ -108,8 +180,9 @@ so you can keep reading while you write.
 - **Formatting**: compose is rich text by default -- bold, italic,
   underline, bulleted and numbered lists, and links (select text, press
   the link button, type the URL) all work directly. The "RT" button
-  switches to plain text and back; PGP-encrypted mail always sends as
-  plain text.
+  switches to plain text and back. Encrypted mail keeps its formatting
+  and attachments -- everything travels inside the encrypted envelope
+  (PGP/MIME).
 - **Attachments**: the paperclip stages files as chips showing name and
   size. Attaching a file with the same name again *replaces* it and marks
   the chip "v2" -- updating a document never silently duplicates it.
@@ -134,10 +207,19 @@ The sidebar's Calendar button opens the calendar tab; the sidebar then
 lists your connected calendars.
 
 - Calendars come from CalDAV -- added during account setup or later via
-  "Add calendar" (username + password is usually enough; Helix finds the
-  server itself).
-- Create events by clicking a day; edit or delete by clicking an event.
-  Events support location, description, recurrence, and a reminder.
+  "Add calendar". Username + password is usually enough: the server
+  field pre-fills itself as mail.<your-domain>:2080 (the common setup)
+  and stays editable if your provider differs.
+- Removing a calendar lives in Settings > Calendar -- deliberately not a
+  one-click x in the sidebar.
+- Create events with "+ Add task"; every event is editable -- select a
+  day and use **Edit** or **Delete** on any event in its detail panel.
+  Events support location, recurrence, a reminder, and **all-day** (the
+  "All day" pill hides the time fields). Times are always shown in
+  24-hour format.
+- Each calendar has its own color: click its chip in the legend above
+  the grid to pick from the palette (or a fully custom color) -- events
+  tint to match.
 - **Reminders**: Helix checks upcoming events and fires a desktop
   notification shortly before each one starts. Configure the lead time
   (or turn reminders off) in Settings > Notifications.
@@ -179,12 +261,29 @@ Settings stage your changes: nothing applies until you press **Save**
 way discards the changes.
 
 - **General**: compact list, unified inbox, conversation view, separate
-  unread/read sections, signature.
+  unread/read sections, spell checking in compose (offline, via your OS
+  dictionaries), signature, and **Set as default mail client** -- once
+  set, clicking an email link anywhere on your system opens a pre-filled
+  compose window in Helix.
 - **Accounts**: connected accounts, add/edit/remove, send-as aliases.
-- **Appearance**: text size (Small / Default / Large / Larger), accent
-  color per account, typography. Dark is the only theme, by design.
-- **Notifications**: OS permission, new-mail notifications, calendar
-  reminders and their lead time.
+  For a Google/Microsoft account, Edit offers **"Sign in with ... again"**
+  instead of a password field -- use it if the account stops working
+  (sign-in revoked from the provider's security page, expired after long
+  inactivity, or invalidated by a password change). It re-runs the
+  browser sign-in and keeps the account, its cached mail, and its
+  settings; nothing is removed.
+- **Appearance**: theme -- **Dark** (the default) or **Light**, a soft
+  gray take rather than glaring white; text size (Small up to Huge); the
+  accent color per account, picked from a large palette or a fully
+  custom color; avatar colors -- every starting letter (A-Z) gets its own
+  distinct color for sender/contact letter avatars in the inbox and
+  address book, and you choose how loud that palette is: **Muted**,
+  **Balanced** (the default), or **Vivid**; typography.
+- **Notifications**: OS permission, new-mail notifications (fired
+  instantly from the live IMAP connection), calendar reminders and their
+  lead time. With **Debug mode** on (see About below), a **Send test
+  notification** button appears here to prove the whole pipeline works
+  end to end.
 - **Privacy & Security**: remote-image blocking, read receipts, encrypt
   by default, the app lock, PGP keys, S/MIME certificates.
 - **Contacts / Calendar**: CardDAV and CalDAV sources.
@@ -208,6 +307,13 @@ way discards the changes.
   **Check for updates** -- updates download from the official release feed
   and are cryptographically verified before installing, and Helix only
   checks when you press the button (it never phones home on its own).
+  Also home to **Debug mode**: a toggle that reveals the **debug log** (a
+  local, in-memory record of what the app did recently -- server
+  connections, sends, sync requests, notifications, with no passwords or
+  tokens in it) plus the test-notification button under Notifications.
+  It's for troubleshooting; copy the log from here when reporting a
+  problem. The log never leaves your computer and clears when the app
+  closes.
 
 ## Keyboard shortcuts (defaults)
 

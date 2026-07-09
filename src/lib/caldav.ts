@@ -86,6 +86,13 @@ export async function listCalDavSources(): Promise<CalDavSource[]> {
   return invoke("list_caldav_sources");
 }
 
+/** Sets (or clears) a calendar's display color -- a purely local preference
+ * used to tint its events in the calendar grid. */
+export async function updateCalDavSourceColor(id: number, color: string | null): Promise<void> {
+  if (!isTauri()) return;
+  return invoke("update_caldav_source_color", { id, color });
+}
+
 export async function deleteCalDavSource(id: number): Promise<void> {
   if (!isTauri()) return;
   return invoke("delete_caldav_source", { id });

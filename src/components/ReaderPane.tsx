@@ -8,7 +8,7 @@ import { useAnchorRect } from "../hooks/useAnchorRect";
 import type { HoverState } from "../lib/pressable";
 import { sanitizeHtml } from "../lib/sanitizeHtml";
 import { glassPanel } from "../lib/webStyle";
-import { colorForIndex, colors, fontFamily, fontSize, radii, spacing, withAlpha } from "../theme";
+import { colorForIndex, colors, fontFamily, fontSize, isLightTheme, radii, spacing, withAlpha } from "../theme";
 import { FloatingPortal } from "./FloatingPortal";
 import { FolderIcon } from "./FolderIcon";
 import { InviteCard } from "./InviteCard";
@@ -28,6 +28,9 @@ interface ReaderPaneProps {
   isMuted: boolean;
   // True when the current folder is Spam/Junk -- shows the "Not spam" banner.
   isSpamFolder?: boolean;
+  // True when the current folder is the Archive -- the Archive button then
+  // reads "Unarchive" and onArchive moves the message back to the inbox.
+  isArchiveFolder?: boolean;
   // Present only when rendered in the mobile single-pane view-stack.
   onBack?: () => void;
   onReply: (message: SampleMessage) => void;
@@ -43,6 +46,9 @@ interface ReaderPaneProps {
   // Called with an ISO 8601 snooze-until timestamp chosen by the user.
   onSnooze?: (id: number, until: string) => void;
   onDownloadAttachment: (uid: number, attachmentIndex: number) => void;
+  // Opens the attachment for viewing (in-app for images, OS default app
+  // otherwise) without saving a copy to Downloads.
+  onOpenAttachment?: (uid: number, attachmentIndex: number) => void;
   onMuteThread?: (messageId: string, muted: boolean) => void;
   // Returns raw RFC 822 bytes as base64. Undefined for POP3 and sample
   // messages that have no real IMAP UID -- hides source/EML actions.
@@ -67,6 +73,7 @@ export function ReaderPane({
   onAllowImageDomain,
   isMuted,
   isSpamFolder,
+  isArchiveFolder,
   onBack,
   onReply,
   onReplyAll,
@@ -79,6 +86,7 @@ export function ReaderPane({
   onNotSpam,
   onSnooze,
   onDownloadAttachment,
+  onOpenAttachment,
   onMuteThread,
   onFetchSource,
   onFetchInvite,
@@ -170,7 +178,7 @@ export function ReaderPane({
     return (
       <View style={[styles.pane, styles.emptyPane]}>
         <View style={styles.emptyIcon}>
-          <svg width={40} height={40} viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth={1.2} strokeLinecap="round" strokeLinejoin="round" style={{ color: "rgba(255,255,255,0.12)" }}>
+          <svg width={40} height={40} viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth={1.2} strokeLinecap="round" strokeLinejoin="round" style={{ color: colors.border.subtle }}>
             <rect x="2" y="5" width="20" height="14" rx="2" />
             <polyline points="2 5 12 13 22 5" />
           </svg>
@@ -231,43 +239,65 @@ export function ReaderPane({
     const presets: Array<{ label: string; sublabel: string; iso: string }> = [];
     const later = new Date(now.getTime() + 3 * 60 * 60 * 1000);
     if (later.getDate() === now.getDate()) {
-      presets.push({ label: "Later today", sublabel: later.toLocaleTimeString([], { hour: "2-digit", minute: "2-digit" }), iso: later.toISOString() });
+      presets.push({ label: "Later today", sublabel: later.toLocaleTimeString([], { hour: "2-digit", minute: "2-digit", hour12: false }), iso: later.toISOString() });
     }
     const tomorrow = new Date(now); tomorrow.setDate(tomorrow.getDate() + 1); tomorrow.setHours(8, 0, 0, 0);
-    presets.push({ label: "Tomorrow morning", sublabel: `${tomorrow.toLocaleDateString([], { weekday: "short" })} 8:00 AM`, iso: tomorrow.toISOString() });
+    presets.push({ label: "Tomorrow morning", sublabel: `${tomorrow.toLocaleDateString([], { weekday: "short" })} 08:00`, iso: tomorrow.toISOString() });
     const dayOfWeek = now.getDay();
     if (dayOfWeek < 6) {
       const sat = new Date(now); sat.setDate(sat.getDate() + (6 - dayOfWeek)); sat.setHours(8, 0, 0, 0);
-      presets.push({ label: "This weekend", sublabel: "Sat 8:00 AM", iso: sat.toISOString() });
+      presets.push({ label: "This weekend", sublabel: "Sat 08:00", iso: sat.toISOString() });
     }
     const daysToMon = dayOfWeek === 0 ? 1 : (8 - dayOfWeek) % 7 || 7;
     const mon = new Date(now); mon.setDate(mon.getDate() + daysToMon); mon.setHours(8, 0, 0, 0);
-    presets.push({ label: "Next week", sublabel: "Mon 8:00 AM", iso: mon.toISOString() });
+    presets.push({ label: "Next week", sublabel: "Mon 08:00", iso: mon.toISOString() });
     return presets;
   }
 
-  // Opens the message in a throwaway window and triggers the OS print
-  // dialog -- the standard "Print" every desktop mail client has. Reuses
-  // the already-sanitized HTML body when there is one (safe to inject,
-  // DOMPurify ran over it); otherwise the plain-text body is HTML-escaped
-  // so a message that happens to contain markup can't inject into the
-  // print document.
+  // Triggers the OS print dialog for the open message -- the standard
+  // "Print" every desktop mail client has. The document is staged in a
+  // hidden same-page iframe rather than window.open(): the Tauri shell
+  // (WebKitGTK on Linux) intercepts window.open and never yields a
+  // printable window, while an in-document iframe prints reliably in both
+  // the desktop app and browser dev mode. Reuses the already-sanitized
+  // HTML body when there is one (safe to inject, DOMPurify ran over it);
+  // otherwise the plain-text body is HTML-escaped so a message that
+  // happens to contain markup can't inject into the print document.
   function handlePrint() {
-    const printWindow = window.open("", "_blank", "width=820,height=640");
-    if (!printWindow) return;
     const bodyHtml = sanitizedBody ?? `<pre style="white-space:pre-wrap;font-family:sans-serif">${escapeHtml(textBody ?? "")}</pre>`;
-    printWindow.document.write(
-      `<!doctype html><html><head><meta charset="utf-8" /><meta http-equiv="Content-Security-Policy" content="default-src 'none'; style-src 'unsafe-inline'; img-src * data: blob:; font-src *;"><title>${escapeHtml(message!.subject)}</title>` +
-        `<style>body{font-family:sans-serif;color:#000;margin:32px;line-height:1.5}` +
-        `h1{font-size:18px;margin:0 0 12px}.meta{font-size:13px;color:#444;margin-bottom:16px}` +
-        `hr{border:none;border-top:1px solid #ccc;margin:16px 0}img{max-width:100%}</style></head><body>` +
-        `<h1>${escapeHtml(message!.subject)}</h1>` +
-        `<div class="meta"><strong>From:</strong> ${escapeHtml(message!.sender)} &lt;${escapeHtml(message!.senderEmail)}&gt;<br />` +
-        `<strong>Date:</strong> ${escapeHtml(formatMessageTime(message!.date))}</div><hr />${bodyHtml}</body></html>`,
-    );
-    printWindow.document.close();
-    printWindow.focus();
-    printWindow.print();
+    const doc =
+      `<!doctype html><html><head><meta charset="utf-8" /><title>${escapeHtml(message!.subject)}</title>` +
+      `<style>body{font-family:sans-serif;color:#000;margin:32px;line-height:1.5}` +
+      `h1{font-size:18px;margin:0 0 12px}.meta{font-size:13px;color:#444;margin-bottom:16px}` +
+      `hr{border:none;border-top:1px solid #ccc;margin:16px 0}img{max-width:100%}</style></head><body>` +
+      `<h1>${escapeHtml(message!.subject)}</h1>` +
+      `<div class="meta"><strong>From:</strong> ${escapeHtml(message!.sender)} &lt;${escapeHtml(message!.senderEmail)}&gt;<br />` +
+      `<strong>Date:</strong> ${escapeHtml(formatMessageTime(message!.date))}</div><hr />${bodyHtml}</body></html>`;
+
+    const frame = document.createElement("iframe");
+    frame.style.position = "fixed";
+    frame.style.right = "0";
+    frame.style.bottom = "0";
+    frame.style.width = "0";
+    frame.style.height = "0";
+    frame.style.border = "none";
+    document.body.appendChild(frame);
+    const frameDoc = frame.contentDocument;
+    if (!frameDoc) {
+      frame.remove();
+      return;
+    }
+    frameDoc.open();
+    frameDoc.write(doc);
+    frameDoc.close();
+    // Give the iframe a beat to lay out (images/styles) before printing;
+    // removing it immediately after print returns cancels the dialog on
+    // some engines, so it lingers briefly instead.
+    window.setTimeout(() => {
+      frame.contentWindow?.focus();
+      frame.contentWindow?.print();
+      window.setTimeout(() => frame.remove(), 60_000);
+    }, 150);
   }
 
   return (
@@ -367,7 +397,7 @@ export function ReaderPane({
               )}
             </Pressable>
           </Tooltip>
-          <Tooltip label="Archive">
+          <Tooltip label={isArchiveFolder ? "Unarchive — move back to Inbox" : "Archive"}>
             <Pressable
               onPress={() => onArchive(message.id)}
               style={({ hovered }: HoverState) => [
@@ -376,7 +406,11 @@ export function ReaderPane({
               ]}
             >
               {({ hovered }: HoverState) => (
-                <FolderIcon id="archive" size={18} color={hovered ? accentColor : colors.text.muted} />
+                <FolderIcon
+                  id={isArchiveFolder ? "inbox" : "archive"}
+                  size={18}
+                  color={hovered ? accentColor : colors.text.muted}
+                />
               )}
             </Pressable>
           </Tooltip>
@@ -537,7 +571,7 @@ export function ReaderPane({
                     fontFamily: fontFamily.ui,
                     fontSize: 12,
                     padding: "4px 8px",
-                    colorScheme: "dark",
+                    colorScheme: isLightTheme ? "light" : "dark",
                     outline: "none",
                   }}
                 />
@@ -693,34 +727,60 @@ export function ReaderPane({
         )}
 
         {hasActualRemoteImages && (
-          <View style={styles.imageBlocked}>
-            <Text style={styles.imageBlockedText}>
-              Remote images blocked — loading them tells the sender when you opened this email.
-            </Text>
-            {showImagesPicker ? (
-              <View style={styles.imageBlockedPicker}>
-                <Pressable
-                  onPress={() => { setShowImagesOverride(true); setShowImagesPicker(false); }}
-                  style={[styles.imagePickerOption, { borderColor: accentColor }]}
-                >
-                  <Text style={[styles.imagePickerOptionText, { color: accentColor }]}>Just this time</Text>
-                </Pressable>
-                {!!senderDomain && (
+          <View style={[styles.imageBlocked, { borderColor: withAlpha(accentColor, 0.35) }]}>
+            <View style={[styles.imageBlockedIcon, { backgroundColor: withAlpha(accentColor, 0.14) }]}>
+              <svg width={16} height={16} viewBox="0 0 24 24" fill="none" stroke={accentColor} strokeWidth={1.8} strokeLinecap="round" strokeLinejoin="round">
+                <rect x="3" y="3" width="18" height="18" rx="2" />
+                <circle cx="8.5" cy="8.5" r="1.5" />
+                <path d="M21 15l-5-5L5 21" />
+              </svg>
+            </View>
+            <View style={styles.imageBlockedBody}>
+              <Text style={styles.imageBlockedTitle}>Remote images blocked</Text>
+              <Text style={styles.imageBlockedText}>
+                Loading them can tell the sender when you opened this email.
+              </Text>
+              {showImagesPicker && (
+                <View style={styles.imageBlockedPicker}>
                   <Pressable
-                    onPress={() => { onAllowImageDomain(senderDomain); setShowImagesPicker(false); }}
-                    style={[styles.imagePickerOption, { borderColor: accentColor }]}
+                    onPress={() => { setShowImagesOverride(true); setShowImagesPicker(false); }}
+                    style={({ hovered }: HoverState) => [
+                      styles.imagePickerOption,
+                      { borderColor: accentColor },
+                      hovered && { backgroundColor: withAlpha(accentColor, 0.12) },
+                    ]}
                   >
-                    <Text style={[styles.imagePickerOptionText, { color: accentColor }]}>
-                      Always from {senderDomain}
-                    </Text>
+                    <Text style={[styles.imagePickerOptionText, { color: accentColor }]}>Just this time</Text>
                   </Pressable>
-                )}
-                <Pressable onPress={() => setShowImagesPicker(false)}>
-                  <Text style={[styles.imageBlockedAction, { color: colors.text.muted }]}>Cancel</Text>
-                </Pressable>
-              </View>
-            ) : (
-              <Pressable onPress={() => setShowImagesPicker(true)}>
+                  {!!senderDomain && (
+                    <Pressable
+                      onPress={() => { onAllowImageDomain(senderDomain); setShowImagesPicker(false); }}
+                      style={({ hovered }: HoverState) => [
+                        styles.imagePickerOption,
+                        { borderColor: accentColor },
+                        hovered && { backgroundColor: withAlpha(accentColor, 0.12) },
+                      ]}
+                    >
+                      <Text style={[styles.imagePickerOptionText, { color: accentColor }]}>
+                        Always from {senderDomain}
+                      </Text>
+                    </Pressable>
+                  )}
+                  <Pressable onPress={() => setShowImagesPicker(false)} style={styles.imagePickerCancel}>
+                    <Text style={[styles.imageBlockedAction, { color: colors.text.muted }]}>Cancel</Text>
+                  </Pressable>
+                </View>
+              )}
+            </View>
+            {!showImagesPicker && (
+              <Pressable
+                onPress={() => setShowImagesPicker(true)}
+                style={({ hovered }: HoverState) => [
+                  styles.imageShowBtn,
+                  { borderColor: accentColor },
+                  hovered && { backgroundColor: withAlpha(accentColor, 0.12) },
+                ]}
+              >
                 <Text style={[styles.imageBlockedAction, { color: accentColor }]}>Show images</Text>
               </Pressable>
             )}
@@ -761,38 +821,84 @@ export function ReaderPane({
             // "error" or undefined -- fall through to the plain download card
           }
 
+          const fetchable = message?.uid !== undefined || message?.pop3Number !== undefined;
+          const uidOrNumber = (message?.uid ?? message?.pop3Number)!;
+          const isImage = (att.contentType ?? "").startsWith("image/");
+          const ext = (att.name.includes(".") ? att.name.split(".").pop()! : "").slice(0, 4).toUpperCase();
           return (
           <View
             key={att.index}
-            style={[styles.vaultCard, { borderColor: accentColor }]}
+            style={[styles.vaultCard, { borderColor: withAlpha(accentColor, 0.4) }]}
           >
-            <View style={[styles.vaultLock, { backgroundColor: accentColor }]} />
-            <View style={styles.vaultText}>
-              <Text style={styles.vaultName}>{att.name}</Text>
-              <Text style={styles.vaultMeta}>
-                {att.contentType ?? "application/octet-stream"} · {formatBytes(att.size)}
-              </Text>
-            </View>
-            {message?.uid !== undefined || message?.pop3Number !== undefined ? (
-              <Pressable
-                onPress={() => onDownloadAttachment((message.uid ?? message.pop3Number)!, att.index)}
-                style={({ hovered }: HoverState) => [
-                  styles.downloadButton,
-                  { borderColor: accentColor },
-                  hovered && { backgroundColor: accentColor },
-                ]}
-              >
-                {({ hovered }: HoverState) => (
-                  <Text style={[styles.downloadButtonText, hovered && { color: colors.background.base }]}>
-                    Download
-                  </Text>
+            {/* Clicking the badge/name opens the attachment in the in-app
+                viewer (or the OS default app) -- no download required. The
+                explicit Download button is the only thing that writes to
+                the Downloads folder. */}
+            <Pressable
+              disabled={!fetchable || !onOpenAttachment}
+              onPress={() => onOpenAttachment?.(uidOrNumber, att.index)}
+              style={styles.attachmentBody}
+            >
+              <View style={[styles.fileBadge, { backgroundColor: withAlpha(accentColor, 0.13) }]}>
+                {isImage ? (
+                  <svg width={18} height={18} viewBox="0 0 24 24" fill="none" stroke={accentColor} strokeWidth={1.7} strokeLinecap="round" strokeLinejoin="round">
+                    <rect x="3" y="3" width="18" height="18" rx="2" />
+                    <circle cx="8.5" cy="8.5" r="1.5" />
+                    <path d="M21 15l-5-5L5 21" />
+                  </svg>
+                ) : (
+                  <svg width={18} height={18} viewBox="0 0 24 24" fill="none" stroke={accentColor} strokeWidth={1.7} strokeLinecap="round" strokeLinejoin="round">
+                    <path d="M14 2H6a2 2 0 0 0-2 2v16a2 2 0 0 0 2 2h12a2 2 0 0 0 2-2V8z" />
+                    <polyline points="14 2 14 8 20 8" />
+                  </svg>
                 )}
-              </Pressable>
-            ) : (
-              <View style={styles.downloadButtonDisabled}>
-                <Text style={styles.downloadButtonText}>Download</Text>
+                {!!ext && <Text style={[styles.fileBadgeExt, { color: accentColor }]}>{ext}</Text>}
               </View>
-            )}
+              <View style={styles.vaultText}>
+                <Text style={styles.vaultName}>{att.name}</Text>
+                <Text style={styles.vaultMeta}>
+                  {att.contentType ?? "application/octet-stream"} · {formatBytes(att.size)}
+                </Text>
+              </View>
+            </Pressable>
+            <View style={styles.attachmentActions}>
+              {fetchable && onOpenAttachment ? (
+                <Pressable
+                  onPress={() => onOpenAttachment(uidOrNumber, att.index)}
+                  style={({ hovered }: HoverState) => [
+                    styles.downloadButton,
+                    { borderColor: accentColor, backgroundColor: withAlpha(accentColor, 0.1) },
+                    hovered && { backgroundColor: accentColor },
+                  ]}
+                >
+                  {({ hovered }: HoverState) => (
+                    <Text style={[styles.downloadButtonText, { color: accentColor }, hovered && { color: colors.background.base }]}>
+                      Open
+                    </Text>
+                  )}
+                </Pressable>
+              ) : null}
+              {fetchable ? (
+                <Pressable
+                  onPress={() => onDownloadAttachment(uidOrNumber, att.index)}
+                  style={({ hovered }: HoverState) => [
+                    styles.downloadButton,
+                    { borderColor: accentColor },
+                    hovered && { backgroundColor: accentColor },
+                  ]}
+                >
+                  {({ hovered }: HoverState) => (
+                    <Text style={[styles.downloadButtonText, hovered && { color: colors.background.base }]}>
+                      Download
+                    </Text>
+                  )}
+                </Pressable>
+              ) : (
+                <View style={styles.downloadButtonDisabled}>
+                  <Text style={styles.downloadButtonText}>Download</Text>
+                </View>
+              )}
+            </View>
           </View>
           );
         })}
@@ -855,7 +961,7 @@ function HtmlMessageBody({ html, blockRemoteImages = false, shielded = false }: 
     td, th { padding: 4px 8px; }
   </style></head><body>${html}</body></html>`;
 
-  function handleLoad() {
+  function measure() {
     const body = iframeRef.current?.contentDocument?.body;
     if (body) {
       // Add a small buffer so content doesn't clip on the bottom edge.
@@ -863,13 +969,43 @@ function HtmlMessageBody({ html, blockRemoteImages = false, shielded = false }: 
     }
   }
 
+  // The iframe's `load` event only fires after every subresource -- with
+  // slow remote images the body would sit collapsed at the default height
+  // until the last image finished. Instead the text is sized as soon as
+  // the document exists and re-sized as each image lands: a ResizeObserver
+  // on the iframe body catches every progressive layout change, with a
+  // short polling fallback for engines that don't fire it across the
+  // frame boundary.
+  useEffect(() => {
+    measure();
+    let observer: ResizeObserver | null = null;
+    const attach = () => {
+      const body = iframeRef.current?.contentDocument?.body;
+      if (!body || typeof ResizeObserver === "undefined") return false;
+      observer = new ResizeObserver(measure);
+      observer.observe(body);
+      return true;
+    };
+    attach();
+    const poll = setInterval(() => {
+      measure();
+      if (!observer) attach();
+    }, 300);
+    const stopPolling = setTimeout(() => clearInterval(poll), 15_000);
+    return () => {
+      observer?.disconnect();
+      clearInterval(poll);
+      clearTimeout(stopPolling);
+    };
+  }, [doc]);
+
   return (
     <div style={{ position: "relative", width: "100%" }}>
       <iframe
         ref={iframeRef}
         title="Message body"
         srcDoc={doc}
-        onLoad={handleLoad}
+        onLoad={measure}
         sandbox="allow-same-origin allow-popups"
         style={{ width: "100%", border: "none", height, display: "block" }}
       />
@@ -1075,8 +1211,11 @@ const styles = StyleSheet.create({
     paddingTop: spacing.xl,
     paddingBottom: spacing.xxl,
   },
+  // The reading surface. Pure white in the dark theme (mail content is
+  // designed against white); a soft paper tone in light mode so the whole
+  // window isn't wall-to-wall bright.
   bodyLight: {
-    backgroundColor: "#FFFFFF",
+    backgroundColor: isLightTheme ? "#F0EFEA" : "#FFFFFF",
   },
   lightModeToggleText: {
     fontFamily: fontFamily.ui,
@@ -1091,39 +1230,66 @@ const styles = StyleSheet.create({
     marginBottom: spacing.xl,
   },
   imageBlocked: {
-    alignSelf: "flex-start",
     flexDirection: "row",
     alignItems: "center",
-    flexWrap: "wrap",
-    paddingVertical: spacing.sm,
+    gap: spacing.md,
+    paddingVertical: spacing.md,
     paddingHorizontal: spacing.md,
     borderRadius: radii.md,
+    borderWidth: 1,
     backgroundColor: colors.background.surface,
     marginBottom: spacing.xl,
+  },
+  imageBlockedIcon: {
+    width: 32,
+    height: 32,
+    borderRadius: radii.sm,
+    alignItems: "center",
+    justifyContent: "center",
+  },
+  imageBlockedBody: {
+    flex: 1,
+    minWidth: 0,
+  },
+  imageBlockedTitle: {
+    fontFamily: fontFamily.ui,
+    fontSize: fontSize.sm,
+    fontWeight: "600",
+    color: colors.text.primary,
+    marginBottom: 1,
   },
   imageBlockedText: {
     fontFamily: fontFamily.ui,
     fontSize: fontSize.xs,
     color: colors.text.muted,
-    marginRight: spacing.sm,
   },
   imageBlockedAction: {
     fontFamily: fontFamily.ui,
     fontSize: fontSize.xs,
     fontWeight: "700",
   },
+  imageShowBtn: {
+    paddingVertical: 6,
+    paddingHorizontal: spacing.md,
+    borderWidth: 1,
+    borderRadius: radii.pill,
+  },
   imageBlockedPicker: {
     flexDirection: "row",
     alignItems: "center",
     flexWrap: "wrap",
     gap: spacing.sm,
-    marginTop: spacing.xs,
+    marginTop: spacing.sm,
   },
   imagePickerOption: {
     paddingVertical: 4,
     paddingHorizontal: spacing.sm,
     borderWidth: 1,
     borderRadius: radii.pill,
+  },
+  imagePickerCancel: {
+    paddingVertical: 4,
+    paddingHorizontal: spacing.xs,
   },
   imagePickerOptionText: {
     fontFamily: fontFamily.ui,
@@ -1144,11 +1310,30 @@ const styles = StyleSheet.create({
   vaultCardLight: {
     backgroundColor: "#F0F0F0",
   },
-  vaultLock: {
-    width: 28,
-    height: 28,
-    borderRadius: radii.sm,
+  attachmentBody: {
+    flexDirection: "row",
+    alignItems: "center",
+  },
+  fileBadge: {
+    width: 42,
+    height: 42,
+    borderRadius: radii.md,
+    alignItems: "center",
+    justifyContent: "center",
     marginRight: spacing.md,
+    gap: 1,
+  },
+  fileBadgeExt: {
+    fontFamily: fontFamily.mono,
+    fontSize: 7,
+    fontWeight: "700",
+    letterSpacing: 0.5,
+  },
+  attachmentActions: {
+    flexDirection: "row",
+    alignItems: "center",
+    gap: spacing.sm,
+    marginLeft: "auto",
   },
   vaultText: {
     marginRight: spacing.lg,
@@ -1168,14 +1353,12 @@ const styles = StyleSheet.create({
     color: "#555555",
   },
   downloadButton: {
-    marginLeft: "auto",
     paddingVertical: 6,
     paddingHorizontal: spacing.md,
     borderRadius: radii.pill,
     borderWidth: 1,
   },
   downloadButtonDisabled: {
-    marginLeft: "auto",
     paddingVertical: 6,
     paddingHorizontal: spacing.md,
     borderRadius: radii.pill,

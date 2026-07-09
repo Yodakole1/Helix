@@ -164,6 +164,64 @@ export function reportSpam(
   return invoke("report_spam", { accountId, host, port, folder, uid });
 }
 
+// Re-runs the browser sign-in for an existing OAuth account -- the fix
+// for a dead refresh token (revoked, expired, password changed) that
+// doesn't lose the account's cached mail, aliases, or settings. Resolves
+// only after the user finishes in the browser, like addOauthAccount; on
+// failure the previous credential is restored, so nothing gets worse.
+export function reauthorizeOauthAccount(accountId: string): Promise<void> {
+  return invoke("reauthorize_oauth_account", { accountId });
+}
+
+export interface AccountImportOutcome {
+  email: string;
+  // "added", "skipped" (already configured), or "failed".
+  status: string;
+  // The error for failed/skipped rows; for added rows, notes about the
+  // optional CalDAV/CardDAV side (e.g. nothing discovered).
+  detail: string | null;
+  calendars_added: number;
+  address_books_added: number;
+}
+
+export interface ImportAccountsReport {
+  results: AccountImportOutcome[];
+  // The import file holds plaintext passwords, so the backend deletes it
+  // after the run. false means the user has to delete it by hand.
+  file_deleted: boolean;
+  delete_error: string | null;
+}
+
+// Bulk onboarding from a "key: value" text file (one block per account --
+// accounts-import.example.txt in the repo is the reference). Each account
+// is verified against the real server exactly like addAccount; the file
+// is deleted afterwards. A parse error rejects the whole call and leaves
+// the file in place; per-account failures land in the report instead.
+export function importAccountsFile(path: string): Promise<ImportAccountsReport> {
+  return invoke("import_accounts_file", { path });
+}
+
+// One mail account discovered in a Thunderbird profile (settings only --
+// Thunderbird encrypts passwords, so the user still types theirs once).
+export interface ThunderbirdAccount {
+  email: string;
+  display_name: string | null;
+  protocol: "imap" | "pop3";
+  incoming_host: string;
+  incoming_port: number;
+  incoming_starttls: boolean;
+  smtp_host: string;
+  smtp_port: number;
+  smtp_starttls: boolean;
+}
+
+// Reads the local Thunderbird profile(s) and returns the mail accounts found
+// so onboarding can pre-fill from them. Read-only; empty array = nothing
+// found (Thunderbird not installed or no IMAP/POP3 accounts), not an error.
+export function discoverThunderbirdAccounts(): Promise<ThunderbirdAccount[]> {
+  return invoke("discover_thunderbird_accounts");
+}
+
 export function listAccounts(): Promise<AccountRecord[]> {
   return invoke("list_accounts");
 }

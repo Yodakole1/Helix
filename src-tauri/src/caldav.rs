@@ -169,11 +169,23 @@ fn build_vcalendar(ev: &ParsedEvent, sequence: i64, reminder_minutes_before: Opt
     cal.push_str(&format!("UID:{}\r\n", ev.uid));
     cal.push_str(&format!("DTSTAMP:{}\r\n", now_ical()));
     cal.push_str(&format!("SEQUENCE:{sequence}\r\n"));
+    // All-day events carry a bare date ("20260706"); RFC 5545 requires the
+    // VALUE=DATE parameter then, since the property defaults to DATE-TIME.
     if let Some(s) = &ev.dtstart {
-        cal.push_str(&format!("DTSTART:{}\r\n", iso_to_ical(s)));
+        let v = iso_to_ical(s);
+        if v.len() == 8 {
+            cal.push_str(&format!("DTSTART;VALUE=DATE:{v}\r\n"));
+        } else {
+            cal.push_str(&format!("DTSTART:{v}\r\n"));
+        }
     }
     if let Some(s) = &ev.dtend {
-        cal.push_str(&format!("DTEND:{}\r\n", iso_to_ical(s)));
+        let v = iso_to_ical(s);
+        if v.len() == 8 {
+            cal.push_str(&format!("DTEND;VALUE=DATE:{v}\r\n"));
+        } else {
+            cal.push_str(&format!("DTEND:{v}\r\n"));
+        }
     }
     if let Some(s) = &ev.summary {
         cal.push_str(&format!("SUMMARY:{s}\r\n"));
@@ -317,10 +329,16 @@ fn propfind(
         .header("Content-Type", "application/xml; charset=\"utf-8\"")
         .body(body.to_string())
         .send()
-        .map_err(|e| format!("PROPFIND {url} failed: {e}"))?;
+        .map_err(|e| {
+            let msg = format!("PROPFIND {url} failed: {e}");
+            crate::debug_log::record("caldav", &msg);
+            msg
+        })?;
 
-    if !resp.status().is_success() && resp.status().as_u16() != 207 {
-        return Err(format!("PROPFIND {url} returned HTTP {}", resp.status()));
+    let status = resp.status();
+    crate::debug_log::record("caldav", format!("PROPFIND {url} -> HTTP {status}"));
+    if !status.is_success() && status.as_u16() != 207 {
+        return Err(format!("PROPFIND {url} returned HTTP {status}"));
     }
     resp.text().map_err(|e| format!("could not read PROPFIND response: {e}"))
 }
@@ -337,10 +355,16 @@ fn get_ics(
         .basic_auth(username, Some(password))
         .header("Accept", "text/calendar")
         .send()
-        .map_err(|e| format!("GET {url} failed: {e}"))?;
+        .map_err(|e| {
+            let msg = format!("GET {url} failed: {e}");
+            crate::debug_log::record("caldav", &msg);
+            msg
+        })?;
 
-    if !resp.status().is_success() {
-        return Err(format!("GET {url} returned HTTP {}", resp.status()));
+    let status = resp.status();
+    crate::debug_log::record("caldav", format!("GET {url} -> HTTP {status}"));
+    if !status.is_success() {
+        return Err(format!("GET {url} returned HTTP {status}"));
     }
 
     let etag = resp
@@ -378,10 +402,16 @@ fn put_ics(
     let resp = req
         .body(body.to_string())
         .send()
-        .map_err(|e| format!("PUT {url} failed: {e}"))?;
+        .map_err(|e| {
+            let msg = format!("PUT {url} failed: {e}");
+            crate::debug_log::record("caldav", &msg);
+            msg
+        })?;
 
-    if !resp.status().is_success() {
-        return Err(format!("PUT {url} returned HTTP {}", resp.status()));
+    let status = resp.status();
+    crate::debug_log::record("caldav", format!("PUT {url} -> HTTP {status}"));
+    if !status.is_success() {
+        return Err(format!("PUT {url} returned HTTP {status}"));
     }
 
     let new_etag = resp
@@ -403,13 +433,19 @@ fn http_delete(
         .delete(url)
         .basic_auth(username, Some(password))
         .send()
-        .map_err(|e| format!("DELETE {url} failed: {e}"))?;
+        .map_err(|e| {
+            let msg = format!("DELETE {url} failed: {e}");
+            crate::debug_log::record("caldav", &msg);
+            msg
+        })?;
 
+    let status = resp.status();
+    crate::debug_log::record("caldav", format!("DELETE {url} -> HTTP {status}"));
     // 204 No Content is the normal success; 404 means already gone.
-    if resp.status().is_success() || resp.status().as_u16() == 404 {
+    if status.is_success() || status.as_u16() == 404 {
         Ok(())
     } else {
-        Err(format!("DELETE {url} returned HTTP {}", resp.status()))
+        Err(format!("DELETE {url} returned HTTP {status}"))
     }
 }
 
@@ -579,6 +615,15 @@ fn resolve_source_password(record: &cache::CalDavSourceRecord) -> Result<String,
             record.id, record.account_id
         )
     })?;
+    // An OAuth account's mail credential is a refresh-token blob, not a
+    // password -- sending it as Basic auth would both fail and hand the
+    // token to whatever server the source URL names.
+    if crate::oauth::parse_stored(&fallback).is_some() {
+        return Err(format!(
+            "the password for calendar {} is gone and {} signs in with OAuth, so its mail credential can't stand in; remove and re-add the calendar with its own password",
+            record.id, record.account_id
+        ));
+    }
     if let Err(e) = credentials::store_credential(key, fallback.clone()) {
         eprintln!("could not re-store healed CalDAV credential: {e}");
     }
@@ -588,7 +633,21 @@ fn resolve_source_password(record: &cache::CalDavSourceRecord) -> Result<String,
 /// Adds a CalDAV source, stores the password in the OS keychain, and runs
 /// an initial sync. Rolls back on failure — same pattern as `add_carddav_source`.
 #[tauri::command]
-pub fn add_caldav_source(
+pub async fn add_caldav_source(
+    account_id: String,
+    url: String,
+    username: String,
+    password: String,
+    display_name: Option<String>,
+    color: Option<String>,
+) -> Result<CalDavSource, String> {
+    crate::run_blocking(move || {
+        add_caldav_source_blocking(account_id, url, username, password, display_name, color)
+    })
+    .await
+}
+
+pub(crate) fn add_caldav_source_blocking(
     account_id: String,
     url: String,
     username: String,
@@ -642,7 +701,7 @@ pub fn add_caldav_source(
 }
 
 #[tauri::command]
-pub fn list_caldav_sources() -> Result<Vec<CalDavSource>, String> {
+pub async fn list_caldav_sources() -> Result<Vec<CalDavSource>, String> {
     let conn = cache::open()?;
     Ok(cache::list_caldav_sources_db(&conn)?
         .into_iter()
@@ -658,9 +717,17 @@ pub fn list_caldav_sources() -> Result<Vec<CalDavSource>, String> {
         .collect())
 }
 
+/// Sets (or clears) the display color for a calendar source. Purely a local
+/// preference -- nothing is written back to the server.
+#[tauri::command]
+pub async fn update_caldav_source_color(id: i64, color: Option<String>) -> Result<(), String> {
+    let conn = cache::open()?;
+    cache::update_caldav_source_color_db(&conn, id, color.as_deref())
+}
+
 /// Deletes the keychain credential, all synced events, and the DB row.
 #[tauri::command]
-pub fn delete_caldav_source(id: i64) -> Result<(), String> {
+pub async fn delete_caldav_source(id: i64) -> Result<(), String> {
     let key = format!("caldav__{id}");
     credentials::delete_credential(key).ok();
     let conn = cache::open()?;
@@ -670,7 +737,11 @@ pub fn delete_caldav_source(id: i64) -> Result<(), String> {
 /// Re-fetches all ICS resources and upserts them. Removes events that are no
 /// longer present on the server. Updates `last_synced_at` on success.
 #[tauri::command]
-pub fn sync_caldav(id: i64) -> Result<CalDavSyncResult, String> {
+pub async fn sync_caldav(id: i64) -> Result<CalDavSyncResult, String> {
+    crate::run_blocking(move || sync_caldav_blocking(id)).await
+}
+
+pub(crate) fn sync_caldav_blocking(id: i64) -> Result<CalDavSyncResult, String> {
     let conn = cache::open()?;
     let record = cache::get_caldav_source(&conn, id)?
         .ok_or_else(|| format!("no CalDAV source with id {id}"))?;
@@ -689,7 +760,15 @@ pub fn sync_caldav(id: i64) -> Result<CalDavSyncResult, String> {
 /// RFC 6764 discovery: `.well-known/caldav` → principal → calendar-home-set →
 /// list calendar collections. Returns URLs without persisting anything.
 #[tauri::command]
-pub fn discover_caldav(
+pub async fn discover_caldav(
+    host: String,
+    username: String,
+    password: String,
+) -> Result<Vec<CalDavDiscoveredCalendar>, String> {
+    crate::run_blocking(move || discover_caldav_blocking(host, username, password)).await
+}
+
+pub(crate) fn discover_caldav_blocking(
     host: String,
     username: String,
     password: String,
@@ -768,7 +847,7 @@ pub fn discover_caldav(
 /// so both should use the same iCal compact format (`"20260701T000000Z"` or
 /// `"20260701"`) for the filter to work reliably.
 #[tauri::command]
-pub fn list_calendar_events(
+pub async fn list_calendar_events(
     source_id: Option<i64>,
     from_date: Option<String>,
     to_date: Option<String>,
@@ -783,7 +862,26 @@ pub fn list_calendar_events(
 /// Creates a new event on the CalDAV server and inserts it into the local
 /// cache. Generates a UUID for the UID.
 #[tauri::command]
-pub fn create_event(
+pub async fn create_event(
+    source_id: i64,
+    summary: String,
+    dtstart: String,
+    dtend: String,
+    location: Option<String>,
+    description: Option<String>,
+    rrule: Option<String>,
+    reminder_minutes_before: Option<i64>,
+) -> Result<CalendarEvent, String> {
+    crate::run_blocking(move || {
+        create_event_blocking(
+            source_id, summary, dtstart, dtend, location, description, rrule,
+            reminder_minutes_before,
+        )
+    })
+    .await
+}
+
+fn create_event_blocking(
     source_id: i64,
     summary: String,
     dtstart: String,
@@ -846,7 +944,23 @@ pub fn create_event(
 /// Updates an existing event in place (increments SEQUENCE, sends
 /// `If-Match` with the cached ETag for optimistic concurrency).
 #[tauri::command]
-pub fn update_event(
+pub async fn update_event(
+    source_id: i64,
+    uid: String,
+    summary: String,
+    dtstart: String,
+    dtend: String,
+    location: Option<String>,
+    description: Option<String>,
+    rrule: Option<String>,
+) -> Result<CalendarEvent, String> {
+    crate::run_blocking(move || {
+        update_event_blocking(source_id, uid, summary, dtstart, dtend, location, description, rrule)
+    })
+    .await
+}
+
+fn update_event_blocking(
     source_id: i64,
     uid: String,
     summary: String,
@@ -914,7 +1028,11 @@ pub fn update_event(
 
 /// Deletes an event from the CalDAV server and removes it from the local cache.
 #[tauri::command]
-pub fn delete_event(source_id: i64, uid: String) -> Result<(), String> {
+pub async fn delete_event(source_id: i64, uid: String) -> Result<(), String> {
+    crate::run_blocking(move || delete_event_blocking(source_id, uid)).await
+}
+
+fn delete_event_blocking(source_id: i64, uid: String) -> Result<(), String> {
     let conn = cache::open()?;
     let record = cache::get_caldav_source(&conn, source_id)?
         .ok_or_else(|| format!("no CalDAV source with id {source_id}"))?;

@@ -26,7 +26,10 @@ everyday mail:
   saved. Special folders (Sent, Trash, Archive, Drafts, Spam) are detected
   from the server's real layout -- including hosting providers that nest
   everything under `INBOX.`. Gmail and Microsoft 365 sign in with OAuth2
-  through your browser -- no app password needed.
+  through your browser -- no app password needed. Setting up many
+  mailboxes at once? A plain-text import file (template in the repo:
+  `accounts-import.example.txt`) onboards any number of accounts in one
+  go -- and is deleted after the import, since it contains passwords.
 - **Mail.** Reading (sanitized HTML with remote images blocked by
   default), sending (rich text, attachments, Cc/Bcc, send-as aliases),
   replies and forwards with proper threading headers, drafts that

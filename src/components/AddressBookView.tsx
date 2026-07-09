@@ -12,7 +12,7 @@ import {
 import { syncCardDav } from "../lib/carddav";
 import type { HoverState } from "../lib/pressable";
 import { glassPanel } from "../lib/webStyle";
-import { colorForKey, colors, fontFamily, fontSize, radii, spacing, withAlpha } from "../theme";
+import { colorForLetter, colors, fontFamily, fontSize, radii, spacing, withAlpha } from "../theme";
 
 // One selectable address book in the sidebar: everything, the locally
 // collected contacts, or a synced CardDAV book (source "carddav:<id>").
@@ -122,8 +122,8 @@ export function AddressBookView({ accentColor, selectedSource }: AddressBookView
 
   function renderItem({ item }: { item: ContactRecord }) {
     const editing = editingEmail === item.email;
-    const avatarColor = colorForKey(item.email);
     const initial = (item.display_name || item.email).charAt(0).toUpperCase();
+    const avatarColor = colorForLetter(initial);
     return (
       <View style={styles.row}>
         <View style={[styles.avatar, { backgroundColor: avatarColor }]}>

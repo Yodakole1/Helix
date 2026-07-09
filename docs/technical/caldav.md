@@ -94,7 +94,22 @@ it is removed and re-added. The fallback triggers only on
 a locked or unreachable keychain still errors, so a transient failure can
 never silently switch which password is sent. Sources added manually with
 a username that isn't a stored mail account get no fallback: the error
-tells the user to remove and re-add the calendar.
+tells the user to remove and re-add the calendar. The fallback also
+refuses an OAuth account's mail credential — that's a refresh-token blob,
+not a password, and must never be sent as Basic auth to whatever host the
+source URL names — so those sources error with the same re-add
+instruction instead.
+
+`CalendarView.tsx`'s `friendlyError()` maps raw transport/server error text
+to plain-English messages (401/403/404/DNS/TLS substrings each get their
+own explanation) and falls back to a generic "check your URL and
+credentials" message for anything unmatched. That fallback used to also
+swallow `resolve_source_password`'s own already-actionable "...remove and
+re-add the calendar" text on an account that otherwise looks connected
+(e.g. after a keychain entry disappears), showing the generic message
+instead of the specific instruction. `friendlyError` now special-cases
+that substring and surfaces the backend's own message instead of masking
+it.
 
 ### UUID generation
 
@@ -210,3 +225,55 @@ read at check time so changes apply live). All-day events (date-only
 `dtstart`) are skipped. A slow 15-minute loop re-syncs every CalDAV
 source so the cached events reminders read from stay fresh. Each event
 notifies at most once per app run (an in-memory keyed set).
+
+## Calendar UI additions (2026-07-06)
+
+All in `CalendarView.tsx` unless noted:
+
+- **24-hour time everywhere.** Event times in the day detail, reminder
+  notifications, and the edit form render through
+  `toLocaleTimeString(..., { hour12: false })` -- never AM/PM, regardless
+  of OS locale.
+- **All-day events.** The add-task form has an "All day" pill that hides
+  the time inputs. All-day events are written per RFC 5545 as bare dates:
+  `DTSTART;VALUE=DATE:<day>` with an exclusive `DTEND;VALUE=DATE:<next
+  day>` -- `build_vcalendar` (caldav.rs) adds the `VALUE=DATE` parameter
+  whenever the value is an 8-character date, since the property otherwise
+  defaults to DATE-TIME. The day detail shows them as "All day".
+- **Per-calendar colors.** The `color` column on `caldav_sources` (always
+  in the schema, previously unused) is now user-editable: a legend row
+  under the calendar header shows one chip per source, and clicking it
+  opens a palette (`EXTENDED_PALETTE` from the theme, deliberately
+  including muted rows, plus a native custom color input). Persisted via
+  the `update_caldav_source_color` command; purely a local display
+  preference, never written to the server. Event chips in the grid and
+  the detail's left border tint by their source's color, falling back to
+  the app accent when unset.
+- **Edit and delete.** Each event in the day detail has Edit/Delete
+  actions. Edit reuses the add-task form pre-filled (title, date,
+  times/all-day, location, RRULE mapped back to the repeat pills, or
+  "custom" for anything more complex) and submits through `update_event`
+  (same UID, SEQUENCE+1, If-Match on the cached ETag). The reminder
+  picker is hidden while editing because `update_event` rebuilds the ICS
+  without a VALARM -- offering it would lie. Delete goes through
+  `delete_event` and reloads.
+- **Creation is synchronous with the server.** `create_event` PUTs to the
+  CalDAV server first and only then caches locally -- a task that appears
+  in the grid is already on the server, not queued. The command (like the
+  rest of the DAV commands) now runs on the blocking pool, so a slow
+  server no longer freezes the window (see architecture.md's main-thread
+  section).
+
+## Add-form ergonomics and removal placement (2026-07-07)
+
+The add-calendar forms (calendar tab and Settings > Calendar) pre-fill
+the server as `mail.<domain>:2080`, derived by regex from the username's
+email domain -- the common self-hosted layout this project targets. It's
+only a guess: the field stays editable, and a manually-typed server is
+never overwritten (the autofill only replaces an empty field or its own
+previous guess as the email is typed).
+
+Calendar *removal* was moved out of the sidebar (its per-row x was one
+misclick from deleting a calendar) and now lives only in Settings >
+Calendar's source list; that delete emits `sources-changed` on the
+calendar bus so the sidebar list and any open calendar tab refresh.

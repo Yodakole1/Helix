@@ -177,9 +177,26 @@ command in its own right.
 
 ## WKD key discovery
 
-`pgp::discover_pgp_key_wkd(email)` auto-fetches a contact's public key
-from their domain's Web Key Directory (WKD) so the user doesn't have to
-import it manually.
+`pgp::discover_pgp_key_wkd(email)` fetches a contact's public key from
+their domain's Web Key Directory (WKD) so the user doesn't have to import
+it manually. It only *returns* the key (armored + fingerprint); it does
+not store anything, so it's the right call behind an explicit,
+fingerprint-first import UI.
+
+The compose/encrypt flow instead uses `pgp::ensure_contact_key_wkd(email)`,
+which wraps the fetch with a no-overwrite guard: if a key is already stored
+for that address it is kept and returned untouched (`status:
+"already_present"`), and WKD is only fetched-and-imported when nothing is
+on file (`status: "imported"`). This matters because
+`cache::upsert_contact_key` is an `ON CONFLICT(email) DO UPDATE` upsert —
+calling `import_contact_key` for an address that already has a key
+*replaces* it. That is correct for the key-management UI, where replacing a
+key is a deliberate user action, but it must not happen on an unattended,
+opportunistic acquisition: whatever a domain's WKD currently serves must
+never be able to silently overwrite a key the user has verified and
+trusted. `ensure_contact_key_wkd` therefore mirrors the exact no-overwrite
+rule the Autocrypt harvester (`harvest_autocrypt`) applies to inbound
+headers — both are keys the user didn't individually confirm.
 
 **URL format (direct method):**
 
@@ -196,14 +213,14 @@ binary Transferable Public Key (not ASCII-armored).
 
 1. Split the email on `@` to get `local` and `domain`.
 2. SHA-1 the lowercased local-part; take the first 10 bytes; z-base-32 encode.
-3. Fetch the URL via `reqwest::blocking::get` (synchronous, no Tokio runtime
-   needed in a `#[tauri::command]` fn).
+3. Fetch the URL via an async `reqwest::Client` (the command is `async`,
+   sharing Tauri's Tokio runtime).
 4. Parse the binary response as a `SignedPublicKey` via the `pgp` crate's
    `from_bytes`.
-5. Re-armor the key via `to_armored_string` and store it with
-   `cache::upsert_contact_key` — the same path as `import_contact_key`.
-6. Return the fingerprint hex string so the caller can display which key was
-   found.
+5. Re-armor the key via `to_armored_string` and return it as
+   `PublicKeyInfo { public_key, fingerprint }`. `discover_pgp_key_wkd`
+   itself stores nothing — the caller decides whether to import (via
+   `import_contact_key`, or the no-overwrite `ensure_contact_key_wkd`).
 
 **What it doesn't do:**
 
@@ -211,5 +228,6 @@ binary Transferable Public Key (not ASCII-armored).
   use direct only, and adding the fallback is straightforward later.
 - No key validity / expiry check beyond what `from_bytes` enforces.
 - No cross-certification check or trust model beyond fingerprint storage.
-- The compose UI is still responsible for calling this at the right time
-  (e.g. when the user enables encryption for a recipient with no stored key).
+- No storage of its own: the compose UI drives acquisition through
+  `ensure_contact_key_wkd` (no-overwrite) when the user enables encryption
+  for a recipient with no stored key.

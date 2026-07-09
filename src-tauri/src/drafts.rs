@@ -304,13 +304,13 @@ pub async fn save_draft(
 }
 
 #[tauri::command]
-pub fn list_drafts(account_id: String) -> Result<Vec<DraftSummary>, String> {
+pub async fn list_drafts(account_id: String) -> Result<Vec<DraftSummary>, String> {
     let conn = cache::open()?;
     cache::list_drafts(&conn, &account_id)
 }
 
 #[tauri::command]
-pub fn get_draft(draft_id: String) -> Result<Option<DraftRecord>, String> {
+pub async fn get_draft(draft_id: String) -> Result<Option<DraftRecord>, String> {
     let conn = cache::open()?;
     cache::get_draft(&conn, &draft_id)
 }
@@ -458,13 +458,13 @@ pub async fn queue_for_send(
 /// The frontend should call this within the undo-send window, keyed by the
 /// `outbox_id` returned by `queue_for_send`.
 #[tauri::command]
-pub fn cancel_queued_send(outbox_id: String) -> Result<bool, String> {
+pub async fn cancel_queued_send(outbox_id: String) -> Result<bool, String> {
     let conn = cache::open()?;
     cache::cancel_outbox_item(&conn, &outbox_id)
 }
 
 #[tauri::command]
-pub fn list_outbox(account_id: String) -> Result<Vec<OutboxRecord>, String> {
+pub async fn list_outbox(account_id: String) -> Result<Vec<OutboxRecord>, String> {
     let conn = cache::open()?;
     cache::list_outbox(&conn, &account_id)
 }

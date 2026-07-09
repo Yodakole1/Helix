@@ -338,7 +338,7 @@ pub(crate) fn maybe_process_smime(account_id: &str, mut body: MessageBody, raw: 
 /// and stores the X.509 cert + private key in DER form for `account_id`.
 /// The password itself is never persisted.
 #[tauri::command]
-pub fn import_smime_cert(
+pub async fn import_smime_cert(
     account_id: String,
     pkcs12_base64: String,
     password: String,
@@ -376,7 +376,7 @@ pub fn import_smime_cert(
 /// Returns the public certificate for `account_id` as a PEM string — safe
 /// to copy-paste or share with correspondents.
 #[tauri::command]
-pub fn export_smime_cert(account_id: String) -> Result<String, String> {
+pub async fn export_smime_cert(account_id: String) -> Result<String, String> {
     let conn = cache::open()?;
     let own = cache::get_smime_own_cert(&conn, &account_id)?
         .ok_or_else(|| format!("no S/MIME certificate for {account_id}"))?;
@@ -386,7 +386,7 @@ pub fn export_smime_cert(account_id: String) -> Result<String, String> {
 }
 
 #[tauri::command]
-pub fn list_own_smime_certs() -> Result<Vec<SmimeOwnCertInfo>, String> {
+pub async fn list_own_smime_certs() -> Result<Vec<SmimeOwnCertInfo>, String> {
     let conn = cache::open()?;
     Ok(cache::list_smime_own_certs(&conn)?
         .into_iter()
@@ -400,7 +400,7 @@ pub fn list_own_smime_certs() -> Result<Vec<SmimeOwnCertInfo>, String> {
 }
 
 #[tauri::command]
-pub fn delete_smime_cert(account_id: String) -> Result<(), String> {
+pub async fn delete_smime_cert(account_id: String) -> Result<(), String> {
     let conn = cache::open()?;
     cache::delete_smime_own_cert(&conn, &account_id)
 }
@@ -409,7 +409,7 @@ pub fn delete_smime_cert(account_id: String) -> Result<(), String> {
 
 /// Accepts a cert as PEM text or base64-encoded DER, stores it keyed by email.
 #[tauri::command]
-pub fn import_contact_smime_cert(email: String, cert_pem_or_der_base64: String) -> Result<(), String> {
+pub async fn import_contact_smime_cert(email: String, cert_pem_or_der_base64: String) -> Result<(), String> {
     let cert = parse_cert_pem_or_der(&cert_pem_or_der_base64)?;
     let meta = cert_meta(&cert)?;
     let der = cert.to_der().map_err(|e| e.to_string())?;
@@ -429,7 +429,7 @@ pub fn import_contact_smime_cert(email: String, cert_pem_or_der_base64: String) 
 }
 
 #[tauri::command]
-pub fn list_contact_smime_certs() -> Result<Vec<SmimeContactCertInfo>, String> {
+pub async fn list_contact_smime_certs() -> Result<Vec<SmimeContactCertInfo>, String> {
     let conn = cache::open()?;
     Ok(cache::list_smime_contact_certs(&conn)?
         .into_iter()
@@ -444,7 +444,7 @@ pub fn list_contact_smime_certs() -> Result<Vec<SmimeContactCertInfo>, String> {
 }
 
 #[tauri::command]
-pub fn delete_contact_smime_cert(email: String) -> Result<(), String> {
+pub async fn delete_contact_smime_cert(email: String) -> Result<(), String> {
     let conn = cache::open()?;
     cache::delete_smime_contact_cert(&conn, &email)
 }
@@ -454,7 +454,7 @@ pub fn delete_contact_smime_cert(email: String) -> Result<(), String> {
 /// Parses a cert blob (PEM or base64 DER) without storing it — useful in the
 /// import dialog to display what's inside before the user confirms.
 #[tauri::command]
-pub fn get_smime_cert_info(cert_pem_or_der_base64: String) -> Result<SmimeCertInfo, String> {
+pub async fn get_smime_cert_info(cert_pem_or_der_base64: String) -> Result<SmimeCertInfo, String> {
     let cert = parse_cert_pem_or_der(&cert_pem_or_der_base64)?;
     let meta = cert_meta(&cert)?;
     Ok(SmimeCertInfo {
@@ -638,13 +638,13 @@ mod tests {
         assert_eq!(decrypted, plaintext);
     }
 
-    #[test]
-    fn get_smime_cert_info_parses_pem() {
+    #[tokio::test]
+    async fn get_smime_cert_info_parses_pem() {
         let (cert, _) = make_test_cert("info@helix.test", "Info User");
         let pem = cert.to_pem().expect("to_pem");
         let pem_str = String::from_utf8(pem).expect("utf8");
 
-        let info = get_smime_cert_info(pem_str).expect("get_smime_cert_info");
+        let info = get_smime_cert_info(pem_str).await.expect("get_smime_cert_info");
         assert_eq!(info.subject_cn.as_deref(), Some("Info User"));
         assert!(info.email_san.iter().any(|e| e == "info@helix.test"));
         assert!(!info.fingerprint.is_empty());

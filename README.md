@@ -33,7 +33,7 @@ with the same credentials, and doesn't assume the world ends at OAuth.
   decline from inside the message).
 - **An app lock, if you want one.** Lock Helix behind a password, a FIDO2
   security key, or both -- asked once per start, then out of your way.
-- **Dark, glassy, and fast.** A dark-first interface on a Tauri shell that
+- **Dark, glassy, and fast.** A dark-first interface (with an optional muted light theme) on a Tauri shell that
   uses your OS webview instead of shipping a whole browser, so the
   installed app and its idle footprint stay small.
 
@@ -86,6 +86,12 @@ you type them where it can't, verifies the login before saving anything,
 then checks whether your provider also offers a calendar and an address
 book with the same credentials -- one checkmark per service, one Continue
 button, and you're in your inbox.
+
+Bringing many mailboxes at once? Fill in
+[`accounts-import.example.txt`](accounts-import.example.txt) (one
+`key: value` block per account) and use "Import accounts from a file..."
+on the same page -- every account is verified before it's saved, and the
+file is deleted afterwards because it contains your passwords.
 
 The user manual lives in [`docs/user/`](docs/user) -- what every screen,
 setting, and shortcut does.
