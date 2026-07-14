@@ -50,7 +50,12 @@ const darkColors: Palette = {
   accent: {
     cyan: "#22D3EE",
     purple: "#A855F7",
-    green: "#9FFF3D",
+    // Was #9FFF3D -- a neon/lime green that read as glaring wherever an
+    // account or calendar happened to land on it (accentCycle drives
+    // buttons, highlights, and the calendar's "today"/add-task accent, not
+    // just avatar dots), unlike the other four accents in this cycle which
+    // all sit at a comparable, comfortable saturation.
+    green: "#4DCB62",
     pink: "#F472B6",
     amber: "#FBBF24",
   },
@@ -75,7 +80,13 @@ const lightColors: Palette = {
   },
   // Deeper accent versions so they hold contrast against light surfaces.
   accent: {
-    cyan: "#0891B2",
+    // Was #0891B2 -- cyan is accentCycle's first entry, so it's the
+    // default color for the first (often only) account, meaning it's the
+    // color a light-theme user sees the most: compose button, active
+    // highlights, sidebar accents. #0891B2 read as too saturated/glary
+    // for something that pervasive against a light background; this is
+    // the same hue pulled back to a calmer, less blue-heavy teal.
+    cyan: "#2C7F96",
     purple: "#7C3AED",
     green: "#4D7C0F",
     pink: "#BE185D",
@@ -104,8 +115,10 @@ export const EXTENDED_PALETTE: string[] = [
   "#22D3EE", "#38BDF8", "#60A5FA", "#3B82F6", "#2DD4BF", "#14B8A6",
   // purples / pinks
   "#A855F7", "#8B5CF6", "#C084FC", "#F472B6", "#E879A9", "#D0648F",
-  // greens
-  "#9FFF3D", "#84CC16", "#4ADE80", "#22C55E", "#7CB86B", "#5F9E63",
+  // greens -- first entry was #9FFF3D, the same neon lime already toned
+  // down in accentCycle above; softened the same way here since this row
+  // is exactly what the calendar's per-source color picker offers.
+  "#91D742", "#84CC16", "#4ADE80", "#22C55E", "#7CB86B", "#5F9E63",
   // warm
   "#FBBF24", "#F59E0B", "#FB923C", "#F87171", "#E0715F", "#D9A45B",
   // muted / neutral

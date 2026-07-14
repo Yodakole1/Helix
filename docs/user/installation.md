@@ -7,17 +7,27 @@ once it's there.
 
 ## Prebuilt packages
 
-Helix is in early development and does not publish prebuilt packages
-yet. For the first public release the plan is:
+Helix is in early development. As of the `0.1.0` release, a Debian/Ubuntu
+`.deb` is published on the
+[Releases page](https://github.com/Yodakole1/Helix/releases) --
+download it and install with:
 
-- **Debian/Ubuntu**: an apt repository, so installing is
+```
+sudo apt install ./Helix_0.1.0_amd64.deb
+```
+
+Nothing else is prebuilt yet. The plan for upcoming releases:
+
+- **Debian/Ubuntu**: eventually an apt repository, so installing is
   `sudo apt install helix-mail` and updates arrive with your normal
-  system updates. Until that repository exists, building from source
-  produces a proper `.deb` you can install the same way (below).
-- **Other Linux**: the same build also produces an `.rpm` and a
-  self-contained `.AppImage`.
+  system updates, instead of a manual `.deb` download each release.
+- **Other Linux**: a published `.rpm` and a self-contained `.AppImage` --
+  building from source already produces both (below).
 - **Windows**: an `.msi` installer.
 - **macOS**: a `.dmg`.
+
+Until each of those is published, building from source produces the same
+installer for any of the three (below).
 
 Once installed, Helix keeps itself current: Settings > About > "Check
 for updates" downloads new versions from the official release feed and

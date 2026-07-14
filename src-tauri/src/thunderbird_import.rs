@@ -41,9 +41,17 @@ pub struct DiscoveredAccount {
 fn thunderbird_roots() -> Vec<PathBuf> {
     let mut roots: Vec<PathBuf> = Vec::new();
     if let Some(home) = dirs::home_dir() {
-        roots.push(home.join(".thunderbird")); // Linux
+        roots.push(home.join(".thunderbird")); // Linux, native/deb/rpm packaging
         roots.push(home.join(".mozilla-thunderbird")); // older Linux packaging
         roots.push(home.join("Library/Thunderbird/Profiles")); // macOS
+        // Sandboxed Linux packaging formats redirect the whole home
+        // directory: Snap's writable area is `~/snap/<name>/common`, and
+        // Flatpak's is `~/.var/app/<app-id>`. Ubuntu ships Thunderbird as a
+        // Snap by default, so skipping this means the scan silently finds
+        // nothing on a stock Ubuntu desktop despite Thunderbird being right
+        // there.
+        roots.push(home.join("snap/thunderbird/common/.thunderbird"));
+        roots.push(home.join(".var/app/org.mozilla.Thunderbird/.thunderbird"));
     }
     if let Some(appdata) = dirs::config_dir() {
         // On Windows dirs::config_dir() is %APPDATA%.

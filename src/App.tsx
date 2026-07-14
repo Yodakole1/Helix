@@ -37,11 +37,13 @@ import { parseIcsInvite, respondToInvite, type InviteInfo } from "./lib/ics";
 import { getLaunchMailto, parseMailto } from "./lib/mailto";
 import { startIdle, stopIdle } from "./lib/idle";
 import { notifyNewMail, sendDesktopNotification } from "./lib/notifications";
+import { formatClockTime } from "./lib/timeFormat";
 import { cancelQueuedSend, flushOutbox, queueForSend } from "./lib/drafts";
 import { trainMessage } from "./lib/bayes";
 import { snoozeMessage, listAllSnoozed, listDueSnoozed, cancelSnooze } from "./lib/snooze";
 import { UndoSendToast } from "./components/UndoSendToast";
 import { StatusToast } from "./components/StatusToast";
+import { SyncIndicator } from "./components/SyncIndicator";
 import type { SyncDepth } from "./components/DataStorageSettings";
 import type { Rule } from "./lib/rules";
 import { fileToBase64, sendMdn, type OutgoingAttachment } from "./lib/smtp";
@@ -254,6 +256,10 @@ export default function App() {
   // default -- it uses the OS dictionaries, nothing bundled or online.
   const [spellCheck, setSpellCheck] = usePersistedJSON<boolean>("helix:spellCheck", true);
   const [encryptByDefault, setEncryptByDefault] = usePersistedJSON<boolean>("helix:encryptByDefault", false);
+  // Clock format, 24-hour by default. Formatting helpers read the same key
+  // straight from localStorage (lib/timeFormat.ts); this state exists to
+  // stage/apply it through Settings like everything else.
+  const [hour12, setHour12] = usePersistedJSON<boolean>("helix:hour12", false);
   // Unread messages grouped above read ones in the message list.
   const [separateUnread, setSeparateUnread] = usePersistedJSON<boolean>("helix:separateUnread", false);
   // UI text-size multiplier, applied as a zoom on the document body --
@@ -284,6 +290,18 @@ export default function App() {
   // One-off confirmation toast (attachment downloaded, etc.). Bottom-center,
   // auto-dismissing; only one shows at a time -- the newest wins.
   const [statusToast, setStatusToast] = useState<{ message: string; kind: "success" | "error" | "info" } | null>(null);
+
+  // How many folder/message fetches are in flight right now, across every
+  // account -- drives the small bottom-right sync indicator. A count
+  // rather than a boolean because several accounts (or a folder switch
+  // racing a background poll) can be fetching at once; the indicator
+  // should stay up until every one of them settles, not blink off when
+  // just the first one finishes.
+  const [syncingCount, setSyncingCount] = useState(0);
+  function trackSync<T>(promise: Promise<T>): Promise<T> {
+    setSyncingCount((c) => c + 1);
+    return promise.finally(() => setSyncingCount((c) => Math.max(0, c - 1)));
+  }
 
   // In-app viewer for the reader's attachment "Open" action. Images render
   // as an <img>; PDFs and text render in an iframe (WebKitGTK ships a
@@ -372,6 +390,17 @@ export default function App() {
       );
       ensureFolders(first);
     }
+  }, [accounts]);
+
+  // Loads every account's folder list up front, not just the active tab's --
+  // the sidebar shows every open account's folder tree expanded by default
+  // (Sidebar.tsx's `isExpanded` defaults to true), so without this, any
+  // account you haven't clicked into yet would sit there expanded but
+  // empty until you switched to it. ensureFolders() is a no-op for an
+  // account it already has folders for, so this is safe to run whenever
+  // the account list changes (a new account added, one removed, etc.).
+  useEffect(() => {
+    accounts.forEach((account) => ensureFolders(account.id));
   }, [accounts]);
 
   // Opens a fresh tab on the active account's inbox and focuses it.
@@ -513,7 +542,7 @@ export default function App() {
     setSelectedFolder((prev) => (prev[forAccountId] ? prev : { ...prev, [forAccountId]: "INBOX" }));
     loadFolder(forAccountId, "INBOX");
 
-    listFolders(forAccountId, rec.imap_host, rec.imap_port)
+    trackSync(listFolders(forAccountId, rec.imap_host, rec.imap_port))
       .then((folders) => {
         setFoldersByAccount((prev) => ({ ...prev, [forAccountId]: folders }));
         // Only reconcile if the INBOX guess above turns out to be wrong --
@@ -612,7 +641,7 @@ export default function App() {
       }
 
       const key = `${forAccountId}:${folder}`;
-      fetchThreadedMessages(forAccountId, rec.imap_host, rec.imap_port, folder, MESSAGES_LIMIT)
+      trackSync(fetchThreadedMessages(forAccountId, rec.imap_host, rec.imap_port, folder, MESSAGES_LIMIT))
         .then((threads) => {
           liveLoaded = true;
           const { summaries, meta } = buildThreadData(threads);
@@ -663,7 +692,7 @@ export default function App() {
         .catch(() => {});
     }
 
-    fetchMessages(forAccountId, rec.imap_host, rec.imap_port, folder, MESSAGES_LIMIT)
+    trackSync(fetchMessages(forAccountId, rec.imap_host, rec.imap_port, folder, MESSAGES_LIMIT))
       .then((summaries) => {
         liveLoaded = true;
         const messages = summaries.map((s, i) => summaryToMessage(s, i));
@@ -714,7 +743,7 @@ export default function App() {
         .catch(() => {});
     }
 
-    listMessages(forAccountId, rec.pop3_host, rec.pop3_port)
+    trackSync(listMessages(forAccountId, rec.pop3_host, rec.pop3_port))
       .then((summaries) => {
         liveLoaded = true;
         const messages = summaries.map(pop3SummaryToMessage);
@@ -738,33 +767,41 @@ export default function App() {
   function refreshFolders(forAccountId: AccountId) {
     const rec = getRecord(forAccountId);
     if (!rec || isPop3(rec)) return;
-    listFolders(forAccountId, rec.imap_host, rec.imap_port)
+    trackSync(listFolders(forAccountId, rec.imap_host, rec.imap_port))
       .then((folders) => setFoldersByAccount((prev) => ({ ...prev, [forAccountId]: folders })))
       .catch((e) => console.warn("list_folders refresh failed:", e));
+  }
+
+  // Folder mutations share one failure path: the server's actual error in
+  // a toast (a silent console.warn read as "renaming folders doesn't
+  // work"), plus the usual sidebar refresh on success.
+  function runFolderOp(forAccountId: AccountId, op: Promise<void>, what: string) {
+    op.then(() => refreshFolders(forAccountId)).catch((e) => {
+      console.warn(`${what} failed:`, e);
+      setStatusToast({ message: `Could not ${what}: ${e}`, kind: "error" });
+    });
   }
 
   function handleCreateFolder(forAccountId: AccountId, name: string) {
     const rec = getRecord(forAccountId);
     if (!rec || isPop3(rec)) return;
-    createFolder(forAccountId, rec.imap_host, rec.imap_port, name)
-      .then(() => refreshFolders(forAccountId))
-      .catch((e) => console.warn("create_folder failed:", e));
+    runFolderOp(forAccountId, createFolder(forAccountId, rec.imap_host, rec.imap_port, name), "create folder");
   }
 
   function handleRenameFolder(forAccountId: AccountId, folder: string, newName: string) {
     const rec = getRecord(forAccountId);
     if (!rec || isPop3(rec)) return;
-    renameFolder(forAccountId, rec.imap_host, rec.imap_port, folder, newName)
-      .then(() => refreshFolders(forAccountId))
-      .catch((e) => console.warn("rename_folder failed:", e));
+    runFolderOp(
+      forAccountId,
+      renameFolder(forAccountId, rec.imap_host, rec.imap_port, folder, newName),
+      "rename folder",
+    );
   }
 
   function handleDeleteFolder(forAccountId: AccountId, folder: string) {
     const rec = getRecord(forAccountId);
     if (!rec || isPop3(rec)) return;
-    deleteFolder(forAccountId, rec.imap_host, rec.imap_port, folder)
-      .then(() => refreshFolders(forAccountId))
-      .catch((e) => console.warn("delete_folder failed:", e));
+    runFolderOp(forAccountId, deleteFolder(forAccountId, rec.imap_host, rec.imap_port, folder), "delete folder");
   }
 
   function handleEmptyFolder(forAccountId: AccountId, folder: string) {
@@ -799,7 +836,7 @@ export default function App() {
           const key = `${event.source_id}:${event.uid}:${event.dtstart}`;
           if (start <= now || start - now > leadMs || notifiedEventsRef.current.has(key)) continue;
           notifiedEventsRef.current.add(key);
-          const at = new Date(iso).toLocaleTimeString([], { hour: "2-digit", minute: "2-digit", hour12: false });
+          const at = formatClockTime(new Date(iso));
           await sendDesktopNotification(
             "Upcoming event",
             `${event.summary ?? "(untitled event)"} at ${at}${event.location ? ` -- ${event.location}` : ""}`,
@@ -845,7 +882,7 @@ export default function App() {
     const folder = selectedFolder[accountId] ?? "INBOX";
     const timer = setInterval(() => {
       if (unifiedInbox) {
-        fetchUnifiedInbox(MESSAGES_LIMIT)
+        trackSync(fetchUnifiedInbox(MESSAGES_LIMIT))
           .then((results) => {
             const byAccount = new Map<AccountId, SampleMessage[]>();
             results.forEach((r, i) => {
@@ -961,7 +998,7 @@ export default function App() {
   // store, which the client-side merge (getUnifiedInbox) still renders.
   useEffect(() => {
     if (!unifiedInbox || !isTauri() || accounts.length === 0) return;
-    fetchUnifiedInbox(MESSAGES_LIMIT)
+    trackSync(fetchUnifiedInbox(MESSAGES_LIMIT))
       .then((results) => {
         const byAccount = new Map<AccountId, SampleMessage[]>();
         results.forEach((r, i) => {
@@ -982,11 +1019,21 @@ export default function App() {
   // the same theme as the mail view instead of jumping to an unrelated
   // rotation color.
   const accountIdForColor = accountId || accounts[0]?.id || "";
-  const accentColor = resolveAccountColor(
-    accountOverrides,
-    accountIdForColor,
-    accounts.findIndex((a) => a.id === accountIdForColor),
-  );
+  // With no accounts yet (the Welcome screen), there's no rotation index to
+  // resolve against -- accounts.findIndex returns -1, and colorForIndex(-1)
+  // wraps around to the *last* entry in accentCycle (amber) rather than
+  // anything meaningful, so the empty state was rendering in yellow. Use
+  // the theme's primary text color instead: white on dark, near-black on
+  // light -- a neutral that's never jarring, since there's no real account
+  // to carry a rotation color yet.
+  const accentColor =
+    accounts.length === 0
+      ? colors.text.primary
+      : resolveAccountColor(
+          accountOverrides,
+          accountIdForColor,
+          accounts.findIndex((a) => a.id === accountIdForColor),
+        );
 
   function handleUpdateAccountOverride(target: AccountId, patch: { label?: string; color?: string }) {
     setAccountOverrides({ ...accountOverrides, [target]: { ...accountOverrides[target], ...patch } });
@@ -2113,6 +2160,7 @@ export default function App() {
           onDismiss={() => setStatusToast(null)}
         />
       )}
+      {syncingCount > 0 && <SyncIndicator accentColor={accentColor || "#00BCD4"} />}
       {undoSendState && (
         <UndoSendToast
           outboxId={undoSendState.outboxId}
@@ -2149,6 +2197,7 @@ export default function App() {
           encryptByDefault,
           signature,
           spellCheck,
+          hour12,
           syncDepth,
           fontScale,
           theme: themeName,
@@ -2164,6 +2213,7 @@ export default function App() {
           setEncryptByDefault(v.encryptByDefault);
           setSignature(v.signature);
           setSpellCheck(v.spellCheck);
+          setHour12(v.hour12);
           setSyncDepth(v.syncDepth);
           setFontScale(v.fontScale);
           // Both are baked into module-level state at load, so either one

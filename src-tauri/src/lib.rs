@@ -96,6 +96,7 @@ pub fn run() {
       account::fetch_unified_inbox,
       account::report_spam,
       account_import::import_accounts_file,
+      account_import::import_thunderbird_account,
       thunderbird_import::discover_thunderbird_accounts,
       smtp::send_message,
       smtp::send_mdn,

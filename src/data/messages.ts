@@ -1,3 +1,5 @@
+import { formatClockTime } from "../lib/timeFormat";
+
 export interface RealAttachment {
   index: number;
   name: string;
@@ -77,7 +79,7 @@ export function calendarDayDiff(iso: string): number {
 export function formatMessageTime(iso: string): string {
   const dayDiff = calendarDayDiff(iso);
   const date = new Date(iso);
-  if (dayDiff === 0) return date.toLocaleTimeString([], { hour: "2-digit", minute: "2-digit" });
+  if (dayDiff === 0) return formatClockTime(date);
   if (dayDiff === 1) return "Yesterday";
   if (dayDiff > 1 && dayDiff < 7) return date.toLocaleDateString([], { weekday: "short" });
   return date.toLocaleDateString([], { month: "short", day: "numeric" });

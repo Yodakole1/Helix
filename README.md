@@ -39,10 +39,20 @@ with the same credentials, and doesn't assume the world ends at OAuth.
 
 ## Install
 
-Helix runs on Windows, macOS, and Linux. It's in early development;
-prebuilt packages (including an apt repository for Debian/Ubuntu, so
-installing becomes a single `apt install`) are planned for the first
-public release. Until then it builds from source in a few minutes:
+Helix runs on Windows, macOS, and Linux, and is built from one codebase
+for all three. It's early -- this is the `0.1.0` release, and only a
+Debian/Ubuntu `.deb` is published on the
+[Releases page](https://github.com/Yodakole1/Helix/releases) so far:
+
+```
+sudo apt install ./Helix_0.1.0_amd64.deb
+```
+
+`.rpm`/`.AppImage` for other Linux distros, a Windows `.msi`, and a macOS
+build are planned for upcoming releases (an apt repository, so installing
+becomes a single `apt install` with no manual download, is planned further
+out). Until each of those is published, building from source works on any
+of the three:
 
 ```
 git clone https://github.com/Yodakole1/Helix.git
@@ -51,12 +61,17 @@ npm install
 npm run tauri build
 ```
 
-That produces a real installer for whatever OS you build on -- a `.deb`
-(installable with `sudo apt install ./…`), `.rpm`, and `.AppImage` on
-Linux, an `.msi` on Windows, a `.dmg` on macOS -- under
-`src-tauri/target/release/bundle/`. The full walkthrough, including
-per-OS prerequisites and what the app needs at runtime, is in
+That produces a real installer for whatever OS you build on -- a `.deb`,
+`.rpm`, and `.AppImage` on Linux, an `.msi` on Windows, a `.dmg` on macOS
+-- under `src-tauri/target/release/bundle/`. The full walkthrough,
+including per-OS prerequisites and what the app needs at runtime, is in
 [`docs/user/installation.md`](docs/user/installation.md).
+
+**A note on testing:** development happens on Linux, and that's the only
+platform this has actually been run and used on so far. Windows and macOS
+builds compile (Tauri targets all three from the same codebase), but
+nobody has installed or exercised either one yet -- if you try Helix on
+Windows or macOS, bug reports are especially welcome.
 
 For day-to-day development:
 

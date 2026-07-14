@@ -8,6 +8,7 @@ import {
   addPop3Account,
   discoverThunderbirdAccounts,
   importAccountsFile,
+  importThunderbirdAccount,
   oauthProviderInfo,
   type AccountImportOutcome,
   type ImportAccountsReport,
@@ -84,12 +85,25 @@ export function AddAccountView({ accentColor, onCancel, onDone }: AddAccountView
   const [importReport, setImportReport] = useState<ImportAccountsReport | null>(null);
   const [importError, setImportError] = useState("");
 
-  // Import from Thunderbird: scan the local profile for account settings and
-  // let the user pick one to pre-fill the form (Thunderbird encrypts
-  // passwords, so they type theirs once -- see thunderbird_import.rs).
+  // Import from Thunderbird: scan the local profile for account settings.
+  // Each discovered account can either pre-fill the single-account form
+  // below (for reviewing/tweaking one account's settings -- Thunderbird
+  // encrypts passwords, so they type theirs once, same as ever) or be
+  // checked off for the bulk path: pick several (all pre-checked by
+  // default), enter each one's password, then Helix adds them one at a
+  // time -- see thunderbird_import.rs/account_import.rs's
+  // import_thunderbird_account.
   const [tbScanning, setTbScanning] = useState(false);
   const [tbAccounts, setTbAccounts] = useState<ThunderbirdAccount[] | null>(null);
   const [tbError, setTbError] = useState("");
+  const [tbSelected, setTbSelected] = useState<Record<string, boolean>>({});
+  const [tbPasswordStep, setTbPasswordStep] = useState(false);
+  const [tbPasswords, setTbPasswords] = useState<Record<string, string>>({});
+  const [tbRowStatus, setTbRowStatus] = useState<
+    Record<string, { state: "pending" | "running" | "added" | "skipped" | "failed"; detail?: string }>
+  >({});
+  const [tbRunning, setTbRunning] = useState(false);
+  const [tbShowPassword, setTbShowPassword] = useState<Record<string, boolean>>({});
 
   const [calendarProbe, setCalendarProbe] = useState<CalendarProbe>({ status: "pending", detail: "", calendars: [] });
   const [contactsProbe, setContactsProbe] = useState<ContactsProbe>({ status: "pending", detail: "", books: [] });
@@ -318,9 +332,16 @@ export function AddAccountView({ accentColor, onCancel, onDone }: AddAccountView
     setTbScanning(true);
     setTbError("");
     setTbAccounts(null);
+    setTbPasswordStep(false);
+    setTbPasswords({});
+    setTbRowStatus({});
     try {
       const found = await discoverThunderbirdAccounts();
       setTbAccounts(found);
+      // All pre-checked -- scanning already implies "I want these", and
+      // unchecking the odd account you don't want is one click instead of
+      // twenty to opt every account in.
+      setTbSelected(Object.fromEntries(found.map((account) => [account.email, true])));
       if (found.length === 0) {
         setTbError("No Thunderbird accounts found on this computer.");
       }
@@ -329,6 +350,55 @@ export function AddAccountView({ accentColor, onCancel, onDone }: AddAccountView
     } finally {
       setTbScanning(false);
     }
+  }
+
+  function toggleTbSelected(email: string) {
+    setTbSelected((prev) => ({ ...prev, [email]: !prev[email] }));
+  }
+
+  function toggleTbSelectAll() {
+    if (!tbAccounts) return;
+    const allSelected = tbAccounts.every((account) => tbSelected[account.email]);
+    setTbSelected(Object.fromEntries(tbAccounts.map((account) => [account.email, !allSelected])));
+  }
+
+  // Moves from the checklist into the password-entry step for whichever
+  // accounts are currently checked.
+  function handleStartTbImport() {
+    const selected = tbAccounts?.filter((account) => tbSelected[account.email]) ?? [];
+    setTbPasswords(Object.fromEntries(selected.map((account) => [account.email, ""])));
+    setTbRowStatus(Object.fromEntries(selected.map((account) => [account.email, { state: "pending" as const }])));
+    setTbPasswordStep(true);
+  }
+
+  // Imports the given emails one at a time (sequential, not parallel --
+  // twenty simultaneous login attempts against twenty different servers
+  // is a worse experience than a predictable queue), updating that row's
+  // status as each call resolves so the list reads live instead of
+  // freezing until the whole batch finishes. Called with every selected
+  // account the first time, and with just the failed ones on retry -- rows
+  // that already succeeded are never re-run.
+  async function runTbImport(emails: string[]) {
+    if (!tbAccounts) return;
+    setTbRunning(true);
+    for (const email of emails) {
+      const account = tbAccounts.find((a) => a.email === email);
+      if (!account) continue;
+      setTbRowStatus((prev) => ({ ...prev, [email]: { state: "running" } }));
+      try {
+        const outcome = await importThunderbirdAccount({ ...account, password: tbPasswords[email] ?? "" });
+        setTbRowStatus((prev) => ({
+          ...prev,
+          [email]: { state: outcome.status as "added" | "skipped" | "failed", detail: outcome.detail ?? undefined },
+        }));
+      } catch (err) {
+        setTbRowStatus((prev) => ({
+          ...prev,
+          [email]: { state: "failed", detail: typeof err === "string" ? err : err instanceof Error ? err.message : String(err) },
+        }));
+      }
+    }
+    setTbRunning(false);
   }
 
   // Pre-fill the form from a discovered Thunderbird account. Everything but
@@ -354,6 +424,15 @@ export function AddAccountView({ accentColor, onCancel, onDone }: AddAccountView
   }
 
   const importedAccounts = importReport?.results.filter((r) => r.status === "added") ?? [];
+
+  const tbSelectedAccounts = tbAccounts?.filter((account) => tbSelected[account.email]) ?? [];
+  const tbStatusList = Object.values(tbRowStatus);
+  // A run has finished once every row landed somewhere terminal -- used to
+  // switch the action button from "Add N accounts" to "Retry N failed".
+  const tbRunFinished = tbStatusList.length > 0 && tbStatusList.every((s) => s.state !== "pending" && s.state !== "running");
+  const tbFailedEmails = Object.entries(tbRowStatus).filter(([, s]) => s.state === "failed").map(([email]) => email);
+  const tbAddedEmails = Object.entries(tbRowStatus).filter(([, s]) => s.state === "added").map(([email]) => email);
+  const tbAllPasswordsFilled = tbSelectedAccounts.every((account) => (tbPasswords[account.email] ?? "").length > 0);
 
   const probing = calendarProbe.status === "pending" || contactsProbe.status === "pending";
   const anyFailed = calendarProbe.status === "failed" || contactsProbe.status === "failed";
@@ -665,27 +744,143 @@ export function AddAccountView({ accentColor, onCancel, onDone }: AddAccountView
                 </Text>
               </Pressable>
               {tbError !== "" && <Text style={styles.hint}>{tbError}</Text>}
-              {tbAccounts && tbAccounts.length > 0 && (
+              {tbAccounts && tbAccounts.length > 0 && !tbPasswordStep && (
                 <View style={styles.importResults}>
-                  <Text style={styles.oauthLead}>
-                    Found {tbAccounts.length} account{tbAccounts.length === 1 ? "" : "s"}. Pick one to fill in
-                    the form, then enter its password:
-                  </Text>
-                  {tbAccounts.map((account) => (
-                    <Pressable
-                      key={account.email}
-                      onPress={() => prefillFromThunderbird(account)}
-                      style={({ hovered }: HoverState) => [
-                        styles.tbRow,
-                        hovered ? { borderColor: withAlpha(accentColor, 0.6) } : null,
-                      ]}
-                    >
-                      <Text style={styles.tbRowEmail}>{account.email}</Text>
-                      <Text style={styles.tbRowDetail}>
-                        {account.protocol.toUpperCase()} · {account.incoming_host} · SMTP {account.smtp_host}
+                  <View style={styles.tbSelectAllRow}>
+                    <Text style={styles.oauthLead}>
+                      Found {tbAccounts.length} account{tbAccounts.length === 1 ? "" : "s"}. Check the ones to
+                      bring over (all checked by default), or edit one manually.
+                    </Text>
+                    <Pressable onPress={toggleTbSelectAll}>
+                      <Text style={[styles.tbLink, { color: accentColor }]}>
+                        {tbAccounts.every((account) => tbSelected[account.email]) ? "Deselect all" : "Select all"}
                       </Text>
                     </Pressable>
+                  </View>
+                  {tbAccounts.map((account) => (
+                    <View key={account.email} style={styles.tbRow}>
+                      <Pressable
+                        onPress={() => toggleTbSelected(account.email)}
+                        style={({ hovered }: HoverState) => [
+                          styles.tbCheckboxRow,
+                          hovered ? { borderColor: withAlpha(accentColor, 0.6) } : null,
+                        ]}
+                      >
+                        <View
+                          style={[
+                            styles.tbCheckbox,
+                            tbSelected[account.email]
+                              ? { backgroundColor: accentColor, borderColor: accentColor }
+                              : null,
+                          ]}
+                        >
+                          {tbSelected[account.email] && <Text style={styles.tbCheckboxMark}>✓</Text>}
+                        </View>
+                        <View style={styles.tbRowText}>
+                          <Text style={styles.tbRowEmail}>{account.email}</Text>
+                          <Text style={styles.tbRowDetail}>
+                            {account.protocol.toUpperCase()} · {account.incoming_host} · SMTP {account.smtp_host}
+                          </Text>
+                        </View>
+                      </Pressable>
+                      <Pressable onPress={() => prefillFromThunderbird(account)}>
+                        <Text style={[styles.tbLink, { color: accentColor }]}>Edit manually</Text>
+                      </Pressable>
+                    </View>
                   ))}
+                  <Pressable
+                    onPress={handleStartTbImport}
+                    disabled={tbSelectedAccounts.length === 0}
+                    style={[
+                      styles.primaryButton,
+                      { backgroundColor: accentColor },
+                      tbSelectedAccounts.length === 0 && styles.primaryButtonDisabled,
+                    ]}
+                  >
+                    <Text style={styles.primaryButtonText}>
+                      Import {tbSelectedAccounts.length} selected account{tbSelectedAccounts.length === 1 ? "" : "s"}...
+                    </Text>
+                  </Pressable>
+                </View>
+              )}
+              {tbPasswordStep && (
+                <View style={styles.importResults}>
+                  <Pressable onPress={() => setTbPasswordStep(false)} disabled={tbRunning}>
+                    <Text style={[styles.tbLink, { color: accentColor }]}>← Back to account list</Text>
+                  </Pressable>
+                  <Text style={styles.oauthLead}>
+                    Enter each account's password -- Helix verifies and saves them one at a time, so this can
+                    take a moment for a large batch.
+                  </Text>
+                  {tbSelectedAccounts.map((account) => {
+                    const status = tbRowStatus[account.email]?.state ?? "pending";
+                    const detail = tbRowStatus[account.email]?.detail;
+                    const locked = status === "added" || status === "skipped";
+                    const revealed = tbShowPassword[account.email] ?? false;
+                    return (
+                      <View key={account.email} style={styles.tbPasswordRow}>
+                        <Text style={styles.tbRowEmail}>{account.email}</Text>
+                        <Text style={styles.tbFieldLabel}>Password</Text>
+                        <View style={styles.tbPasswordInputWrap}>
+                          <TextInput
+                            value={tbPasswords[account.email] ?? ""}
+                            onChangeText={(value) => setTbPasswords((prev) => ({ ...prev, [account.email]: value }))}
+                            placeholder="Password"
+                            secureTextEntry={!revealed}
+                            editable={!tbRunning && !locked}
+                            style={styles.tbPasswordInput}
+                          />
+                          <Pressable
+                            onPress={() =>
+                              setTbShowPassword((prev) => ({ ...prev, [account.email]: !revealed }))
+                            }
+                            style={styles.tbShowToggle}
+                          >
+                            <Text style={[styles.tbLink, { color: accentColor }]}>
+                              {revealed ? "Hide" : "Show"}
+                            </Text>
+                          </Pressable>
+                        </View>
+                        {status === "running" && <Text style={styles.hint}>Verifying...</Text>}
+                        {status === "added" && (
+                          <Text style={styles.importRowOk}>Added{detail ? ` -- ${detail}` : ""}</Text>
+                        )}
+                        {status === "skipped" && <Text style={styles.hint}>{detail}</Text>}
+                        {status === "failed" && <Text style={styles.importRowProblem}>{detail}</Text>}
+                      </View>
+                    );
+                  })}
+                  {(!tbRunFinished || tbFailedEmails.length > 0) && (
+                    <Pressable
+                      onPress={() =>
+                        runTbImport(
+                          tbRunFinished ? tbFailedEmails : tbSelectedAccounts.map((account) => account.email),
+                        )
+                      }
+                      disabled={tbRunning || !tbAllPasswordsFilled}
+                      style={[
+                        styles.primaryButton,
+                        { backgroundColor: accentColor },
+                        (tbRunning || !tbAllPasswordsFilled) && styles.primaryButtonDisabled,
+                      ]}
+                    >
+                      <Text style={styles.primaryButtonText}>
+                        {tbRunning
+                          ? "Adding accounts..."
+                          : tbRunFinished
+                            ? `Retry ${tbFailedEmails.length} failed`
+                            : `Add ${tbSelectedAccounts.length} account${tbSelectedAccounts.length === 1 ? "" : "s"}`}
+                      </Text>
+                    </Pressable>
+                  )}
+                  {tbAddedEmails.length > 0 && (
+                    <Pressable
+                      onPress={() => onDone(tbAddedEmails[0])}
+                      style={[styles.primaryButton, styles.importDoneButton, { backgroundColor: accentColor }]}
+                    >
+                      <Text style={styles.primaryButtonText}>Open inbox</Text>
+                    </Pressable>
+                  )}
                 </View>
               )}
 
@@ -980,6 +1175,17 @@ const styles = StyleSheet.create({
     borderTopWidth: 1,
     borderTopColor: colors.border.subtle,
   },
+  tbSelectAllRow: {
+    flexDirection: "row",
+    alignItems: "center",
+    justifyContent: "space-between",
+    gap: spacing.sm,
+  },
+  tbLink: {
+    fontFamily: fontFamily.ui,
+    fontSize: fontSize.xs,
+    fontWeight: "600",
+  },
   tbRow: {
     marginTop: spacing.xs,
     paddingVertical: spacing.sm,
@@ -988,6 +1194,35 @@ const styles = StyleSheet.create({
     borderWidth: 1,
     borderColor: colors.border.subtle,
     backgroundColor: withAlpha(colors.background.panel, 0.6),
+    flexDirection: "row",
+    alignItems: "center",
+    justifyContent: "space-between",
+    gap: spacing.sm,
+  },
+  tbCheckboxRow: {
+    flexDirection: "row",
+    alignItems: "center",
+    flex: 1,
+    gap: spacing.sm,
+  },
+  tbCheckbox: {
+    width: 18,
+    height: 18,
+    borderRadius: 4,
+    borderWidth: 1,
+    borderColor: colors.border.subtle,
+    alignItems: "center",
+    justifyContent: "center",
+    flexShrink: 0,
+  },
+  tbCheckboxMark: {
+    fontFamily: fontFamily.ui,
+    fontSize: 12,
+    fontWeight: "700",
+    color: colors.background.panel,
+  },
+  tbRowText: {
+    flex: 1,
   },
   tbRowEmail: {
     fontFamily: fontFamily.ui,
@@ -999,6 +1234,43 @@ const styles = StyleSheet.create({
     fontSize: fontSize.xs,
     color: colors.text.secondary,
     marginTop: 2,
+  },
+  tbPasswordRow: {
+    marginTop: spacing.sm,
+    paddingVertical: spacing.md,
+    paddingHorizontal: spacing.md,
+    borderRadius: radii.md,
+    borderWidth: 1,
+    borderColor: colors.border.subtle,
+    backgroundColor: withAlpha(colors.background.panel, 0.7),
+    gap: spacing.xs,
+  },
+  tbFieldLabel: {
+    fontFamily: fontFamily.ui,
+    fontSize: fontSize.xs,
+    color: colors.text.secondary,
+    marginTop: 2,
+  },
+  tbPasswordInputWrap: {
+    flexDirection: "row",
+    alignItems: "center",
+    backgroundColor: colors.background.surface,
+    borderWidth: 1,
+    borderColor: colors.border.subtle,
+    borderRadius: radii.sm,
+    paddingLeft: spacing.md,
+    paddingRight: spacing.xs,
+  },
+  tbPasswordInput: {
+    flex: 1,
+    paddingVertical: spacing.sm,
+    color: colors.text.primary,
+    fontFamily: fontFamily.ui,
+    fontSize: fontSize.sm,
+  },
+  tbShowToggle: {
+    paddingHorizontal: spacing.sm,
+    paddingVertical: spacing.xs,
   },
   importRowOk: {
     fontFamily: fontFamily.ui,

@@ -115,7 +115,10 @@ export function Sidebar({
   function openFolderMenu(event: React.MouseEvent, forAccountId: AccountId, folder: string) {
     event.preventDefault();
     if (!onRenameFolder && !onDeleteFolder && !onEmptyFolder) return;
-    setFolderRenameDraft(folder);
+    // Draft starts as the leaf name, not the raw path -- the user renames
+    // "Projects", not "INBOX.Projects"; the backend rebuilds the parent
+    // path when the server needs it.
+    setFolderRenameDraft(folder.split(/[/.]/).pop() ?? folder);
     setFolderMenu({ accountId: forAccountId, folder, top: event.clientY, left: event.clientX });
   }
 

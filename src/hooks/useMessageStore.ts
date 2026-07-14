@@ -64,8 +64,21 @@ export function useMessageStore() {
       const list = current[key] ?? [];
       const existingIds = new Set(list.map((message) => message.id));
       const additions = incoming.filter((message) => !existingIds.has(message.id));
-      if (additions.length === 0) return current;
-      return { ...current, [key]: [...list, ...additions] };
+      // Refresh unread/starred on rows already present: flags change from
+      // outside this app (read in webmail, flagged on the phone), and a
+      // merge that only appends would leave sorting, badges, and the
+      // unread separator working off whatever the flags were at first
+      // load. Only flags -- an existing record keeps its fetched body.
+      const freshById = new Map(incoming.map((message) => [message.id, message]));
+      let flagsChanged = false;
+      const refreshed = list.map((message) => {
+        const fresh = freshById.get(message.id);
+        if (!fresh || (fresh.unread === message.unread && fresh.starred === message.starred)) return message;
+        flagsChanged = true;
+        return { ...message, unread: fresh.unread, starred: fresh.starred };
+      });
+      if (additions.length === 0 && !flagsChanged) return current;
+      return { ...current, [key]: [...refreshed, ...additions] };
     });
   }
 

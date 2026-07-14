@@ -137,7 +137,14 @@ view with a back button.
   color follows the account everywhere (tabs, highlights, badges).
 - Folders show live unread counts. Right-click a folder to rename, empty,
   or delete it. "+ New folder" creates a real folder on the server (Helix
-  handles servers that require an `INBOX.` prefix automatically).
+  handles servers that require an `INBOX.` prefix automatically), and
+  subscribes to it so it actually shows up here.
+- The sidebar lists your subscribed folders, not every folder on the
+  server -- hosting-provider mail stacks often auto-create service
+  mailboxes (an unsubscribed spam-filter folder alongside the real Junk,
+  for instance) that would otherwise clutter the list. Your inbox and
+  the folders Helix uses for Sent/Trash/Drafts/Archive/Spam always show
+  even if the server left them unsubscribed.
 - The footer buttons open the **Calendar** tab, the **Address Book** tab,
   and **Settings**.
 
@@ -262,9 +269,11 @@ way discards the changes.
 
 - **General**: compact list, unified inbox, conversation view, separate
   unread/read sections, spell checking in compose (offline, via your OS
-  dictionaries), signature, and **Set as default mail client** -- once
-  set, clicking an email link anywhere on your system opens a pre-filled
-  compose window in Helix.
+  dictionaries), a 12-hour (AM/PM) clock toggle -- off by default, so
+  times in the message list, reader, calendar, and reminders use a
+  24-hour clock until you turn it on -- signature, and **Set as default
+  mail client** -- once set, clicking an email link anywhere on your
+  system opens a pre-filled compose window in Helix.
 - **Accounts**: connected accounts, add/edit/remove, send-as aliases.
   For a Google/Microsoft account, Edit offers **"Sign in with ... again"**
   instead of a password field -- use it if the account stops working

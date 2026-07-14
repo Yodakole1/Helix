@@ -102,6 +102,7 @@ export interface SettingsValues {
   encryptByDefault: boolean;
   signature: string;
   spellCheck: boolean;
+  hour12: boolean;
   syncDepth: SyncDepth;
   fontScale: number;
   theme: ThemeName;
@@ -533,6 +534,13 @@ export function SettingsModal({
                 description="Underlines misspellings in the compose subject and body using your OS dictionaries -- fully offline."
                 value={draft.spellCheck}
                 onChange={() => patchDraft({ spellCheck: !draft.spellCheck })}
+                color={accentColor}
+              />
+              <SettingRow
+                label="12-hour clock (AM/PM)"
+                description="Times throughout the app -- message list, reader, calendar, reminders -- use a 24-hour clock unless this is on."
+                value={draft.hour12}
+                onChange={() => patchDraft({ hour12: !draft.hour12 })}
                 color={accentColor}
               />
 
