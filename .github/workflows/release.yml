@@ -56,14 +56,18 @@ jobs:
         if: matrix.platform == 'windows-latest'
         shell: pwsh
         run: |
-          choco install openssl -y --no-progress
-          $opensslDir = "C:\Program Files\OpenSSL-Win64"
-          if (!(Test-Path $opensslDir)) {
-            $found = Get-ChildItem "C:\Program Files*" -Directory -Filter "OpenSSL*" -ErrorAction SilentlyContinue | Select-Object -First 1
-            if ($found) { $opensslDir = $found.FullName }
-          }
+          $triplet = "x64-windows-static-md"
+          vcpkg install "openssl:$triplet"
+          $vcpkgRoot = $env:VCPKG_INSTALLATION_ROOT
+          if (-not $vcpkgRoot) { $vcpkgRoot = "C:\vcpkg" }
+          $opensslDir = Join-Path $vcpkgRoot "installed\$triplet"
           Write-Host "Using OPENSSL_DIR=$opensslDir"
+          if (!(Test-Path (Join-Path $opensslDir "include"))) {
+            Write-Host "include/ not found under $opensslDir -- vcpkg installed tree:"
+            Get-ChildItem (Join-Path $vcpkgRoot "installed") -ErrorAction SilentlyContinue
+          }
           "OPENSSL_DIR=$opensslDir" | Out-File -FilePath $env:GITHUB_ENV -Append -Encoding utf8
+          "OPENSSL_STATIC=1" | Out-File -FilePath $env:GITHUB_ENV -Append -Encoding utf8
 
       - name: Cargo test
         working-directory: src-tauri
@@ -104,14 +108,18 @@ jobs:
         if: matrix.platform == 'windows-latest'
         shell: pwsh
         run: |
-          choco install openssl -y --no-progress
-          $opensslDir = "C:\Program Files\OpenSSL-Win64"
-          if (!(Test-Path $opensslDir)) {
-            $found = Get-ChildItem "C:\Program Files*" -Directory -Filter "OpenSSL*" -ErrorAction SilentlyContinue | Select-Object -First 1
-            if ($found) { $opensslDir = $found.FullName }
-          }
+          $triplet = "x64-windows-static-md"
+          vcpkg install "openssl:$triplet"
+          $vcpkgRoot = $env:VCPKG_INSTALLATION_ROOT
+          if (-not $vcpkgRoot) { $vcpkgRoot = "C:\vcpkg" }
+          $opensslDir = Join-Path $vcpkgRoot "installed\$triplet"
           Write-Host "Using OPENSSL_DIR=$opensslDir"
+          if (!(Test-Path (Join-Path $opensslDir "include"))) {
+            Write-Host "include/ not found under $opensslDir -- vcpkg installed tree:"
+            Get-ChildItem (Join-Path $vcpkgRoot "installed") -ErrorAction SilentlyContinue
+          }
           "OPENSSL_DIR=$opensslDir" | Out-File -FilePath $env:GITHUB_ENV -Append -Encoding utf8
+          "OPENSSL_STATIC=1" | Out-File -FilePath $env:GITHUB_ENV -Append -Encoding utf8
 
       - name: Install frontend dependencies
         run: npm install
