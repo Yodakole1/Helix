@@ -57,7 +57,13 @@ jobs:
         shell: pwsh
         run: |
           choco install openssl -y --no-progress
-          echo "OPENSSL_DIR=C:\Program Files\OpenSSL-Win64" >> $env:GITHUB_ENV
+          $opensslDir = "C:\Program Files\OpenSSL-Win64"
+          if (!(Test-Path $opensslDir)) {
+            $found = Get-ChildItem "C:\Program Files*" -Directory -Filter "OpenSSL*" -ErrorAction SilentlyContinue | Select-Object -First 1
+            if ($found) { $opensslDir = $found.FullName }
+          }
+          Write-Host "Using OPENSSL_DIR=$opensslDir"
+          "OPENSSL_DIR=$opensslDir" | Out-File -FilePath $env:GITHUB_ENV -Append -Encoding utf8
 
       - name: Cargo test
         working-directory: src-tauri
@@ -99,7 +105,13 @@ jobs:
         shell: pwsh
         run: |
           choco install openssl -y --no-progress
-          echo "OPENSSL_DIR=C:\Program Files\OpenSSL-Win64" >> $env:GITHUB_ENV
+          $opensslDir = "C:\Program Files\OpenSSL-Win64"
+          if (!(Test-Path $opensslDir)) {
+            $found = Get-ChildItem "C:\Program Files*" -Directory -Filter "OpenSSL*" -ErrorAction SilentlyContinue | Select-Object -First 1
+            if ($found) { $opensslDir = $found.FullName }
+          }
+          Write-Host "Using OPENSSL_DIR=$opensslDir"
+          "OPENSSL_DIR=$opensslDir" | Out-File -FilePath $env:GITHUB_ENV -Append -Encoding utf8
 
       - name: Install frontend dependencies
         run: npm install
