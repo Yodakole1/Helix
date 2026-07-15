@@ -28,7 +28,25 @@ jobs:
         run: |
           sudo apt-get update
           sudo apt-get install -y libwebkit2gtk-4.1-dev build-essential curl wget file \
-            libxdo-dev libssl-dev libayatana-appindicator3-dev librsvg2-dev
+            libxdo-dev libssl-dev libayatana-appindicator3-dev librsvg2-dev gnome-keyring dbus-x11
+
+      # credentials.rs's round_trips_through_the_real_os_keychain test isn't
+      # #[ignore]d -- it's meant to prove the keychain integration against
+      # whatever real Secret Service/Keychain/Credential Manager the test
+      # runs on. A bare ubuntu-latest runner has no Secret Service daemon
+      # running at all (unlike a real desktop session), so cargo test needs
+      # a throwaway D-Bus session with gnome-keyring unlocked in it first --
+      # see docs/technical/credential-storage.md's Verification section.
+      - name: Start a throwaway keyring (Linux)
+        if: matrix.platform == 'ubuntu-latest'
+        run: |
+          eval "$(dbus-launch --sh-syntax)"
+          echo "DBUS_SESSION_BUS_ADDRESS=$DBUS_SESSION_BUS_ADDRESS" >> "$GITHUB_ENV"
+          mkdir -p ~/.local/share/keyrings
+          eval "$(printf '\n' | gnome-keyring-daemon --unlock --components=secrets)"
+          eval "$(printf '\n' | gnome-keyring-daemon --start --components=secrets)"
+          echo "GNOME_KEYRING_CONTROL=$GNOME_KEYRING_CONTROL" >> "$GITHUB_ENV"
+
       - name: Cargo test
         working-directory: src-tauri
         run: cargo test
