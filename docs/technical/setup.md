@@ -4,12 +4,13 @@ This doc covers day-to-day local development, which happens on Linux.
 (Installing Helix as an end user -- release builds, the installer
 formats each OS produces, and the planned apt repository -- is
 `docs/user/installation.md`, not this doc.)
-That doesn't mean Windows/macOS are unverified, though: `.github/workflows/ci.yml`
-runs `cargo test` on all three OSes (`ubuntu-latest`, `macos-latest`,
-`windows-latest`) on every push/PR — see `credential-storage.md`'s
+Windows and macOS are currently unverified beyond compiling -- there is no
+CI workflow yet running the test suite on those OSes, and nobody on this
+project develops on either day to day. See `credential-storage.md`'s
 Verification section for why that matters specifically for credential
 storage, which is the one thing that's genuinely platform-specific code
-(a different `keyring` backend per OS, selected in `Cargo.toml`).
+(a different `keyring` backend per OS, selected in `Cargo.toml`), and for
+what a 3-OS CI matrix would need to look like once one exists.
 
 ## Linux
 
@@ -44,17 +45,13 @@ from the Vite dev server.
 
 ## Windows / macOS
 
-No local-dev walkthrough is written yet, and nobody on this project
-actively develops on either — but that's a documentation gap, not an
-unverified-platform gap. CI (`.github/workflows/ci.yml`) builds the Rust
-backend and runs its full non-network test suite, including the
-real-keychain credential round-trip test, on both `macos-latest` and
-`windows-latest` on every push. Tauri's own prerequisites for those OSes
-(Xcode Command Line Tools on macOS; the MSVC toolchain + WebView2 Runtime
-on Windows, both preinstalled on GitHub's hosted runners) are what a
-first-time local setup would need — see Tauri's official prerequisites
-docs for the exact install steps until this doc gets a real walkthrough
-for both.
+No local-dev walkthrough is written yet, nobody on this project actively
+develops on either, and there's no CI running the test suite on them yet
+either -- both are genuinely unverified beyond compiling. Tauri's own
+prerequisites for those OSes (Xcode Command Line Tools on macOS; the MSVC
+toolchain + WebView2 Runtime on Windows) are what a first-time local setup
+would need — see Tauri's official prerequisites docs for the exact
+install steps until this doc gets a real walkthrough for both.
 
 ## Optional: passkey (FIDO2 security key) app-lock support
 

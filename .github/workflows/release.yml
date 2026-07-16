@@ -1,0 +1,162 @@
+name: Build and release
+
+# main produces a real, non-prerelease GitHub Release (tag v<version> from
+# package.json). Any other branch this runs on (prerelease-* -- add more
+# patterns below if you start naming testing branches differently)
+# produces a release flagged as a prerelease, tagged with the branch name
+# itself, so pushing again to the same branch updates that one release
+# in place instead of piling up tags.
+on:
+  push:
+    branches:
+      - main
+      - "prerelease-*"
+  workflow_dispatch:
+
+# The default GITHUB_TOKEN is read-only unless a job says otherwise --
+# tauri-action needs to create/update a Release and upload assets to it.
+permissions:
+  contents: write
+
+jobs:
+  test:
+    strategy:
+      fail-fast: false
+      matrix:
+        platform: [ubuntu-latest, macos-latest, windows-latest]
+    runs-on: ${{ matrix.platform }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - name: Install Linux native dependencies
+        if: matrix.platform == 'ubuntu-latest'
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y libwebkit2gtk-4.1-dev build-essential curl wget file \
+            libxdo-dev libssl-dev libayatana-appindicator3-dev librsvg2-dev gnome-keyring dbus-x11
+
+      # credentials.rs's round_trips_through_the_real_os_keychain test isn't
+      # #[ignore]d -- it's meant to prove the keychain integration against
+      # whatever real Secret Service/Keychain/Credential Manager the test
+      # runs on. A bare ubuntu-latest runner has no Secret Service daemon
+      # running at all (unlike a real desktop session), so cargo test needs
+      # a throwaway D-Bus session with gnome-keyring unlocked in it first --
+      # see docs/technical/credential-storage.md's Verification section.
+      - name: Start a throwaway keyring (Linux)
+        if: matrix.platform == 'ubuntu-latest'
+        run: |
+          eval "$(dbus-launch --sh-syntax)"
+          echo "DBUS_SESSION_BUS_ADDRESS=$DBUS_SESSION_BUS_ADDRESS" >> "$GITHUB_ENV"
+          mkdir -p ~/.local/share/keyrings
+          eval "$(printf '\n' | gnome-keyring-daemon --unlock --components=secrets)"
+          eval "$(printf '\n' | gnome-keyring-daemon --start --components=secrets)"
+          echo "GNOME_KEYRING_CONTROL=$GNOME_KEYRING_CONTROL" >> "$GITHUB_ENV"
+
+      # libsqlite3-sys's SQLCipher build links against libcrypto directly
+      # (a C-level build.rs concern, separate from the openssl-sys
+      # "vendored" feature already in Cargo.toml, which only covers Rust's
+      # own TLS code) -- it needs a real OpenSSL install with OPENSSL_DIR
+      # pointed at it, which windows-latest doesn't have out of the box.
+      - name: Install OpenSSL (Windows)
+        if: matrix.platform == 'windows-latest'
+        shell: pwsh
+        run: |
+          $triplet = "x64-windows-static-md"
+          vcpkg install "openssl:$triplet"
+          $vcpkgRoot = $env:VCPKG_INSTALLATION_ROOT
+          if (-not $vcpkgRoot) { $vcpkgRoot = "C:\vcpkg" }
+          $opensslDir = Join-Path $vcpkgRoot "installed\$triplet"
+          Write-Host "Using OPENSSL_DIR=$opensslDir"
+          if (!(Test-Path (Join-Path $opensslDir "include"))) {
+            Write-Host "include/ not found under $opensslDir -- vcpkg installed tree:"
+            Get-ChildItem (Join-Path $vcpkgRoot "installed") -ErrorAction SilentlyContinue
+          }
+          "OPENSSL_DIR=$opensslDir" | Out-File -FilePath $env:GITHUB_ENV -Append -Encoding utf8
+          "OPENSSL_STATIC=1" | Out-File -FilePath $env:GITHUB_ENV -Append -Encoding utf8
+
+      - name: Cargo test
+        working-directory: src-tauri
+        run: cargo test
+
+  build:
+    needs: test
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - platform: macos-latest
+            args: "--target universal-apple-darwin"
+          - platform: ubuntu-latest
+            args: ""
+          - platform: windows-latest
+            args: ""
+    runs-on: ${{ matrix.platform }}
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: ${{ matrix.platform == 'macos-latest' && 'aarch64-apple-darwin,x86_64-apple-darwin' || '' }}
+
+      - name: Install Linux native dependencies
+        if: matrix.platform == 'ubuntu-latest'
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y libwebkit2gtk-4.1-dev build-essential curl wget file \
+            libxdo-dev libssl-dev libayatana-appindicator3-dev librsvg2-dev
+
+      - name: Install OpenSSL (Windows)
+        if: matrix.platform == 'windows-latest'
+        shell: pwsh
+        run: |
+          $triplet = "x64-windows-static-md"
+          vcpkg install "openssl:$triplet"
+          $vcpkgRoot = $env:VCPKG_INSTALLATION_ROOT
+          if (-not $vcpkgRoot) { $vcpkgRoot = "C:\vcpkg" }
+          $opensslDir = Join-Path $vcpkgRoot "installed\$triplet"
+          Write-Host "Using OPENSSL_DIR=$opensslDir"
+          if (!(Test-Path (Join-Path $opensslDir "include"))) {
+            Write-Host "include/ not found under $opensslDir -- vcpkg installed tree:"
+            Get-ChildItem (Join-Path $vcpkgRoot "installed") -ErrorAction SilentlyContinue
+          }
+          "OPENSSL_DIR=$opensslDir" | Out-File -FilePath $env:GITHUB_ENV -Append -Encoding utf8
+          "OPENSSL_STATIC=1" | Out-File -FilePath $env:GITHUB_ENV -Append -Encoding utf8
+
+      - name: Install frontend dependencies
+        run: npm install
+
+      # main -> a real release, tagged v<version>, not marked prerelease.
+      # Any other branch this workflow runs on -> tagged with the branch
+      # name, marked prerelease, updated in place on every push.
+      - name: Compute release metadata
+        id: vars
+        shell: bash
+        run: |
+          VERSION=$(node -p "require('./package.json').version")
+          if [ "${{ github.ref_name }}" = "main" ]; then
+            echo "tag=v$VERSION" >> "$GITHUB_OUTPUT"
+            echo "name=Helix v$VERSION" >> "$GITHUB_OUTPUT"
+            echo "prerelease=false" >> "$GITHUB_OUTPUT"
+          else
+            echo "tag=${{ github.ref_name }}" >> "$GITHUB_OUTPUT"
+            echo "name=Helix (${{ github.ref_name }}, prerelease build)" >> "$GITHUB_OUTPUT"
+            echo "prerelease=true" >> "$GITHUB_OUTPUT"
+          fi
+
+      - uses: tauri-apps/tauri-action@v0
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          TAURI_SIGNING_PRIVATE_KEY: ${{ secrets.TAURI_SIGNING_PRIVATE_KEY }}
+          TAURI_SIGNING_PRIVATE_KEY_PASSWORD: ${{ secrets.TAURI_SIGNING_PRIVATE_KEY_PASSWORD }}
+        with:
+          tagName: ${{ steps.vars.outputs.tag }}
+          releaseName: ${{ steps.vars.outputs.name }}
+          releaseBody: "Automated build from ${{ github.ref_name }} (${{ github.sha }}). See the commit log for what changed."
+          releaseDraft: false
+          prerelease: ${{ steps.vars.outputs.prerelease }}
+          includeUpdaterJson: true
+          args: ${{ matrix.args }}

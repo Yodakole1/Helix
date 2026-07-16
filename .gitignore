@@ -3,7 +3,7 @@ dist/
 src-tauri/target/
 *.log
 .claude/settings.local.json
-.env
+*.env
 # A filled-in copy of accounts-import.example.txt contains plaintext
 # passwords -- make sure it can never be committed by accident.
 accounts-import.txt

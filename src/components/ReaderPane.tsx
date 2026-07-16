@@ -3,6 +3,7 @@ import type { InviteInfo } from "../lib/ics";
 import { Pressable, ScrollView, StyleSheet, Text, View } from "react-native";
 import type { SampleMessage } from "../data/messages";
 import { formatMessageTime } from "../data/messages";
+import { formatClockTime } from "../lib/timeFormat";
 import type { RealAttachment } from "../data/messages";
 import { useAnchorRect } from "../hooks/useAnchorRect";
 import type { HoverState } from "../lib/pressable";
@@ -239,7 +240,7 @@ export function ReaderPane({
     const presets: Array<{ label: string; sublabel: string; iso: string }> = [];
     const later = new Date(now.getTime() + 3 * 60 * 60 * 1000);
     if (later.getDate() === now.getDate()) {
-      presets.push({ label: "Later today", sublabel: later.toLocaleTimeString([], { hour: "2-digit", minute: "2-digit", hour12: false }), iso: later.toISOString() });
+      presets.push({ label: "Later today", sublabel: formatClockTime(later), iso: later.toISOString() });
     }
     const tomorrow = new Date(now); tomorrow.setDate(tomorrow.getDate() + 1); tomorrow.setHours(8, 0, 0, 0);
     presets.push({ label: "Tomorrow morning", sublabel: `${tomorrow.toLocaleDateString([], { weekday: "short" })} 08:00`, iso: tomorrow.toISOString() });

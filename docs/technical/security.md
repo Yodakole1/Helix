@@ -21,9 +21,11 @@ names the file that enforces it.
   whichever one is correct for the platform. Passwords are zeroized
   (`zeroize` crate) immediately after every login attempt, success or
   failure, and after every credential-rotation path
-  (`account::update_account`). This isn't just asserted: `.github/workflows/ci.yml`
-  runs the real-keychain round-trip test against all three actual OS
-  credential stores on every push. See `credential-storage.md`.
+  (`account::update_account`). The real-keychain round-trip test proves
+  this against whichever OS credential store the test happens to run on;
+  there's no CI yet running it against all three, so today that's
+  verified on Linux and only spot-checked (not continuously) on macOS/
+  Windows. See `credential-storage.md`.
 - **The local mail cache is encrypted at rest.** SQLCipher via `rusqlite`'s
   `bundled-sqlcipher` feature; the encryption key itself is a random
   32-byte value stored in the OS keychain, not derived from anything

@@ -222,6 +222,17 @@ export function discoverThunderbirdAccounts(): Promise<ThunderbirdAccount[]> {
   return invoke("discover_thunderbird_accounts");
 }
 
+// Imports one account picked from the Thunderbird checklist, password
+// included (Thunderbird's own store is encrypted, so the user types theirs
+// once per account). Goes through the exact same verify/save/CalDAV/CardDAV
+// path as addAccount. Never rejects -- failures come back as a "failed" row,
+// same shape as ImportAccountsReport's per-row results -- so the caller can
+// run a whole selected batch sequentially and update one row per call
+// without a try/catch around each one.
+export function importThunderbirdAccount(spec: ThunderbirdAccount & { password: string }): Promise<AccountImportOutcome> {
+  return invoke("import_thunderbird_account", { spec });
+}
+
 export function listAccounts(): Promise<AccountRecord[]> {
   return invoke("list_accounts");
 }

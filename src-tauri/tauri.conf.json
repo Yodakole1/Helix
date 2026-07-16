@@ -30,7 +30,7 @@
   },
   "plugins": {
     "updater": {
-      "pubkey": "dW50cnVzdGVkIGNvbW1lbnQ6IG1pbmlzaWduIHB1YmxpYyBrZXk6IDYzMEQ1Mjk5MUFDRkM0MEMKUldRTXhNOGFtVklOWTZZbkpXWTB4cm8vNzFyR1Z1K1FjSVJ0ZkFySkpDMm9QU0RuZk9SZXVUQ3QK",
+      "pubkey": "dW50cnVzdGVkIGNvbW1lbnQ6IG1pbmlzaWduIHB1YmxpYyBrZXk6IDdFMjgwQzVBRURERjY4MUQKUldRZGFOL3RXZ3dvZm1kQzU2VkJvc0dUVkhULzU3Q2QyT0lPSHhUZkhVUVlHMHhZd2VPTlZXelUK",
       "endpoints": [
         "https://github.com/Yodakole1/Helix/releases/latest/download/latest.json"
       ]

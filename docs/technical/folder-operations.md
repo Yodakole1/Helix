@@ -44,13 +44,60 @@ empty.
   the same boundary `move_message_to_folder` draws — resolving the
   account's actual Trash/Junk folder (via RFC 6154 `SPECIAL-USE`, or the
   names stored on `AccountRecord`) is the caller's job.
-- **`CREATE` doesn't auto-subscribe.** `subscribe_folder` and `create_folder`
-  are separate calls; creating a new folder doesn't automatically subscribe
-  to it — the caller must subscribe explicitly if that's the intent.
 - **No recursive delete semantics guarantee.** `DELETE` behavior on a
   folder with child folders is server-defined (RFC 3501 §6.3.4); this
   passes the command through as-is rather than emulating a recursive
   delete.
+
+## `list_folders` shows subscriptions, not the raw `LIST`
+
+The sidebar calls `list_folders`, which now prefers `LSUB "*"` over the
+raw `LIST` `collect_folder_names` used to return unconditionally (that
+helper is still used internally for namespace detection). Hosting-provider
+IMAP stacks (cPanel/Dovecot in particular) auto-create service mailboxes
+the user never subscribed to — an unsubscribed spam-filter folder sitting
+next to the real, subscribed Junk folder is the case that motivated this —
+and a raw `LIST` dumps all of it into the sidebar, unlike every classic
+desktop client (which shows subscriptions).
+
+Three repairs sit on top of the bare `LSUB` result:
+
+- **`INBOX` is prepended if missing.** Many servers never report INBOX
+  itself as subscribed even though it's always selectable.
+- **The account's recorded special folders are appended if unsubscribed.**
+  Sent/Trash/Drafts/Archive/Spam disappearing from the sidebar would break
+  every move/append flow that targets them by name, so `list_folders`
+  reads `AccountRecord` from the cache and force-includes each one.
+- **An empty `LSUB` falls back to the full `LIST`.** A server (or an
+  account) with no subscriptions at all still needs a working sidebar
+  rather than an empty one.
+
+Because the sidebar is now subscription-driven, the folder-mutation
+commands keep the subscription list in sync so folders don't appear to
+vanish or get stuck:
+
+- `create_folder` subscribes to the folder right after `CREATE` succeeds
+  (`subscribe_created`, best-effort — the folder still exists even if the
+  `SUBSCRIBE` fails, and the full-`LIST` fallback would still find it).
+- `delete_folder` unsubscribes *before* attempting `DELETE`, since `DELETE`
+  itself doesn't touch the subscription list and a dead subscription would
+  otherwise leave a ghost entry in the `LSUB`-based sidebar forever. It
+  also gained the same namespace-prefix retry `create_folder` already had:
+  a bare name can be rejected on a server with an `INBOX.` namespace, so a
+  failed `DELETE` retries against `detect_namespace_prefix`'s guess (and
+  unsubscribes that prefixed name too).
+- `rename_folder` moves the subscription from the old name to the new one
+  after a successful `RENAME` (`fix_subscription_after_rename`) — RFC 3501
+  leaves that up to the client, and skipping it would keep showing the old
+  name and never show the new one. It also retries with a rebuilt
+  namespaced target (source's parent path + the new leaf name) when the
+  bare rename is rejected, since the rename UI only ever submits a leaf
+  name.
+
+All of these repairs are best-effort and logged to the debug log
+(`crate::debug_log::record`) on failure rather than surfaced as a second
+error — the primary CREATE/DELETE/RENAME result is what the caller acted
+on and already got its own error path.
 
 ## Verification
 

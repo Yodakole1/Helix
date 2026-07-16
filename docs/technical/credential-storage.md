@@ -52,19 +52,19 @@ encryption key (see "Also used by the local cache" below).
 
 Selecting the right `keyring` feature per OS in `Cargo.toml` only proves
 the code *should* work on all three platforms — it doesn't prove it
-*does*, since none of this is exercised locally on anything but whatever
-OS the developer happens to run on (Linux, in this project's day-to-day
-development). `.github/workflows/ci.yml` closes that gap: a 3-OS matrix
-(`ubuntu-latest`, `macos-latest`, `windows-latest`) runs `cargo test` on
-every push/PR, so the real-keychain round-trip test above actually
-executes against real Secret Service, real Keychain Services, and real
-Credential Manager on every change, not just whichever one the person
-who wrote the change happened to have handy. Linux CI runners don't have
-a Secret Service daemon running by default the way a real desktop session
-does, so the workflow starts a throwaway `gnome-keyring`/D-Bus session
-(via `dbus-run-session`) for the duration of the test run; macOS/Windows
-runners already have a working default keychain / Credential Manager with
-no extra setup needed.
+*does*, since none of this is exercised on anything but whatever OS the
+developer happens to run (Linux, in this project's day-to-day
+development). There is no CI workflow yet to close that gap: a 3-OS
+matrix (`ubuntu-latest`, `macos-latest`, `windows-latest`) running `cargo
+test` on every push/PR, with the real-keychain round-trip test executing
+against real Secret Service, real Keychain Services, and real Credential
+Manager, is the natural way to get that coverage (Linux runners would
+need a throwaway `gnome-keyring`/D-Bus session via `dbus-run-session`,
+since they don't have one running by default the way a real desktop
+session does; macOS/Windows runners already have a working default
+keychain / Credential Manager with no extra setup needed) — but it isn't
+written yet, so Windows/macOS credential storage is currently unverified
+outside of manual testing on those platforms.
 
 ## Consumers
 

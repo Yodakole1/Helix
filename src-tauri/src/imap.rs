@@ -184,6 +184,17 @@ async fn collect_folder_names(session: &mut ImapSession) -> Result<Vec<String>, 
         .map_err(|e| format!("LIST failed: {e}"))
 }
 
+async fn collect_subscribed_folder_names(session: &mut ImapSession) -> Result<Vec<String>, String> {
+    session
+        .lsub(None, Some("*"))
+        .await
+        .map_err(|e| format!("LSUB failed: {e}"))?
+        .map_ok(|name| name.name().to_string())
+        .try_collect()
+        .await
+        .map_err(|e| format!("LSUB failed: {e}"))
+}
+
 /// The last path segment of an IMAP folder name -- "INBOX.Sent" and
 /// "[Gmail]/Sent Mail" both need to be recognized by what they're called,
 /// not where they sit in the hierarchy. Splits on both common delimiters;
@@ -290,6 +301,19 @@ pub(crate) fn persist_folder_correction(account_id: &str, wrong: &str, correct: 
     }
 }
 
+/// The sidebar's folder list: subscribed folders (LSUB), not the raw LIST.
+/// Hosting stacks auto-create service mailboxes the user never subscribed
+/// to (cPanel/Dovecot mint an unsubscribed "INBOX.Junk" next to the real
+/// spam folder, plus whatever else the panel's filters need) -- the raw
+/// LIST dumps those into the sidebar while every classic client (showing
+/// subscriptions) stays clean. Three repairs on top of LSUB:
+/// - INBOX itself is prepended when missing (many servers never report it
+///   as subscribed);
+/// - the account's recorded special folders are appended if the server
+///   left them unsubscribed -- Sent/Trash/etc. disappearing from the
+///   sidebar would break every move/append flow that targets them;
+/// - an empty LSUB falls back to the full LIST, so a server (or user) with
+///   no subscriptions at all still gets a working sidebar.
 #[tauri::command]
 pub async fn list_folders(
     account_id: String,
@@ -297,7 +321,31 @@ pub async fn list_folders(
     port: u16,
 ) -> Result<Vec<String>, String> {
     let mut session = login_for_account(&host, port, &account_id).await?;
-    let folders = collect_folder_names(&mut session).await;
+    let folders = async {
+        let subscribed = collect_subscribed_folder_names(&mut session).await.unwrap_or_default();
+        if subscribed.is_empty() {
+            return collect_folder_names(&mut session).await;
+        }
+        let mut folders = subscribed;
+        if !folders.iter().any(|f| f == "INBOX") {
+            folders.insert(0, "INBOX".to_string());
+        }
+        if let Ok(Some(account)) = cache::open().and_then(|conn| cache::get_account(&conn, &account_id)) {
+            for special in [
+                &account.sent_folder,
+                &account.drafts_folder,
+                &account.trash_folder,
+                &account.archive_folder,
+                &account.spam_folder,
+            ] {
+                if !special.is_empty() && !folders.iter().any(|f| f == special) {
+                    folders.push(special.clone());
+                }
+            }
+        }
+        Ok(folders)
+    }
+    .await;
     session.logout().await.ok();
     folders
 }
@@ -534,7 +582,10 @@ pub async fn create_folder(
     let mut session = login_for_account(&host, port, &account_id).await?;
     let result = async {
         let first_error = match session.create(&folder).await {
-            Ok(()) => return Ok(()),
+            Ok(()) => {
+                subscribe_created(&mut session, &folder).await;
+                return Ok(());
+            }
             Err(e) => format!("could not create folder {folder}: {e}"),
         };
         // Retry inside the server's INBOX namespace if it has one -- the
@@ -548,11 +599,26 @@ pub async fn create_folder(
         session
             .create(&prefixed)
             .await
-            .map_err(|e| format!("could not create folder {folder} (or {prefixed}): {e}"))
+            .map_err(|e| format!("could not create folder {folder} (or {prefixed}): {e}"))?;
+        subscribe_created(&mut session, &prefixed).await;
+        Ok(())
     }
     .await;
     session.logout().await.ok();
+    if let Err(e) = &result {
+        crate::debug_log::record("imap", format!("create folder failed for {account_id}: {e}"));
+    }
     result
+}
+
+/// CREATE doesn't subscribe on most servers (Dovecot included), and the
+/// sidebar lists subscribed folders -- an unsubscribed new folder would
+/// appear to vanish the moment it was created. Best-effort: the folder
+/// exists either way, and the full-LIST fallback still finds it.
+async fn subscribe_created(session: &mut ImapSession, folder: &str) {
+    if let Err(e) = session.subscribe(folder).await {
+        log::warn!("could not subscribe new folder {folder}: {e}");
+    }
 }
 
 #[tauri::command]
@@ -563,11 +629,38 @@ pub async fn delete_folder(
     folder: String,
 ) -> Result<(), String> {
     let mut session = login_for_account(&host, port, &account_id).await?;
-    let result = session
-        .delete(&folder)
-        .await
-        .map_err(|e| format!("could not delete folder {folder}: {e}"));
+    let result = async {
+        // Unsubscribe first (best-effort): DELETE doesn't touch the
+        // subscription list, and a dead subscription would keep a ghost
+        // entry in the LSUB-based sidebar forever.
+        session.unsubscribe(&folder).await.ok();
+        let first_error = match session.delete(&folder).await {
+            Ok(()) => return Ok(()),
+            Err(e) => format!("could not delete folder {folder}: {e}"),
+        };
+        // Same namespace retry as create_folder: servers with an INBOX
+        // namespace reject the bare name ("Client tried to access
+        // nonexistent namespace", Dovecot) when the caller didn't carry
+        // the prefix.
+        let folders = collect_folder_names(&mut session).await.map_err(|_| first_error.clone())?;
+        let Some(prefix) = detect_namespace_prefix(&folders) else {
+            return Err(first_error);
+        };
+        if folder.starts_with(&prefix) {
+            return Err(first_error);
+        }
+        let prefixed = format!("{prefix}{folder}");
+        session.unsubscribe(&prefixed).await.ok();
+        session
+            .delete(&prefixed)
+            .await
+            .map_err(|e| format!("could not delete folder {folder} (or {prefixed}): {e}"))
+    }
+    .await;
     session.logout().await.ok();
+    if let Err(e) = &result {
+        crate::debug_log::record("imap", format!("delete folder failed for {account_id}: {e}"));
+    }
     result
 }
 
@@ -580,12 +673,48 @@ pub async fn rename_folder(
     new_name: String,
 ) -> Result<(), String> {
     let mut session = login_for_account(&host, port, &account_id).await?;
-    let result = session
-        .rename(&folder, &new_name)
-        .await
-        .map_err(|e| format!("could not rename folder {folder} to {new_name}: {e}"));
+    let result = async {
+        let first_error = match session.rename(&folder, &new_name).await {
+            Ok(()) => {
+                fix_subscription_after_rename(&mut session, &folder, &new_name).await;
+                return Ok(());
+            }
+            Err(e) => format!("could not rename folder {folder} to {new_name}: {e}"),
+        };
+        // The rename dialog submits a bare leaf name ("Projects"), but on a
+        // namespaced server the target must live in the source's parent
+        // path ("INBOX.Projects") -- rebuild it there and retry.
+        let Some(delimiter_pos) = folder.rfind(['.', '/']) else {
+            return Err(first_error);
+        };
+        let target = format!("{}{}", &folder[..=delimiter_pos], new_name);
+        if target == new_name || target == folder {
+            return Err(first_error);
+        }
+        session
+            .rename(&folder, &target)
+            .await
+            .map_err(|e| format!("could not rename folder {folder} to {new_name} (or {target}): {e}"))?;
+        fix_subscription_after_rename(&mut session, &folder, &target).await;
+        Ok(())
+    }
+    .await;
     session.logout().await.ok();
+    if let Err(e) = &result {
+        crate::debug_log::record("imap", format!("rename folder failed for {account_id}: {e}"));
+    }
     result
+}
+
+/// RENAME doesn't move the subscription (RFC 3501 leaves that to the
+/// client), so without this the LSUB-based sidebar would keep showing the
+/// old name and never show the new one. Best-effort, like the other
+/// subscription repairs.
+async fn fix_subscription_after_rename(session: &mut ImapSession, old: &str, new: &str) {
+    session.unsubscribe(old).await.ok();
+    if let Err(e) = session.subscribe(new).await {
+        log::warn!("could not subscribe renamed folder {new}: {e}");
+    }
 }
 
 // Some servers error on 1:* STORE against an empty mailbox, so bail early in that case.
@@ -671,14 +800,7 @@ pub async fn list_subscribed_folders(
     port: u16,
 ) -> Result<Vec<String>, String> {
     let mut session = login_for_account(&host, port, &account_id).await?;
-    let result = session
-        .lsub(None, Some("*"))
-        .await
-        .map_err(|e| format!("LSUB failed: {e}"))?
-        .map_ok(|name| name.name().to_string())
-        .try_collect()
-        .await
-        .map_err(|e| format!("LSUB failed: {e}"));
+    let result = collect_subscribed_folder_names(&mut session).await;
     session.logout().await.ok();
     result
 }

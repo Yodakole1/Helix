@@ -589,6 +589,69 @@ pub async fn import_accounts_file(path: String) -> Result<ImportAccountsReport, 
     Ok(ImportAccountsReport { results, file_deleted, delete_error })
 }
 
+/// One account picked from the Thunderbird-import checklist in the
+/// onboarding UI, plus the password the user typed for it (Thunderbird's
+/// own store is NSS-encrypted -- see `thunderbird_import.rs` -- so this is
+/// the one field the scan can never supply). Radioactive like
+/// `ParsedAccount`: zeroized on drop.
+#[derive(Debug, serde::Deserialize)]
+pub struct ThunderbirdImportSpec {
+    pub email: String,
+    pub password: String,
+    pub display_name: Option<String>,
+    /// "imap" or "pop3", matching `thunderbird_import::DiscoveredAccount`.
+    pub protocol: String,
+    pub incoming_host: String,
+    pub incoming_port: u16,
+    pub incoming_starttls: bool,
+    pub smtp_host: String,
+    pub smtp_port: u16,
+    pub smtp_starttls: bool,
+}
+
+impl Drop for ThunderbirdImportSpec {
+    fn drop(&mut self) {
+        self.password.zeroize();
+    }
+}
+
+/// Imports one account the user selected from the Thunderbird-import
+/// checklist. A thin adapter onto `import_one` -- server settings came
+/// from the Thunderbird scan rather than a parsed file block, but from
+/// here on it's the exact same verify/save/CalDAV/CardDAV path every
+/// other onboarding route uses. Takes one account per call (rather than
+/// the whole selected batch) so the frontend can run the import
+/// sequentially and update one row's status as each call resolves,
+/// instead of the caller staring at a spinner until all twenty finish.
+#[tauri::command]
+pub async fn import_thunderbird_account(spec: ThunderbirdImportSpec) -> AccountImportOutcome {
+    let parsed = ParsedAccount {
+        email: spec.email.clone(),
+        password: spec.password.clone(),
+        display_name: spec.display_name.clone(),
+        incoming: if spec.protocol == "pop3" {
+            Incoming::Pop3 { host: spec.incoming_host.clone(), port: spec.incoming_port }
+        } else {
+            Incoming::Imap {
+                host: spec.incoming_host.clone(),
+                port: spec.incoming_port,
+                starttls: spec.incoming_starttls,
+            }
+        },
+        smtp: Some(SmtpSettings {
+            host: spec.smtp_host.clone(),
+            port: spec.smtp_port,
+            starttls: spec.smtp_starttls,
+        }),
+        // Always probed, matching the manual onboarding form's behavior:
+        // it checks for CalDAV/CardDAV with the same credentials right
+        // after the mail login verifies, without asking first.
+        caldav: true,
+        carddav: true,
+    };
+    import_one(&parsed).await
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

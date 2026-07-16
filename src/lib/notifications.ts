@@ -1,6 +1,7 @@
 import { invoke, isTauri } from "@tauri-apps/api/core";
 import { resolveResource } from "@tauri-apps/api/path";
 import { isPermissionGranted } from "@tauri-apps/plugin-notification";
+import { formatClockTime } from "./timeFormat";
 
 // Delivery goes through our own send_desktop_notification command
 // (src-tauri/src/notifications.rs), NOT the notification plugin's
@@ -82,5 +83,5 @@ export async function notifyNewMail(messages: NewMailNotificationMessage[]): Pro
 // what actually went wrong instead of silently doing nothing.
 export async function sendTestNotification(): Promise<void> {
   const icon = await getNotificationIconPath();
-  await deliver("Helix", `This is a test notification (${new Date().toLocaleTimeString()}).`, icon);
+  await deliver("Helix", `This is a test notification (${formatClockTime(new Date())}).`, icon);
 }

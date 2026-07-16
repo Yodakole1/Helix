@@ -17,6 +17,9 @@ import {
   type CalendarEvent,
 } from "../lib/caldav";
 import { emitCalendarBus, onCalendarBus } from "../lib/calendarBus";
+import { listAccounts, type AccountRecord } from "../lib/account";
+import { listIdentities } from "../lib/identities";
+import { formatClockTime } from "../lib/timeFormat";
 import type { HoverState } from "../lib/pressable";
 import { CALENDAR_DEFAULT_COLORS, colors, EXTENDED_PALETTE, fontFamily, fontSize, radii, spacing, withAlpha } from "../theme";
 import { Dropdown } from "./Dropdown";
@@ -68,12 +71,13 @@ function isoDateOf(dtstart: string | null): string | null {
   return icalToIso(dtstart)?.slice(0, 10) ?? null; // "YYYY-MM-DD"
 }
 
-// Calendar times are always 24-hour ("14:30", never "2:30 PM"), regardless
-// of the OS locale's preference.
+// Event times follow the Settings clock-format choice (24-hour by
+// default). The editable start/end inputs below stay 24-hour regardless --
+// they're parsed back as HH:MM.
 function formatEventTime(icalOrIso: string): string {
   const iso = icalToIso(icalOrIso);
   if (!iso || !iso.includes("T")) return "";
-  return new Date(iso).toLocaleTimeString([], { hour: "2-digit", minute: "2-digit", hour12: false });
+  return formatClockTime(new Date(iso));
 }
 
 // An all-day event's DTSTART is a bare date (no "T" time part).
@@ -86,6 +90,14 @@ function isAllDayEvent(ev: CalendarEvent): boolean {
 // user can act on.
 function friendlyError(raw: string): string {
   const r = raw.toLowerCase();
+  // Checked before the generic "timeout" branch below: the keyring crate's
+  // own D-Bus Secret Service error text ("Platform secure storage
+  // failure: ... reply timeout expired ...") would otherwise match it and
+  // read as a network problem, when the actual issue is local -- no
+  // keyring daemon (GNOME Keyring / KWallet) answering on this session's
+  // D-Bus, not a slow or unreachable CalDAV server.
+  if (r.includes("secure storage") || r.includes("dbus") || r.includes("secret service") || r.includes("keyring"))
+    return "Could not reach your system's secure credential storage (Secret Service/Keychain). Make sure a keyring service -- GNOME Keyring or KWallet -- is installed and running, then try again.";
   if (r.includes("401") || r.includes("unauthorized") || r.includes("authentication"))
     return "Wrong username or password. Double-check your credentials and try again.";
   if (r.includes("403") || r.includes("forbidden"))
@@ -230,6 +242,59 @@ export function CalendarView({ accentColor }: CalendarViewProps) {
   // Calendars the server reported when discovery found more than one --
   // rendered as a pick list so the user chooses before connecting.
   const [discovered, setDiscovered] = useState<CalDavDiscoveredCalendar[]>([]);
+  // Every address you already have, offered as one-click fills for the
+  // Username field below -- most CalDAV servers use the same address as
+  // the mailbox, so typing it again is pure friction. Covers every mail
+  // account's primary address plus its send-as identities (aliases), not
+  // just the primary addresses, since a calendar can just as easily live
+  // under an alias. Only the address is reused; the password is never
+  // read back out of the keychain (see CLAUDE.md's frontend/backend
+  // boundary), so it's still typed once here.
+  const [emailSuggestions, setEmailSuggestions] = useState<{ email: string; label: string }[]>([]);
+  useEffect(() => {
+    let cancelled = false;
+    (async () => {
+      let accounts: AccountRecord[];
+      try {
+        accounts = await listAccounts();
+      } catch {
+        if (!cancelled) setEmailSuggestions([]);
+        return;
+      }
+      const identitiesByAccount = await Promise.all(
+        accounts.map((account) => listIdentities(account.account_id).catch(() => [])),
+      );
+      if (cancelled) return;
+      const seen = new Set<string>();
+      const suggestions: { email: string; label: string }[] = [];
+      const add = (email: string, label: string) => {
+        const key = email.toLowerCase();
+        if (email !== "" && !seen.has(key)) {
+          seen.add(key);
+          suggestions.push({ email, label });
+        }
+      };
+      accounts.forEach((account, index) => {
+        add(account.account_id, account.display_name || account.account_id);
+        identitiesByAccount[index].forEach((identity) => add(identity.address, identity.display_name || identity.address));
+      });
+      setEmailSuggestions(suggestions);
+    })();
+    return () => {
+      cancelled = true;
+    };
+  }, []);
+
+  // Fills the Username field and updates the server guess the same way
+  // typing it would -- shared by the manual TextInput and the one-click
+  // account list, so clicking an account behaves exactly like typing its
+  // address would have.
+  function selectUsername(user: string) {
+    const previousGuess = derivedServerFor(addUser);
+    setAddUser(user);
+    setAddError(null);
+    setAddServer((current) => (current.trim() === "" || current === previousGuess ? derivedServerFor(user) : current));
+  }
 
   // Add-task (new event) form state -- opened from the header's "+ Add
   // task", creating a real CalDAV event via create_event (with optional
@@ -692,6 +757,36 @@ export function CalendarView({ accentColor }: CalendarViewProps) {
               Works with iCloud, Fastmail, Nextcloud, Radicale, and any standard CalDAV server.
             </Text>
 
+            {emailSuggestions.length > 0 && (
+              <FormField
+                label="Use an address you already have"
+                hint="Every mailbox and send-as alias you've set up -- most CalDAV servers use the same address as the mailbox, so pick one to fill in the username below."
+                example={emailSuggestions[0].email}
+                accentColor={accentColor}
+                optional
+              >
+                <View style={styles.calAccountPicker}>
+                  {emailSuggestions.map((suggestion) => {
+                    const active = addUser === suggestion.email;
+                    return (
+                      <Pressable
+                        key={suggestion.email}
+                        onPress={() => selectUsername(suggestion.email)}
+                        style={[
+                          styles.calAccountChip,
+                          active && { borderColor: accentColor, backgroundColor: withAlpha(accentColor, 0.12) },
+                        ]}
+                      >
+                        <Text style={styles.calAccountChipText} numberOfLines={1}>
+                          {suggestion.label}
+                        </Text>
+                      </Pressable>
+                    );
+                  })}
+                </View>
+              </FormField>
+            )}
+
             <FormField
               label="Username"
               hint="Usually your email address or account login"
@@ -701,16 +796,7 @@ export function CalendarView({ accentColor }: CalendarViewProps) {
               <TextInput
                 style={styles.addInput}
                 value={addUser}
-                onChangeText={(t) => {
-                  const previousGuess = derivedServerFor(addUser);
-                  setAddUser(t);
-                  setAddError(null);
-                  // Keep the server guess tracking the typed email, but never
-                  // clobber a server the user typed themselves.
-                  setAddServer((current) =>
-                    current.trim() === "" || current === previousGuess ? derivedServerFor(t) : current,
-                  );
-                }}
+                onChangeText={selectUsername}
                 placeholder="you@example.com"
                 placeholderTextColor={colors.text.muted}
                 autoCapitalize="none"
@@ -1439,6 +1525,25 @@ const styles = StyleSheet.create({
     fontSize: 10,
     color: colors.text.muted,
     marginTop: 2,
+  },
+  calAccountPicker: {
+    flexDirection: "row",
+    flexWrap: "wrap",
+    gap: spacing.xs,
+  },
+  calAccountChip: {
+    paddingVertical: spacing.xs,
+    paddingHorizontal: spacing.md,
+    borderRadius: radii.pill,
+    borderWidth: 1,
+    borderColor: colors.border.subtle,
+    backgroundColor: colors.background.surface,
+    maxWidth: 220,
+  },
+  calAccountChipText: {
+    fontFamily: fontFamily.ui,
+    fontSize: fontSize.xs,
+    color: colors.text.primary,
   },
   errorBox: {
     flexDirection: "row",
