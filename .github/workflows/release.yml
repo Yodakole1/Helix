@@ -13,6 +13,11 @@ on:
       - "prerelease-*"
   workflow_dispatch:
 
+# The default GITHUB_TOKEN is read-only unless a job says otherwise --
+# tauri-action needs to create/update a Release and upload assets to it.
+permissions:
+  contents: write
+
 jobs:
   test:
     strategy:
